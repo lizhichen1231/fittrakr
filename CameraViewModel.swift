@@ -13,6 +13,8 @@ final class CameraViewModel: NSObject, ObservableObject {
     private let ciContext = CIContext()
     
 
+    
+
     // æ˜¾ç¤º/å åŠ
     @Published var processedCGImage: CGImage?
     @Published var handLandmarks: [CGPoint] = []
@@ -240,30 +242,26 @@ extension CameraViewModel: CameraEngineDelegate {
     func cameraEngine(_ engine: CameraEngine,
                       didOutputVideo pixelBuffer: CVPixelBuffer,
                       pts: CMTime) {
-
-        // FPS
-        dbgFrames += 1
-        if Date().timeIntervalSince(dbgTick) > 1 {
-            DispatchQueue.main.async { self.dbgText = "FPS ~ \(self.dbgFrames)" }
-            dbgFrames = 0; dbgTick = Date()
-        }
-
-        if videoSize == .zero {
-            videoSize = CGSize(width: CVPixelBufferGetWidth(pixelBuffer),
-                               height: CVPixelBufferGetHeight(pixelBuffer))
-        }
-
+        // 1) 跟随主流程
         let result = follow.process(pixelBuffer: pixelBuffer, pts: pts)
 
-        // æ‰‹åŠ¿è¯†åˆ«ï¼ˆæ¢å¤åŽŸå§‹é€»è¾‘ï¼‰
+        // 2) 同步跑骨架（与 Follow 引擎的 crop / stableBox 对齐）
+        SkeletonAddon.shared.process(pixelBuffer: pixelBuffer,
+                                     orientation: .up,
+                                     pts: pts,
+                                     follow: result)
+
+        // 3) 手势识别（修正 ROI 条件）
         if gestureMode != .off, let ci = result.ciScaled {
             var decided: GestureDecision = .none
-            let rois: [CGRect] = (result.confidence > 1 && self.personBox != nil)
+
+            // 修正：> 1 永远为假，改为 > 0.5
+            let rois: [CGRect] = (result.confidence > 0.5 && self.personBox != nil)
                 ? candidateGestureROIs(from: self.personBox!)
                 : []
-           
-            // 限制处理数量
-            for (index, roi) in rois.prefix(2).enumerated() {  // 最多处理2个
+
+            // 限制最多 2 个 ROI
+            for roi in rois.prefix(2) {
                 if let pbRoi = makePixelBuffer(from: ci, roiN: roi, targetSize: CGSize(width: 224, height: 224)) {
                     self.currentGestureRoiN = roi
                     let d = gesture.process(pbRoi, nil)
@@ -273,21 +271,11 @@ extension CameraViewModel: CameraEngineDelegate {
 
             self.currentGestureRoiN = nil
 
-            // ROI ä¼˜å…ˆï¼šå•å°ºåº¦ 224
-            for roi in rois {
-                if let pbRoi = makePixelBuffer(from: ci, roiN: roi, targetSize: CGSize(width: 224, height: 224)) {
-                    self.currentGestureRoiN = roi
-                    let d = gesture.process(pbRoi, nil)
-                    if d != .none { decided = d; break }
-                }
-            }
-
-            // å…œåº•ï¼šæ•´å¸§ 224Ã—224
+            // 兜底：全帧
             if decided == .none,
                let pbFull = makePixelBuffer(from: ci,
                                             roiN: CGRect(x: 0, y: 0, width: 1, height: 1),
                                             targetSize: CGSize(width: 224, height: 224)) {
-                self.currentGestureRoiN = nil
                 decided = gesture.process(pbFull, nil)
             }
 
@@ -298,20 +286,16 @@ extension CameraViewModel: CameraEngineDelegate {
             }
         }
 
+        // 4) UI / 录制
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             self.isTracking = result.confidence > 0.5
-            
-            if self.isTracking {
-                self.trackingInfo = String(format: "è¿½è¸ªä¸­ %.0f%% ç¼©æ”¾%.2fx",
-                                           result.confidence * 100,
-                                           result.zoom)
-            } else {
-                self.trackingInfo = "æœç´¢ç›®æ ‡â€¦"
-            }
+            self.trackingInfo = self.isTracking
+                ? String(format: "追踪中 %.0f%%  |  缩放 %.2fx", result.confidence * 100, result.zoom)
+                : "搜索目标…"
 
             if let cg = result.previewCG { self.processedCGImage = cg }
-
+            
             let crop = result.cropRect
             if let sb = result.stableBox, crop.width > 0, crop.height > 0 {
                 self.personBox = CGRect(
@@ -320,7 +304,9 @@ extension CameraViewModel: CameraEngineDelegate {
                     width:  sb.width / crop.width,
                     height: sb.height / crop.height
                 )
-            } else { self.personBox = nil }
+            } else {
+                self.personBox = nil
+            }
 
             if self.isRecording, let ci = result.ciScaled {
                 self.recorder.appendVideo(ciImage: ci, at: result.pts)
@@ -332,6 +318,9 @@ extension CameraViewModel: CameraEngineDelegate {
                       didOutputAudio sampleBuffer: CMSampleBuffer) {
         if isRecording { recorder.appendAudio(sampleBuffer) }
     }
+}
+
+
 
     private func blinkTorch() {
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
@@ -347,7 +336,7 @@ extension CameraViewModel: CameraEngineDelegate {
             }
         } catch { }
     }
-}
+
 
 
 
