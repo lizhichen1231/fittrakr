@@ -9,6 +9,7 @@ struct CameraScreen: View {
     var body: some View {
         GeometryReader { geo in
             ZStack {
+                
                 // 预览 + 叠加
                 PreviewCanvasView(
                     image: vm.processedCGImage,
@@ -16,6 +17,7 @@ struct CameraScreen: View {
                     personBoxN: vm.personBox,
                     deadZoneFraction: vm.deadZoneFraction
                 )
+                SkeletonDebugOverlayView()
                 .ignoresSafeArea()
 
                 // 顶部状态信息
