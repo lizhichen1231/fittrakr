@@ -9,7 +9,7 @@ protocol CameraEngineDelegate: AnyObject {
                       didOutputAudio sampleBuffer: CMSampleBuffer)
 }
 
-final class CameraEngine: NSObject {
+ class CameraEngine: NSObject {
 
     // Core
     private let session = AVCaptureSession()

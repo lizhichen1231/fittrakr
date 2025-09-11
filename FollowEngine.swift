@@ -162,8 +162,8 @@ final class FollowEngine {
     private struct Cfg {
         // Detection / Follow - 平衡灵敏和防抖
         var detectIntervalFrames = 1  // 每帧都检测，提高响应速度
-        var deadZone = CGSize(width: 0.25, height: 0.35)  // 适中的死区
-        var inPlaceDeadZone = CGSize(width: 0.25, height: 0.40)  // 原地运动时的特殊死区
+        var deadZone = CGSize(width: 0.35, height: 0.45)  // 适中的死区
+        var inPlaceDeadZone = CGSize(width: 0.40, height: 0.50)  // 原地运动时的特殊死区
 
         // PD smoothing - 更灵敏的响应
         var natFreqHzX: CGFloat = 1.9  // 提高频率，更快响应
@@ -177,12 +177,12 @@ final class FollowEngine {
         var velocityDamping: CGFloat = 0.95  // 轻微阻尼
 
         // Zoom - 改进的缩放参数
-        var maxZoom: CGFloat = 2.5
-        var zoomDeadband: CGFloat = 0.018  // 更小的死区
+        var maxZoom: CGFloat = 3.0
+        var zoomDeadband: CGFloat = 0.014  // 更小的死区
         var maxZoomChangePerSec: CGFloat = 3.0  // 提高变化速度
-        var maxZoomInPerSec: CGFloat = 0.9      // 更快的放大
-        var maxZoomOutPerSec: CGFloat = 0.7    // 更快的缩小
-        var targetWidthRange: ClosedRange<CGFloat> = 0.46...0.54
+        var maxZoomInPerSec: CGFloat = 1.5      // 更快的放大
+        var maxZoomOutPerSec: CGFloat = 1.2    // 更快的缩小
+        var targetWidthRange: ClosedRange<CGFloat> = 0.58...0.66
         
         // 缩放变化阈值
         var zoomChangeThreshold: CGFloat = 0.001
@@ -281,6 +281,12 @@ final class FollowEngine {
     private var kalmanY: SimpleKalmanFilter?
     private var kalmanW: SimpleKalmanFilter?
     private var kalmanH: SimpleKalmanFilter?
+    
+    // 平移累积器（横/纵）
+    private var posAccX: CGFloat = 0
+    private var posAccY: CGFloat = 0
+
+
     
     // 运动预测器
     private var motionPredictor = MotionPredictor()
@@ -774,8 +780,41 @@ final class FollowEngine {
         let finalCx = newCx
         let finalCy = newCy
 
-        let w = lerp(prev.width,  margins.width,  0.40)  // 更快的尺寸变化
-        let h = lerp(prev.height, margins.height, 0.40)
+        // ---- 在计算 w/h 的两行之前，插入这个局部工具函数 ----
+        @inline(__always)
+        func softDeadbandScale(prev: CGFloat, target: CGFloat, rel: CGFloat) -> CGFloat {
+            // 避免 prev≈0 的异常
+            guard prev > 1 else { return target }
+            let ratio = target / prev
+            let d = abs(ratio - 1)           // 相对偏差（0..+∞）
+            if d <= rel { return prev }      // 死区：完全不变
+            if d >= 2*rel { return target }  // 超出：全量跟随
+            // 过渡：平滑从“保持不变”到“跟随目标”
+            let t = (d - rel) / rel          // 0..1
+            let s = t*t*(3 - 2*t)            // smoothstep
+            let sign: CGFloat = (ratio >= 1) ? 1 : -1
+            let newRatio = 1 + sign * (s * d)  // 在边界连续：d=rel→增量0, d=2rel→增量=d
+            return prev * newRatio
+        }
+
+        // ---- 计算目标尺寸，并施加“相对尺度死区 / 锁高” ----
+        var targetW = margins.width
+        var targetH = margins.height
+
+        // 原地运动或预冻结时：强锁高（不改高度）
+        if isDoingExerciseInPlace || zoomFrozen {
+            targetH = prev.height
+        } else {
+            // 软锁高：小于 ±8% 的相对变化直接忽略，其它平滑过渡
+            targetH = softDeadbandScale(prev: prev.height, target: targetH, rel: 0.45)
+        }
+        // 宽度也做相对死区（小一点更灵敏）
+        targetW = softDeadbandScale(prev: prev.width, target: targetW, rel: 0.20)
+
+        // 最终仍用你原来的 lerp 做一次平滑混合（不改其它逻辑）
+        let w = lerp(prev.width,  targetW,  0.40)
+        let h = lerp(prev.height, targetH,  0.40)
+
 
         var rect = CGRect(x: finalCx - w/2, y: finalCy - h/2, width: w, height: h).integral
         rect = rect.intersection(sensorRect())
@@ -1242,3 +1281,5 @@ extension FollowEngine.Tunables {
         set { maxAccPxPerSec2 = newValue }
     }
 }
+
+
