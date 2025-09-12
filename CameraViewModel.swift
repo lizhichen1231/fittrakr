@@ -97,7 +97,10 @@ final class CameraViewModel: NSObject, ObservableObject {
     }
 
     // MARK: - æŽ§åˆ¶
-    func start() { camera.start() }
+    func start() {
+            camera.useUltraWideWithGDC(true)  // ← 新增：切到 0.5x 并开启系统畸变矫正
+            camera.start()
+        }
     func stop()  { camera.stop(); stopTimer() }
     func toggleRecord() { isRecording ? stopRecord() : startRecord() }
     func toggleLock() { hardLock.toggle() }
