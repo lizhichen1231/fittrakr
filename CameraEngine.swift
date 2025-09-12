@@ -204,3 +204,67 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
     }
 }
 
+
+extension CameraEngine {
+
+    /// 切到 0.5x（Ultra Wide/等效）并尽量开启系统几何畸变矫正（GDC）
+    func useUltraWideWithGDC(_ enable: Bool = true) {
+        // 1) 找后置相机：优先物理 Ultra Wide；其次双/三摄虚拟设备（能到 0.5x）
+        let discovery = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.builtInUltraWideCamera, .builtInTripleCamera, .builtInDualWideCamera, .builtInWideAngleCamera],
+            mediaType: .video,
+            position: .back
+        )
+        guard let device =
+                discovery.devices.first(where: { $0.deviceType == .builtInUltraWideCamera }) ??
+                discovery.devices.first(where: { $0.deviceType == .builtInTripleCamera || $0.deviceType == .builtInDualWideCamera }) ??
+                discovery.devices.first(where: { $0.deviceType == .builtInWideAngleCamera })
+        else {
+            print("⚠️ 没找到后置相机"); return
+        }
+
+        // 2) 重新配置 session 的视频输入
+        session.beginConfiguration()
+        defer { session.commitConfiguration() }
+
+        // 移除旧视频输入
+        for input in session.inputs {
+            if let di = input as? AVCaptureDeviceInput, di.device.hasMediaType(.video) {
+                session.removeInput(di)
+            }
+        }
+
+        do {
+            let input = try AVCaptureDeviceInput(device: device)
+            if session.canAddInput(input) { session.addInput(input) }
+        } catch {
+            print("⚠️ 创建视频输入失败：\(error)")
+            return
+        }
+
+        // 3) 锁定设备做 GDC / 变焦设置
+        do {
+            try device.lockForConfiguration()
+
+            // 系统几何畸变矫正（GDC）
+            if device.isGeometricDistortionCorrectionSupported {
+                device.isGeometricDistortionCorrectionEnabled = enable
+            }
+
+            // Ultra Wide 物理镜头用 1.0x；虚拟设备取最小可用（≈0.5x）
+            if device.deviceType == .builtInUltraWideCamera {
+                device.videoZoomFactor = max(1.0, device.minAvailableVideoZoomFactor)
+            } else {
+                device.videoZoomFactor = max(0.5, device.minAvailableVideoZoomFactor)
+            }
+
+            device.unlockForConfiguration()
+        } catch {
+            print("⚠️ 锁定设备失败：\(error)")
+        }
+
+        // 4) 调试输出（方便你确认已经生效）
+        let gdc = device.isGeometricDistortionCorrectionSupported ? device.isGeometricDistortionCorrectionEnabled : false
+        print("✅ Using: \(device.localizedName) | type=\(device.deviceType.rawValue) | zoom=\(device.videoZoomFactor) | GDC=\(gdc)")
+    }
+}

@@ -285,8 +285,6 @@ final class FollowEngine {
     // 平移累积器（横/纵）
     private var posAccX: CGFloat = 0
     private var posAccY: CGFloat = 0
-
-
     
     // 运动预测器
     private var motionPredictor = MotionPredictor()
@@ -572,97 +570,99 @@ final class FollowEngine {
 
     // MARK: 简化的检测函数 - 不再依赖 TargetSelector
     private func detectHuman(pb: CVPixelBuffer, dt: CGFloat) -> (CGRect, CGFloat)? {
-        let req = VNDetectHumanRectanglesRequest()
-        req.upperBodyOnly = false
-        let h = VNImageRequestHandler(cvPixelBuffer: pb, orientation: .up, options: [:])
-        
-        do {
-            try h.perform([req])
-            guard let list = req.results, !list.isEmpty else {
-                // 没有检测到人，直接返回nil
+            let req = VNDetectHumanRectanglesRequest()
+            req.upperBodyOnly = false
+            let h = VNImageRequestHandler(cvPixelBuffer: pb, orientation: .up, options: [:])
+            
+            do {
+                try h.perform([req])
+                guard let list = req.results, !list.isEmpty else {
+                    // 没有检测到人，直接返回nil
+                    return nil
+                }
+
+                func toSensor(_ r: CGRect) -> CGRect {
+                    CGRect(x: r.minX*sensorW,
+                           y: (1-r.maxY)*sensorH,
+                           width: r.width*sensorW,
+                           height: r.height*sensorH)
+                }
+
+                let candidates: [(CGRect, CGFloat)] = list.map { (toSensor($0.boundingBox), CGFloat($0.confidence)) }
+
+                // 简单策略：如果有上一帧，选最接近的；否则选最大的
+                let selected: (CGRect, CGFloat)
+                if let lastBox = rawBox {
+                    // 选择距离上一帧最近的
+                    selected = candidates.min { a, b in
+                        let distA = hypot(a.0.midX - lastBox.midX, a.0.midY - lastBox.midY)
+                        let distB = hypot(b.0.midX - lastBox.midX, b.0.midY - lastBox.midY)
+                        return distA < distB
+                    } ?? candidates[0]
+                } else {
+                    // 第一次检测，选择最大的
+                    selected = candidates.max { a, b in
+                        (a.0.width * a.0.height) < (b.0.width * b.0.height)
+                    } ?? candidates[0]
+                }
+                
+                let (rawRect, conf) = selected
+                
+                // 应用卡尔曼滤波平滑识别框
+                if kalmanX == nil { setupKalmanFilters() }
+                
+                let smoothedRect: CGRect
+                // 降低IoU阈值，减少重置 - 更渐进的处理
+                if let lastBox = rawBox {
+                    let iou = iouRect(rawRect, lastBox)
+                    if iou > 0.05 {  // 从0.15降到0.05
+                        // 正常更新
+                        let smoothX = kalmanX!.update(measurement: rawRect.midX)
+                        let smoothY = kalmanY!.update(measurement: rawRect.midY)
+                        let smoothW = kalmanW!.update(measurement: rawRect.width)
+                        let smoothH = kalmanH!.update(measurement: rawRect.height)
+                        
+                        smoothedRect = CGRect(
+                            x: smoothX - smoothW/2,
+                            y: smoothY - smoothH/2,
+                            width: smoothW,
+                            height: smoothH
+                        )
+                    } else {
+                        // 使用基于IoU的渐进混合
+                        let blendRatio: CGFloat = max(0.05, min(0.2, iou * 4))  // 基于IoU的渐进混合
+                        
+                        // 软重置卡尔曼滤波器
+                        kalmanX?.softReset(value: rawRect.midX, blendRatio: blendRatio)
+                        kalmanY?.softReset(value: rawRect.midY, blendRatio: blendRatio)
+                        kalmanW?.softReset(value: rawRect.width, blendRatio: blendRatio)
+                        kalmanH?.softReset(value: rawRect.height, blendRatio: blendRatio)
+                        
+                        // 混合旧框和新框
+                        smoothedRect = CGRect(
+                            x: lerp(lastBox.midX, rawRect.midX, blendRatio) - rawRect.width/2,
+                            y: lerp(lastBox.midY, rawRect.midY, blendRatio) - rawRect.height/2,
+                            width: lerp(lastBox.width, rawRect.width, blendRatio),
+                            height: lerp(lastBox.height, rawRect.height, blendRatio)
+                        )
+                    }
+                } else {
+                    // 首次检测，完全重置
+                    kalmanX?.reset(value: rawRect.midX)
+                    kalmanY?.reset(value: rawRect.midY)
+                    kalmanW?.reset(value: rawRect.width)
+                    kalmanH?.reset(value: rawRect.height)
+                    smoothedRect = rawRect
+                }
+                
+                return (smoothedRect, conf)
+                
+            } catch {
                 return nil
             }
-
-            func toSensor(_ r: CGRect) -> CGRect {
-                CGRect(x: r.minX*sensorW,
-                       y: (1-r.maxY)*sensorH,
-                       width: r.width*sensorW,
-                       height: r.height*sensorH)
-            }
-
-            let candidates: [(CGRect, CGFloat)] = list.map { (toSensor($0.boundingBox), CGFloat($0.confidence)) }
-
-            // 简单策略：如果有上一帧，选最接近的；否则选最大的
-            let selected: (CGRect, CGFloat)
-            if let lastBox = rawBox {
-                // 选择距离上一帧最近的
-                selected = candidates.min { a, b in
-                    let distA = hypot(a.0.midX - lastBox.midX, a.0.midY - lastBox.midY)
-                    let distB = hypot(b.0.midX - lastBox.midX, b.0.midY - lastBox.midY)
-                    return distA < distB
-                } ?? candidates[0]
-            } else {
-                // 第一次检测，选择最大的
-                selected = candidates.max { a, b in
-                    (a.0.width * a.0.height) < (b.0.width * b.0.height)
-                } ?? candidates[0]
-            }
-            
-            let (rawRect, conf) = selected
-            
-            // 应用卡尔曼滤波平滑识别框
-            if kalmanX == nil { setupKalmanFilters() }
-            
-            let smoothedRect: CGRect
-            // 降低IoU阈值，减少重置 - 更渐进的处理
-            if let lastBox = rawBox {
-                let iou = iouRect(rawRect, lastBox)
-                if iou > 0.05 {  // 从0.15降到0.05
-                    // 正常更新
-                    let smoothX = kalmanX!.update(measurement: rawRect.midX)
-                    let smoothY = kalmanY!.update(measurement: rawRect.midY)
-                    let smoothW = kalmanW!.update(measurement: rawRect.width)
-                    let smoothH = kalmanH!.update(measurement: rawRect.height)
-                    
-                    smoothedRect = CGRect(
-                        x: smoothX - smoothW/2,
-                        y: smoothY - smoothH/2,
-                        width: smoothW,
-                        height: smoothH
-                    )
-                } else {
-                    // 使用基于IoU的渐进混合
-                    let blendRatio: CGFloat = max(0.05, min(0.2, iou * 4))  // 基于IoU的渐进混合
-                    
-                    // 软重置卡尔曼滤波器
-                    kalmanX?.softReset(value: rawRect.midX, blendRatio: blendRatio)
-                    kalmanY?.softReset(value: rawRect.midY, blendRatio: blendRatio)
-                    kalmanW?.softReset(value: rawRect.width, blendRatio: blendRatio)
-                    kalmanH?.softReset(value: rawRect.height, blendRatio: blendRatio)
-                    
-                    // 混合旧框和新框
-                    smoothedRect = CGRect(
-                        x: lerp(lastBox.midX, rawRect.midX, blendRatio) - rawRect.width/2,
-                        y: lerp(lastBox.midY, rawRect.midY, blendRatio) - rawRect.height/2,
-                        width: lerp(lastBox.width, rawRect.width, blendRatio),
-                        height: lerp(lastBox.height, rawRect.height, blendRatio)
-                    )
-                }
-            } else {
-                // 首次检测，完全重置
-                kalmanX?.reset(value: rawRect.midX)
-                kalmanY?.reset(value: rawRect.midY)
-                kalmanW?.reset(value: rawRect.width)
-                kalmanH?.reset(value: rawRect.height)
-                smoothedRect = rawRect
-            }
-            
-            return (smoothedRect, conf)
-            
-        } catch {
-            return nil
         }
-    }
+
+
 
     // MARK: - 改进的 PD stabilizer
     private func stabilize(previous prev: CGRect, target raw: CGRect, dt: CGFloat) -> CGRect {
@@ -1140,11 +1140,11 @@ final class FollowEngine {
             
             let newZoom = clamp(sensorW / allowW, 1.0, zoom)
             if newZoom < zoom - 1e-3 {
-                self.zoom = newZoom
-                cropW = sensorW / newZoom
-                cropH = cropW * ar
+                self.zoom = lerp(self.zoom, newZoom, 0.30)
+                cropW = sensorW / self.zoom
+                    cropH = min(sensorH, cropW * ar)
                 if cropH > sensorH { cropH = sensorH; cropW = cropH / ar }
-                return newZoom
+                return self.zoom
             }
             return zoom
         }
@@ -1157,7 +1157,9 @@ final class FollowEngine {
         cx = clamp(cx, minCx, maxCx)
         cy = clamp(cy, minCy, maxCy)
 
-        let rect = CGRect(x: cx - cropW/2, y: cy - cropH/2, width: cropW, height: cropH).integral
+        let rect = CGRect(x: cx - cropW/2, y: cy - cropH/2, width: cropW, height: cropH)
+        // 保留浮点裁切，避免 1px 阶跃
+
         lastCropRect = rect
         return rect
     }
@@ -1208,7 +1210,12 @@ final class FollowEngine {
     // 渲染
     private func renderCrop(from pixelBuffer: CVPixelBuffer, crop: CGRect) -> (CGImage?, CIImage?) {
         let ciSrc = CIImage(cvPixelBuffer: pixelBuffer)
-        let ciCrop = CGRect(x: crop.minX, y: sensorH - crop.maxY, width: crop.width, height: crop.height).integral
+        let ciCrop = CGRect(x: crop.minX,
+                            y: sensorH - crop.maxY,
+                            width: crop.width,
+                            height: crop.height)
+        // CI 支持浮点裁切，保留亚像素精度
+
         let ciBounds = CGRect(x: 0, y: 0, width: sensorW, height: sensorH)
         let capped = ciCrop.intersection(ciBounds)
 
