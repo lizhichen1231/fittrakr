@@ -1,0 +1,16 @@
+# Xcode build output (240MB+, regenerable — never commit)
+build/
+DerivedData/
+*.xcuserstate
+**/xcuserdata/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Large local test media (not source; back up separately if needed)
+FitTrackr.1/TestVideos/
+*.mov
+
+# CocoaPods deps (regenerable via `pod install`; contains >100MB binaries GitHub rejects)
+Pods/
