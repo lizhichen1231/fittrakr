@@ -122,7 +122,7 @@ extension TrackingController {
 
             // 用平滑后的位置和缩放计算裁切（不是直接返回 cap）
             let centerRect = CGRect(x: smoothedCenter.x - 100, y: smoothedCenter.y - 200, width: 200, height: 400)
-            return computeFinalCropRect(zoom: zoom, center: slewGatePosition(centerRect), ar: ar)
+            return computeFinalCropRect(zoom: zoom, center: centerRect, ar: ar)   // target 直接喂出口二阶弹簧
         }
 
         // === 原地运动检测（优先使用髋部数据） ===
@@ -180,6 +180,12 @@ extension TrackingController {
         } else {
             anchorMidX = sb.midX; anchorMidY = sb.midY                   // 久无 pose → 过渡到 rect(slewGate 限速)
         }
+        // 取证:锚中心相对上帧跳变量(占画面宽比例)
+        dbgAnchorDelta = (dbgPrevAnchorX >= 0) ? hypot(anchorMidX - dbgPrevAnchorX, anchorMidY - dbgPrevAnchorY) / max(sensorW, 1) : 0
+        dbgPrevAnchorX = anchorMidX; dbgPrevAnchorY = anchorMidY
+        // 取证:锚中心相对上帧跳变量(占画面宽比例)
+        dbgAnchorDelta = (dbgPrevAnchorX >= 0) ? hypot(anchorMidX - dbgPrevAnchorX, anchorMidY - dbgPrevAnchorY) / max(sensorW, 1) : 0
+        dbgPrevAnchorX = anchorMidX; dbgPrevAnchorY = anchorMidY
 
         // 位置锁(与 zoom 无关,保留原行为):进入记锁定中心(用 pose 锚),退出清除。zoom 不再钉。
         if inPlaceActive {
@@ -219,6 +225,9 @@ extension TrackingController {
                 fed = raw
             }
             lastFedRatio = fed
+            dbgZoomSrc = lastTorsoRatio != nil ? "torso" : (lastHeightRatio != nil ? "rectH" : "tightH")   // 整合 HUD
+            dbgRatioDelta = (dbgPrevFedRatio >= 0) ? abs(fed - dbgPrevFedRatio) : 0   // 取证
+            dbgPrevFedRatio = fed
             updateZoomLevel(heightRatio: fed, dt: dtEff)
         }
 
@@ -242,7 +251,7 @@ extension TrackingController {
                                    width: sb.width, height: sb.height)   // midX=pose, midY=pose(对称)
         }
 
-        return computeFinalCropRect(zoom: zoom, center: slewGatePosition(centerForCrop), ar: cfg.outputSize.height / cfg.outputSize.width)
+        return computeFinalCropRect(zoom: zoom, center: centerForCrop, ar: cfg.outputSize.height / cfg.outputSize.width)   // target 直接喂出口二阶弹簧
     }
 
     // MARK: - 全局位置速率闸(流水线最后,所有分支汇合后的兜底)
@@ -374,6 +383,19 @@ extension TrackingController {
 
     // MARK: - 统一的crop矩形计算方法
     func computeFinalCropRect(zoom currentZoom: CGFloat, center: CGRect, ar: CGFloat) -> CGRect {
+        // ===== 二阶临界阻尼跟随(取代出口限速 + slewGate):target → 弹簧 → 最终 cropC/zoom =====
+        // 速度惯性本身限制单帧变化 → 废帧被惯性吃掉、下帧拉回,不需也不该再夹限速/clamp。
+        let _dtc = CGFloat(smoothedDt)
+        if !cropSpringValid {
+            cropCenterSpring.reset(to: CGPoint(x: center.midX, y: center.midY))
+            cropZoomSpring.reset(to: log(max(currentZoom, 0.01)))
+            cropSpringValid = true
+        }
+        let _sc = cropCenterSpring.update(target: CGPoint(x: center.midX, y: center.midY), dt: _dtc)
+        let currentZoom = exp(cropZoomSpring.update(target: log(max(currentZoom, 0.01)), dt: _dtc))
+        let center = CGRect(x: _sc.x - center.width / 2, y: _sc.y - center.height / 2,
+                            width: center.width, height: center.height)
+
         // 使用当前 zoom 计算裁切尺寸
         var cropW = sensorW / currentZoom
         var cropH = cropW * ar

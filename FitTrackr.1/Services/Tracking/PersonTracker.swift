@@ -84,6 +84,11 @@ extension TrackingController {
             guard let p = points[name], p.confidence >= minConf else { return nil }
             return p.location
         }
+        // 整合 HUD:门控前记四点 conf(取自同一份 points,不另算)
+        dbgCfLsh = points[.leftShoulder]?.confidence ?? 0
+        dbgCfRsh = points[.rightShoulder]?.confidence ?? 0
+        dbgCfLhp = points[.leftHip]?.confidence ?? 0
+        dbgCfRhp = points[.rightHip]?.confidence ?? 0
         // 严格四点门控：侧身/遮挡导致任一肩或髋低置信 → 冻结（zoom 基本不动），不用退化点硬算
         guard let ls = pt(.leftShoulder), let rs = pt(.rightShoulder),
               let lh = pt(.leftHip), let rh = pt(.rightHip) else { return nil }
@@ -107,7 +112,9 @@ extension TrackingController {
         let boxHeightRatio = getHeightRatioFromTightBox()
 
         // ===== 有好 torso 的帧:正常更新 + 顺带标定 torso↔box 转换比 =====
-        if let raw = getTorsoRatioFromPose(pose) {
+        let _torsoRaw = getTorsoRatioFromPose(pose)
+        dbgPoseValid = (_torsoRaw != nil)   // 取证:四点 0.5 门是否通过
+        if let raw = _torsoRaw {
             torsoLostFrames = 0   // 有 torso 读数 → 清零瞬丢计数
             // 改动1-① 标定:torsoToBoxHeight = EMA(torsoRatio / 全身框高比),仅好 torso 帧更新
             if let boxH = boxHeightRatio, boxH > 0.01 {

@@ -39,6 +39,9 @@ final class CameraViewModel: NSObject, ObservableObject {
     @Published var detSpecHUD = ""
     // slew 闸最近一次事件(SNAP/HIT),sticky,来自 follow.dbgSlewLine
     @Published var slewHUD = ""
+    // 跳变取证:冻结"最近一次显著跳变那一帧"的整行数据(poseValid/srcUsed/rectConf/各Δ)
+    @Published var probeHUD = ""
+    let probeJumpThreshold: CGFloat = 0.03   // anchorΔ 或 rectBoxΔ 超此(占画面宽 3%)算一次跳,刷新冻结行
 
     // 手势负载控制（调优阶段）：硬开关默认关闭，确保 MediaPipe 不进每帧预算；开启时也仅每 N 帧跑一次
     var gestureEnabled = false
@@ -367,15 +370,32 @@ extension CameraViewModel {
         }
         let msGest = (CACurrentMediaTime() - _tGest) * 1000
         let msTotal = (CACurrentMediaTime() - _tFrame) * 1000
-        let _perf = String(format: "FPS %.0f · rect %.0f pose %.0f skel %.0f gest %.0f rend %.0f · tot %.0f ms",
-                           result.fps, result.msRect, result.msPose, msSkel, msGest, result.msRender, msTotal)
+        let _cf = String(format: "sh %.2f/%.2f hp %.2f/%.2f",
+                         Double(follow.dbgCfLsh), Double(follow.dbgCfRsh),
+                         Double(follow.dbgCfLhp), Double(follow.dbgCfRhp))
+        let _perf = String(format: "FPS %.0f · dt %.0f · rect %.0f pose %.0f skel %.0f gest %.0f rend %.0f · tot %.0f ms",
+                           result.fps, follow.dbgRawDtMs, result.msRect, result.msPose, msSkel, msGest, result.msRender, msTotal)
+            + " · cf " + _cf + " · " + (follow.dbgZoomSrc.isEmpty ? "—" : follow.dbgZoomSrc)
         perfFrame += 1
         if perfFrame % 30 == 0 { print("⏱ " + _perf) }
+
+        // 跳变取证:每帧拼一行(poseValid/srcUsed/rectConf/各Δ),console 每帧 print + 最大跳帧冻进 HUD
+        let _probe = String(format: "PROBE t=%.2f f=%d poseValid=%@ srcUsed=%@ rectConf=%.2f anchorΔ=%.3f ratioΔ=%.3f rectBoxΔ=%.3f",
+                            pts.seconds, follow.frameCount,
+                            follow.dbgPoseValid ? "T" : "F",
+                            follow.dbgZoomSrc.isEmpty ? "—" : follow.dbgZoomSrc,
+                            Double(follow.dbgRectConf), Double(follow.dbgAnchorDelta),
+                            Double(follow.dbgRatioDelta), Double(follow.dbgRectBoxDelta))
+        print(_probe)
+        let _probeJump = max(follow.dbgAnchorDelta, follow.dbgRectBoxDelta)
 
         // 4) UI / 录制
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             self.perfHUD = _perf
+            if _probeJump > self.probeJumpThreshold {   // 最近一次显著跳变那一帧,冻结给真机直接读
+                self.probeHUD = _probe
+            }
             // 一次性:捕获配置就绪后填一次(静态量,启动后几帧内可用)
             if self.captureConfigHUD.isEmpty, !CameraEngine.lastCaptureConfig.isEmpty {
                 self.captureConfigHUD = CameraEngine.lastCaptureConfig

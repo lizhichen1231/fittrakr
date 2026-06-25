@@ -41,71 +41,32 @@ struct CameraScreen: View {
                     .padding(.horizontal, 16)
                     .padding(.top, 60)
 
-                    // 性能 HUD（阶段耗时 + 实际 FPS）
+                    // 整合诊断行:FPS·dt·阶段耗时·tot·四点conf·zoom测量源 —— 单行小字自动缩放,占屏最小
                     HStack {
                         Text(vm.perfHUD)
-                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                            .font(.system(size: 10, weight: .medium, design: .monospaced))
                             .foregroundColor(.green)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 5)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.5)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
                             .background(.black.opacity(0.55), in: Capsule())
-                        Spacer()
+                        Spacer(minLength: 0)
                     }
                     .padding(.horizontal, 16)
                     .padding(.top, 6)
 
-                    // 一次性捕获配置(format maxFPS vs 当前锁的 fps)——查帧率瓶颈用,看完删
-                    if !vm.captureConfigHUD.isEmpty {
+                    // 跳变取证:冻结"跳最大那一帧"(poseValid/srcUsed/rectConf/各Δ)——单行小字
+                    if !vm.probeHUD.isEmpty {
                         HStack {
-                            Text("📸 " + vm.captureConfigHUD)
-                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                                .foregroundColor(.yellow)
-                                .padding(.horizontal, 10).padding(.vertical, 5)
-                                .background(.black.opacity(0.6), in: Capsule())
-                            Spacer()
-                        }
-                        .padding(.horizontal, 16)
-                        .padding(.top, 4)
-                    }
-
-                    // 检测输入规格(wide/tele/Vision/out 尺寸)——查 pose=× / 尺寸跳变用
-                    if !vm.detSpecHUD.isEmpty {
-                        HStack {
-                            Text("🔬 " + vm.detSpecHUD)
-                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            Text(vm.probeHUD)
+                                .font(.system(size: 9, weight: .medium, design: .monospaced))
                                 .foregroundColor(.orange)
-                                .padding(.horizontal, 10).padding(.vertical, 5)
-                                .background(.black.opacity(0.6), in: Capsule())
-                            Spacer()
-                        }
-                        .padding(.horizontal, 16)
-                        .padding(.top, 4)
-                    }
-
-                    // slew 闸最近一次事件(sticky):SNAP=绕过限速 / HIT=真削到了 —— 看 1.85s/4.5s 跳点有没有
-                    if !vm.slewHUD.isEmpty {
-                        HStack {
-                            Text("🚦 " + vm.slewHUD)
-                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                                .foregroundColor(.pink)
-                                .padding(.horizontal, 10).padding(.vertical, 5)
-                                .background(.black.opacity(0.6), in: Capsule())
-                            Spacer()
-                        }
-                        .padding(.horizontal, 16)
-                        .padding(.top, 4)
-                    }
-
-
-                    // cx vs 几何 诊断行:仅 debug 开关开时 format+绘制(关时热路径与 UI 都零开销)
-                    if vm.showDebugOverlay && !vm.dbgCropHUD.isEmpty {
-                        HStack {
-                            Text(vm.dbgCropHUD)
-                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                                .foregroundColor(.cyan)
-                                .padding(.horizontal, 10).padding(.vertical, 5)
-                                .background(.black.opacity(0.6), in: Capsule())
-                            Spacer()
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.4)
+                                .padding(.horizontal, 8).padding(.vertical, 4)
+                                .background(.black.opacity(0.55), in: Capsule())
+                            Spacer(minLength: 0)
                         }
                         .padding(.horizontal, 16)
                         .padding(.top, 4)

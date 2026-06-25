@@ -276,6 +276,28 @@ final class TrackingController {
     let maxFedRatioStep: CGFloat = 0.08         // 每帧相对上一帧喂入值最多变 ±8%
     var lastFedRatio: CGFloat?                  // 上一帧真正喂给 updateZoomLevel 的值
 
+    // ===== 二阶临界阻尼跟随(取代出口限速 + slewGate):cropC/zoom 各跑一个临界阻尼弹簧 =====
+    // target 直接喂弹簧,弹簧输出即最终值;速度惯性本身限制单帧变化(速度不可能瞬间拉满)→
+    // 废帧只能让它轻微加速、下帧被拉回 → 无需额外限速(叠了反而打架)。coast/兜底只决定 target。
+    var cropCenterSpring: CriticalDampedSpring2D!   // 位置(像素),responseTime 0.35(更有重量感,不易被废帧带)
+    var cropZoomSpring: CriticalDampedSpring!        // zoom(log 域),responseTime 0.45(缩放比平移更慢更稳)
+    var cropSpringValid = false                      // false=首帧/重置后 reset 到 target(不从旧位置缓动)
+
+    // 整合 HUD 实时量(合进 perfHUD 一行):原始 dt(ms)、torso 四点 conf(左右肩/左右胯)、zoom 测量来源
+    var dbgRawDtMs: Double = 0
+    var dbgCfLsh: Float = 0, dbgCfRsh: Float = 0, dbgCfLhp: Float = 0, dbgCfRhp: Float = 0
+    var dbgZoomSrc = ""
+
+    // 跳变取证(只抓数据,不改逻辑):pose 四点门是否过、rect 兜底框 conf、本帧锚/ratio/rect框跳变量
+    var dbgPoseValid = false
+    var dbgRectConf: CGFloat = -1
+    var dbgAnchorDelta: CGFloat = 0            // 锚中心相对上帧位移(占画面宽比例)
+    var dbgRatioDelta: CGFloat = 0            // 喂入 ratio 相对上帧变化(绝对)
+    var dbgRectBoxDelta: CGFloat = 0          // rect 框中心相对上帧位移(占画面宽比例)
+    var dbgPrevAnchorX: CGFloat = -1, dbgPrevAnchorY: CGFloat = -1
+    var dbgPrevFedRatio: CGFloat = -1
+    var dbgPrevRectBox: CGRect?
+
     // =====================================================================================================
 
     // 位置滤波相关
@@ -332,6 +354,9 @@ final class TrackingController {
         positionSpring = CriticalDampedSpring2D(initialValue: .zero, responseTime: 0.20, maxVelocity: 1800)
         // 尺寸弹簧：响应时间 0.35s
         sizeSpring = CriticalDampedSpring2D(initialValue: .zero, responseTime: 0.35, maxVelocity: 800)
+        // 二阶跟随弹簧(取代出口限速):位置 0.35s、zoom(log) 0.45s,maxVelocity 不限(惯性自限)
+        cropCenterSpring = CriticalDampedSpring2D(initialValue: .zero, responseTime: 0.35)
+        cropZoomSpring   = CriticalDampedSpring(initialValue: 0, responseTime: 0.45)
     }
 
     // MARK: - 公共 API
@@ -475,6 +500,7 @@ final class TrackingController {
         let clampedDt = min(max(rawDt, dtMin), dtMax)
         smoothedDt = smoothedDt * (1 - dtSmoothAlpha) + clampedDt * dtSmoothAlpha
         let dt = smoothedDt
+        dbgRawDtMs = rawDt * 1000   // 整合 HUD 用
         if logDtForTuning {
             print(String(format: "⏱dt raw=%.1f clamped=%.1f smoothed=%.1f ms",
                          rawDt * 1000, clampedDt * 1000, smoothedDt * 1000))
@@ -508,7 +534,11 @@ final class TrackingController {
             let _tRect = CACurrentMediaTime()
             let _rectResult = detectHumanRectFallback(pb: detPB)
             msRect = (CACurrentMediaTime() - _tRect) * 1000
+            dbgRectConf = -1; dbgRectBoxDelta = 0   // 取证:本帧默认(rect 没返回时即此)
             if let (rect, conf) = _rectResult {
+                dbgRectConf = conf   // 取证:即使无门也记 rect 返回框的 conf
+                dbgRectBoxDelta = dbgPrevRectBox.map { hypot(rect.midX - $0.midX, rect.midY - $0.midY) / max(sensorW, 1) } ?? 0
+                dbgPrevRectBox = rect
                 rawBox = rect
                 confidence = conf
                 missCount = 0
@@ -551,6 +581,7 @@ final class TrackingController {
                 ingestTorsoMeasurement(pose)
             } else {
                 lastPoseObservation = nil
+                dbgPoseValid = false             // 取证:pose 没检到 → 四点门当然没过
                 lastTightBoxIsFullBody = false   // 改动2:无骨骼 → 不启用不出框钳位(避免误钳)
                 // 骨骼失败不影响缩放：lastTorsoRatio 保留上一帧值，无骨骼则由调用方回退矩形高
             }
@@ -740,6 +771,7 @@ final class TrackingController {
         zoomController.reset(toZoom: 1.0)
         positionSpring?.reset(to: .zero)
         sizeSpring?.reset(to: .zero)
+        cropSpringValid = false   // 重新检测时 crop 弹簧 reset 到新 target,不从旧位置缓动
 
         // 重置智能构图系统
         actionClassifier.reset()
