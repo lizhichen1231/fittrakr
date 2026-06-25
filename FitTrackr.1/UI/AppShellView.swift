@@ -69,6 +69,10 @@ struct LibraryPlaceholder: View {
 }
 
 struct SettingsPlaceholder: View {
+    #if DEBUG
+    @State private var showPlayback = false
+    #endif
+
     var body: some View {
         ZStack {
             Color.black.opacity(0.9)
@@ -79,8 +83,26 @@ struct SettingsPlaceholder: View {
                 Text("设置")
                     .font(.title2)
                     .foregroundColor(.white.opacity(0.5))
+
+                // 仅 DEBUG:视频回放追踪测试(模拟器/真机 DEBUG 都可进;Release 不含)。
+                // 喂录像 = 确定性输入,真机有 ANE、帧率正常,正好复现/debug tracking。
+                #if DEBUG
+                Button { showPlayback = true } label: {
+                    Label("回放追踪测试 (Debug)", systemImage: "play.rectangle.on.rectangle")
+                        .font(.system(size: 15, weight: .semibold))
+                        .padding(.horizontal, 18).padding(.vertical, 12)
+                        .background(Color.blue.opacity(0.75), in: Capsule())
+                        .foregroundColor(.white)
+                }
+                .padding(.top, 8)
+                #endif
             }
         }
         .ignoresSafeArea()
+        #if DEBUG
+        .fullScreenCover(isPresented: $showPlayback) {
+            VideoTrackingPlaybackView()
+        }
+        #endif
     }
 }

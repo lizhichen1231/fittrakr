@@ -1,6 +1,7 @@
 import AVFoundation
 import Vision
 import CoreImage
+import QuartzCore
 
 enum CaptureMode { case fitness, dance }
 
@@ -15,6 +16,10 @@ struct FollowResult {
     let ciScaled: CIImage?
     let pts: CMTime
     let sensorSize: CGSize
+    // 阶段计时（ms），供 HUD/日志显示
+    var msRect: Double = 0
+    var msPose: Double = 0
+    var msRender: Double = 0
 }
 
 // 可热调参数
@@ -76,7 +81,7 @@ final class TrackingController {
         var velocityDamping: CGFloat = 0.95  // 轻微阻尼
 
         // Zoom
-        var maxZoom: CGFloat = 3.0   // ← 仍在用：作为 ZoomController 的 maxZoom 上限（init/applyPreset 同步）
+        var maxZoom: CGFloat = 5.0   // ← 仍在用：作为 ZoomController 的 maxZoom 上限（init/applyPreset 同步；激进档 5.0）
 
         // —— 以下变焦参数均已 DEPRECATED：不再驱动 zoom，变焦控制律见 ZoomController / ZoomConfig。
         //    保留仅为兼容 Tunables/UI/预设序列化，待 UI 重构时清理。 ——
@@ -114,6 +119,13 @@ final class TrackingController {
 
         // 位置滤波系数
         var positionFilterAlpha: CGFloat = 0.25  // 更快的响应速度
+
+        // —— 躯干高测量预处理（门控 + 突变拒绝 + 小窗中值）——
+        //    链路：算躯干高 → [门控→突变拒绝→中值] → 喂 ZoomController。就这两层，不再叠 EMA/卡尔曼。
+        var torsoMinConfidence: Float = 0.5     // 肩/髋关键点置信度门控：四点任一低于此值 → 冻结（不更新 ratio）
+        var torsoOutlierMaxStep: CGFloat = 0.25 // 改动B:0.15→0.25,放宽门,真·快速移动不被误判离群
+        var torsoMedianWindow = 5               // 小窗中值滤波帧数（压偶发单帧跳变）
+        var torsoOutlierResetFrames = 3         // 改动B:8→3,离群只惯性续走几帧就软 re-baseline,不长时间冻
 
         // Other
         var lostFramesThreshold = 5  // 降低阈值，更快响应丢失
@@ -194,7 +206,77 @@ final class TrackingController {
     var lastTightBox: CGRect?  // 骨骼点计算的紧贴框（原始值）
     var smoothedTightBox: CGRect?  // 平滑后的骨骼框（用于显示黄框）
     let tightBoxSmoothAlpha: CGFloat = 0.15  // 黄框平滑系数（越小越平滑）
-    var lastHeightRatio: CGFloat?  // 缓存的高度比例
+    var lastHeightRatio: CGFloat?  // 缓存的高度比例（全身框高/画面高，矩形兜底）
+    var lastTorsoRatio: CGFloat?   // 缓存的躯干比例（肩中点→髋中点投影距离/画面高）—— 缩放主测量；缺帧/低置信/离群时保留上一帧值，避免突变
+    var torsoMedianBuf: [CGFloat] = []  // 小窗中值滤波缓冲（仅放通过门控+突变拒绝的 ratio）
+    var torsoOutlierStreak = 0          // 连续离群帧计数（超 cfg.torsoOutlierResetFrames 则重新基准）
+
+    // ===================== Zoom 行为四处修正:新增常量与状态(每处独立、可单独 toggle)=====================
+    // 改动1:torso 冻结回退(torso 掉点时用 bbox 高在 torso 尺度上估值,治本修过放大)
+    let torsoToBoxCalibAlpha: CGFloat = 0.10   // torsoToBoxHeight 慢 EMA 系数 α
+    let torsoToBoxCalibFrames = 10             // 攒够 k 帧好 torso 才认定标定完成
+    var torsoToBoxHeight: CGFloat = 0          // 转换比 = torsoRatio / 全身框高比(EMA);0=未初始化
+    var torsoCalibFrames = 0                   // 已累计的好 torso 帧
+    var hasCalibratedRatio = false             // 是否已标定(可用 bbox 估 torso)
+
+    // 改动2:bbox 不出框上钳(安全网,只往外拉)
+    let targetBodyFraction: CGFloat = 0.90     // 全身框最多占画面高的比例
+    let bodyBoxJointMinConfidence: Float = 0.3 // 判定"完整全身框"的关键点置信门控
+    var lastTightBoxIsFullBody = false         // 当前 tightBox 是否含上(头/肩)下(踝)完整
+
+    // 改动3:原地锁定的尺度逃逸(修走近不缩)
+    let scaleStableThreshold: CGFloat = 0.08   // (尺度逃逸)叠在 lock 上;disableInPlaceLock=true 时 isScaleStable 不再被调 → 死代码
+    let torsoScaleHistorySize = 12             // 尺度稳定判定的近期窗口
+    let scaleStableMinSamples = 5              // 样本不足此数 → 不阻止锁定(维持原 hip-only 行为)
+    var torsoRatioHistory: [CGFloat] = []      // 近期 torso 比例(含改动1 的估计值)
+
+    // 改动4:稳住 dt(修时快时慢)
+    let dtMin: Double = 1.0 / 60.0
+    let dtMax: Double = 1.0 / 20.0             // dt 上钳:慢帧不再放大平滑步长/速率帽
+    let dtSmoothAlpha: Double = 0.15           // smoothedDt 短 EMA 系数
+    var smoothedDt: Double = 1.0 / 60.0        // 平滑后的 dt(喂控制律 alpha 与速率帽)
+    let logDtForTuning = false                 // 关:每帧 print 是帧率回退主因(dt 已验证完)。需要时临时置 true。
+    var dbgCropLine = ""                        // cx vs 几何 诊断行,仅 hudDebugEnabled 时才 format(见下)
+    var hudDebugEnabled = false                 // 由 VM 从 showDebugOverlay 同步:关时不每帧 String(format:)
+    var dbgDetSpec = ""                         // 检测输入规格(wide/tele/Vision/out 尺寸),仅尺寸变化时 format
+    var lastDetW = -1, lastDetH = -1            // 上次 wide 帧尺寸(整数比较,避免每帧分配)
+    var dbgSlewLine = ""                        // slew 闸最近一次事件(SNAP/HIT),sticky 给 HUD
+
+    // 全局位置速率闸(流水线最后、所有分支汇合后的兜底):平滑后再夹住单帧最大移动,任何上游突变都不跳。
+    // 归一化 0..1。帧率无关:单帧上限 = maxPosRate × smoothedDt。zoom 的同类闸已在 ZoomController(log 域),不重复。
+    let maxPosRate: CGFloat = 0.4              // 0.8→0.4:压「连续同向累积」漂(太钝再加 velTau 而非继续降)
+    var prevCropCx: CGFloat = 0
+    var prevCropCy: CGFloat = 0
+    var slewHitStreak = 0                       // 连续顶上限帧数(=同向冲刺长度),诊断「逐帧合规累积」
+    var prevCropValid = false                 // 改B:仅【冷启动首帧】为 false→snap;运行中重置不再置 false(走 slewGate 限速)
+
+    // 改A:pose 回退 coast(治锚抖)——pose 丢失时先保持上一帧 pose 锚 poseCoastFrames 帧,再过渡到 rect
+    let poseCoastFrames = 8                     // @60fps ≈ 130ms
+    var lastPoseAnchorX: CGFloat = 0
+    var lastPoseAnchorY: CGFloat = 0
+    var poseLostFrames = 0
+    var poseAnchorValid = false
+
+    // 改动A:软锁定(原地重阻尼,不冻死)——实现方式:dtEff = dt / stiffness 喂控制器
+    //         (等价 tau_eff = tau×stiffness、rateCap_eff = maxLogZoomRate/stiffness,不改 ZoomController)
+    let disableInPlaceLock = true              // 禁用整条 in-place lock:任何时候都走正常 pose 跟随。置 false 即恢复。
+    let lockStiffness: CGFloat = 4.0           // 原地刚度倍数(起手 4.0)
+    let lockRampTime: CGFloat = 0.3            // 刚度渐入渐出时间(秒),避免 engage/release 速度突变
+    var lockStiffnessCurrent: CGFloat = 1.0    // 当前刚度(渐变)
+    var prevInPlaceActive = false              // LOCK 事件日志:上一帧锁定态
+
+    // 改动B:离群惯性续走(不冻目标)
+    let torsoVelAlpha: CGFloat = 0.30          // torso 每帧速度 EMA 系数
+    let torsoCoastVelDecay: CGFloat = 0.90     // coast 期间速度衰减(防长 coast 跑飞)
+    let torsoCoastBlendAlpha: CGFloat = 0.30   // re-baseline 软着陆混合(别硬 snap 到 raw)
+    var torsoVelocity: CGFloat = 0             // 最近有效 torso 每帧变化(coast 外推用)
+    var torsoLostFrames = 0                     // 改A(zoom侧):torso 连续瞬丢帧数;< poseCoastFrames 时保持上一帧值,不 est
+
+    // 单层离群限幅:只作用在三级兜底【选完的最终 heightRatio】上,限制每帧变化幅度(唯一出口、单一变量,不和兜底抢源)
+    let maxFedRatioStep: CGFloat = 0.08         // 每帧相对上一帧喂入值最多变 ±8%
+    var lastFedRatio: CGFloat?                  // 上一帧真正喂给 updateZoomLevel 的值
+
+    // =====================================================================================================
 
     // 位置滤波相关
     var lastFilteredX: CGFloat = 0
@@ -222,6 +304,20 @@ final class TrackingController {
         .workingColorSpace: CGColorSpaceCreateDeviceRGB(),
         .outputColorSpace : CGColorSpaceCreateDeviceRGB()
     ])
+
+    // 检测降采样池（长边 720）：只缩 Vision 输入；坐标用归一化、渲染仍走全分辨率
+    var detPool: CVPixelBufferPool?
+    var detPoolW = 0
+    var detPoolH = 0
+    let detLongSide: CGFloat = 720
+
+    // 复用 Vision request（避免每帧 new）
+    let rectRequest: VNDetectHumanRectanglesRequest = {
+        let r = VNDetectHumanRectanglesRequest()
+        r.upperBodyOnly = false
+        return r
+    }()
+    let poseRequest = VNDetectHumanBodyPoseRequest()
 
     // 初始化时创建滤波器
     init() {
@@ -270,7 +366,7 @@ final class TrackingController {
         cfg.softZoneGain = max(0.5, min(t.softZoneGain, 1.0))
         cfg.maxVelPxPerSec  = max(200, min(t.maxVelPxPerSec, 6000))
         cfg.maxAccPxPerSec2 = max(2000, min(t.maxAccPxPerSec2, 40000))
-        cfg.maxZoom = max(1.0, min(t.maxZoom, 3.0))
+        cfg.maxZoom = max(1.0, min(t.maxZoom, 5.0))
         cfg.zoomDeadband = max(0.0, min(t.zoomDeadband, 0.10))
         cfg.maxZoomChangePerSec = max(0.05, min(t.maxZoomChangePerSec, 2.0))
         cfg.maxZoomInPerSec = max(0.1, min(t.maxZoomInPerSec, 3.0))
@@ -294,7 +390,7 @@ final class TrackingController {
 
         switch mode {
         case .fitness:
-            cfg.maxZoom = 3.0  // 最大 3x
+            cfg.maxZoom = 5.0  // 最大 5x（激进档）
             cfg.targetHeightRange = 0.60...0.75
             cfg.zoomNatFreqHz = 2.2           // 降低：更平滑的缩放响应
             cfg.zoomDamping = 1.05            // 提高：更强阻尼
@@ -373,15 +469,46 @@ final class TrackingController {
         sensorH = CGFloat(CVPixelBufferGetHeight(wideFrame))
 
         let now = Date()
-        let dt = max(1.0/60.0, now.timeIntervalSince(lastTime))
+        // 改动4:稳住 dt —— 上下钳 + 短 EMA(不加新滤波层,只平滑这一个值;live/回放共用)
+        let rawDt = now.timeIntervalSince(lastTime)
         lastTime = now
+        let clampedDt = min(max(rawDt, dtMin), dtMax)
+        smoothedDt = smoothedDt * (1 - dtSmoothAlpha) + clampedDt * dtSmoothAlpha
+        let dt = smoothedDt
+        if logDtForTuning {
+            print(String(format: "⏱dt raw=%.1f clamped=%.1f smoothed=%.1f ms",
+                         rawDt * 1000, clampedDt * 1000, smoothedDt * 1000))
+        }
+
+        // 阶段计时（ms）：供 HUD 显示
+        var msRect = 0.0, msPose = 0.0, msRender = 0.0
 
         // ========== 1. 人体检测：矩形优先（位置），骨骼辅助（缩放/显示）==========
         if frameCount % max(1, cfg.detectIntervalFrames) == 0 {
 
+            // 检测降采样：Vision 只看长边 720 的小图（坐标归一化，不影响后续与渲染）
+            let detPB = downscaledForDetection(wideFrame) ?? wideFrame
+
+            #if DEBUG
+            // 检测输入规格诊断:wide 帧尺寸变化时才记一次(便宜)。看 wide 到底变不变、Vision 实吃多大。
+            if Int(sensorW) != lastDetW || Int(sensorH) != lastDetH {
+                lastDetW = Int(sensorW); lastDetH = Int(sensorH)
+                let tw = telephotoFrame.map { CVPixelBufferGetWidth($0) } ?? 0
+                let th = telephotoFrame.map { CVPixelBufferGetHeight($0) } ?? 0
+                dbgDetSpec = String(format: "wide=%dx%d tele=%dx%d →Vision=%dx%d out=%dx%d",
+                                    Int(sensorW), Int(sensorH), tw, th,
+                                    CVPixelBufferGetWidth(detPB), CVPixelBufferGetHeight(detPB),
+                                    Int(cfg.outputSize.width), Int(cfg.outputSize.height))
+                print("🔬 DET " + dbgDetSpec)
+            }
+            #endif
+
             // Step A: 矩形检测 —— 找"人在哪" + 缩放依据（鲁棒性高，遮挡友好）
             var rectDetected = false
-            if let (rect, conf) = detectHumanRectFallback(pb: wideFrame) {
+            let _tRect = CACurrentMediaTime()
+            let _rectResult = detectHumanRectFallback(pb: detPB)
+            msRect = (CACurrentMediaTime() - _tRect) * 1000
+            if let (rect, conf) = _rectResult {
                 rawBox = rect
                 confidence = conf
                 missCount = 0
@@ -393,8 +520,12 @@ final class TrackingController {
             }
 
             // Step B: 骨骼检测 —— 判断"人在干什么"（姿态分析 + 黄框显示）
-            if let pose = detectPose(pb: wideFrame) {
+            let _tPose = CACurrentMediaTime()
+            let _poseResult = detectPose(pb: detPB)
+            msPose = (CACurrentMediaTime() - _tPose) * 1000
+            if let pose = _poseResult {
                 lastPoseObservation = pose
+                lastTightBoxIsFullBody = tightBoxIsFullBody(pose)   // 改动2:本帧框是否完整全身
 
                 // 骨骼紧贴框用于显示（黄框）—— 应用 EMA 平滑
                 if let tightBox = getTightBoxFromPose(pose) {
@@ -413,10 +544,15 @@ final class TrackingController {
                         smoothedTightBox = tightBox
                     }
                 }
-                // 注意：不再从骨骼获取 heightRatio，缩放统一用矩形
+
+                // 缩放主测量：躯干高（肩中点→髋中点投影/画面高）。刚体，抗原地动作、低噪声。
+                // 经测量预处理层（门控→突变拒绝→小窗中值）写入 lastTorsoRatio；
+                // 缺帧/低置信/离群时保留上一帧值 → ratio 不突变。
+                ingestTorsoMeasurement(pose)
             } else {
                 lastPoseObservation = nil
-                // 骨骼失败不影响缩放，因为缩放已在 Step A 基于矩形计算
+                lastTightBoxIsFullBody = false   // 改动2:无骨骼 → 不启用不出框钳位(避免误钳)
+                // 骨骼失败不影响缩放：lastTorsoRatio 保留上一帧值，无骨骼则由调用方回退矩形高
             }
 
             // Step C: 如果矩形也失败，处理丢失
@@ -427,6 +563,11 @@ final class TrackingController {
                 if missCount > cfg.lostFramesThreshold {
                     rawBox = nil
                     lastHeightRatio = nil
+                    lastTorsoRatio = nil
+                    lastFedRatio = nil          // 限幅参照清掉,重新检测时首值直通、不被陈旧值钳
+                    torsoMedianBuf.removeAll()
+                    torsoOutlierStreak = 0
+                    torsoLostFrames = 0
                     lastTightBox = nil
                     smoothedTightBox = nil
                     lastPoseObservation = nil
@@ -469,6 +610,9 @@ final class TrackingController {
             stableBox = nil
         }
 
+        /* ───── 注掉:自动 shot 分类器(display-only)。zoomMode 恒 .fixed 时它本就不喂取景,
+           注掉只是停掉每帧空转 + 断掉「Talking Head/景别」标签数据源(预期为空)。
+           framingOffset 保持 .zero,取景 = fixed 全身,行为不变。可逆:取消本段注释即恢复。
         // ===== 智能构图系统 =====
         // 1. 动作分类
         let actionState = actionClassifier.update(pose: lastPoseObservation)
@@ -487,6 +631,7 @@ final class TrackingController {
             let (shotType, state, progress) = shotDecider.getCurrentState()
             print("🎬 智能构图: action=\(actionState.rawValue) shot=\(shotType.rawValue) state=\(state.rawValue) progress=\(String(format: "%.0f%%", progress * 100))")
         }
+           ───── 注掉结束 ───── */
 
         // 固定 AR + 变焦（含原地运动检测）
         let crop = computeCropRect(dt: CGFloat(dt))
@@ -542,7 +687,9 @@ final class TrackingController {
             cropForRender = crop
         }
 
+        let _tRender = CACurrentMediaTime()
         let (cg, ciScaled) = renderCrop(from: frameToUse, crop: cropForRender)
+        msRender = (CACurrentMediaTime() - _tRender) * 1000
 
         let fps = dt > 0 ? 1.0/dt : 0
 
@@ -551,7 +698,8 @@ final class TrackingController {
             rawBox: rawBox,
             stableBox: smoothedTightBox ?? stableBox,
             cropRect: cropForRender, previewCG: cg, ciScaled: ciScaled,
-            pts: pts, sensorSize: CGSize(width: sensorW, height: sensorH)
+            pts: pts, sensorSize: CGSize(width: sensorW, height: sensorH),
+            msRect: msRect, msPose: msPose, msRender: msRender
         )
     }
 
@@ -564,6 +712,9 @@ final class TrackingController {
         positionStableFrames = 0
         lockedZoom = 0
         lockedCenter = nil
+        // 改B:运行中重置【不】置 prevCropValid=false → 不 snap,由 slewGate 限速回到新目标(只冷启动首帧才瞬移)
+        poseAnchorValid = false   // 重置 pose coast,避免用上一段的陈旧 pose 锚
+        poseLostFrames = 0
         lastFilteredX = 0
         lastFilteredY = 0
         lastVelX = 0
@@ -583,6 +734,7 @@ final class TrackingController {
         lastTightBox = nil
         smoothedTightBox = nil
         lastHeightRatio = nil
+        lastFedRatio = nil
 
         // 重置变焦控制器 + 位置/尺寸弹簧
         zoomController.reset(toZoom: 1.0)

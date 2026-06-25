@@ -117,11 +117,20 @@ final class MPHandGesture: _HandGestureCore {
     private var tsMs: Int64 = 0
     private var framePeriodMs: Int64 = 33
     private var mode: GestureTriggerMode = .wave
-    private var sampleEvery: Int = 3
+    private var sampleEvery: Int = 6  // 每6帧检测一次（进一步降低频率）
     private var frame = 0
     private let toggle = StableToggle(needStable: 3, cooldownSeconds: 3.0)
     private var initTime = Date()
     var onLandmarks: (([CGPoint]) -> Void)?
+
+    // 异步处理：不阻塞主线程
+    private let detectQueue = DispatchQueue(label: "gesture.detect", qos: .userInitiated)
+    private var isProcessing = false
+    private var pendingDecision: GestureDecision = .none
+    private let stateLock = NSLock()
+
+    // 缓存上一次的landmarks用于回调
+    private var cachedLandmarks: [CGPoint] = []
 
     init?() {
         do {
@@ -133,9 +142,9 @@ final class MPHandGesture: _HandGestureCore {
             base.modelAssetPath = url.path
             opts.baseOptions = base
             opts.runningMode = .video
-            opts.numHands = 2  // 检测最多2个手
-            opts.minHandDetectionConfidence = 0.30
-            opts.minHandPresenceConfidence = 0.30
+            opts.numHands = 1  // 只检测1个手，减少计算量
+            opts.minHandDetectionConfidence = 0.35
+            opts.minHandPresenceConfidence = 0.35
             opts.minTrackingConfidence = 0.50
             landmarker = try HandLandmarker(options: opts)
         } catch {
@@ -147,14 +156,19 @@ final class MPHandGesture: _HandGestureCore {
         mode = m
         reset()
     }
-    
+
     func setSampleInterval(_ n: Int) {
         sampleEvery = max(1, n)
     }
-    
+
     func reset() {
+        stateLock.lock()
         frame = 0
         tsMs = 0
+        pendingDecision = .none
+        isProcessing = false
+        cachedLandmarks = []
+        stateLock.unlock()
         toggle.reset()
         initTime = Date()
     }
@@ -164,62 +178,140 @@ final class MPHandGesture: _HandGestureCore {
         if Date().timeIntervalSince(initTime) < 0.5 {
             return .none
         }
-        
+
         if mode == .off {
             onLandmarks?([])
             return .none
         }
-        
+
         frame &+= 1
-        if (frame % sampleEvery) != 0 { return .none }
-        
+        if (frame % sampleEvery) != 0 {
+            // 非采样帧：返回缓存的landmarks和pending decision
+            stateLock.lock()
+            let cached = cachedLandmarks
+            let decision = pendingDecision
+            if decision != .none { pendingDecision = .none }
+            stateLock.unlock()
+
+            if !cached.isEmpty { onLandmarks?(cached) }
+            return decision
+        }
+
+        // 检查是否正在处理中
+        stateLock.lock()
+        let alreadyProcessing = isProcessing
+        if !alreadyProcessing { isProcessing = true }
+        let currentDecision = pendingDecision
+        if currentDecision != .none { pendingDecision = .none }
+        let cached = cachedLandmarks
+        stateLock.unlock()
+
+        // 如果上一帧还没处理完，直接返回缓存结果
+        if alreadyProcessing {
+            if !cached.isEmpty { onLandmarks?(cached) }
+            return currentDecision
+        }
+
         guard let lm = landmarker else {
+            stateLock.lock()
+            isProcessing = false
+            stateLock.unlock()
             onLandmarks?([])
             return .none
         }
 
-        do {
-            let mpImage = try MPImage(pixelBuffer: pixelBuffer)
-            tsMs &+= framePeriodMs * Int64(sampleEvery)
-            let result = try lm.detect(videoFrame: mpImage, timestampInMilliseconds: Int(tsMs))
+        // 记录当前时间戳用于异步处理
+        let currentTs = tsMs
+        tsMs &+= framePeriodMs * Int64(sampleEvery)
 
-            guard !result.landmarks.isEmpty else {
-                onLandmarks?([])
-                return .none
+        // 尝试创建 MPImage（这个操作很快）
+        let mpImage: MPImage
+        do {
+            mpImage = try MPImage(pixelBuffer: pixelBuffer)
+        } catch {
+            stateLock.lock()
+            isProcessing = false
+            stateLock.unlock()
+            onLandmarks?([])
+            return currentDecision
+        }
+
+        // 异步执行检测
+        let currentMode = mode
+        let toggleRef = toggle
+        let landmarksCallback = onLandmarks
+
+        detectQueue.async { [weak self] in
+            guard let self = self else { return }
+
+            defer {
+                self.stateLock.lock()
+                self.isProcessing = false
+                self.stateLock.unlock()
             }
 
-            var openHand: [CGPoint]? = nil
-            var anyOpen = false
-            
-            for (_, hand) in result.landmarks.enumerated() {
-                let pts: [CGPoint] = hand.map { CGPoint(x: CGFloat($0.x), y: CGFloat($0.y)) }
-                
-                if OpenPalmRule.isOpenPalm(pts) {
-                    anyOpen = true
-                    if openHand == nil {
-                        openHand = pts
+            do {
+                let result = try lm.detect(videoFrame: mpImage, timestampInMilliseconds: Int(currentTs))
+
+                guard !result.landmarks.isEmpty else {
+                    self.stateLock.lock()
+                    self.cachedLandmarks = []
+                    self.stateLock.unlock()
+                    DispatchQueue.main.async { landmarksCallback?([]) }
+                    return
+                }
+
+                var openHand: [CGPoint]? = nil
+                var anyOpen = false
+
+                for hand in result.landmarks {
+                    let pts: [CGPoint] = hand.map { CGPoint(x: CGFloat($0.x), y: CGFloat($0.y)) }
+
+                    if OpenPalmRule.isOpenPalm(pts) {
+                        anyOpen = true
+                        if openHand == nil {
+                            openHand = pts
+                        }
                     }
                 }
-            }
-            
-            if let hand = openHand {
-                onLandmarks?(hand)
-            } else {
-                let firstHand = result.landmarks.first!
-                let pts: [CGPoint] = firstHand.map { CGPoint(x: CGFloat($0.x), y: CGFloat($0.y)) }
-                onLandmarks?(pts)
-            }
 
-            if mode == .wave {
-                return toggle.step(active: anyOpen)
+                let finalPts: [CGPoint]
+                if let hand = openHand {
+                    finalPts = hand
+                } else {
+                    let firstHand = result.landmarks.first!
+                    finalPts = firstHand.map { CGPoint(x: CGFloat($0.x), y: CGFloat($0.y)) }
+                }
+
+                // 更新缓存
+                self.stateLock.lock()
+                self.cachedLandmarks = finalPts
+                self.stateLock.unlock()
+
+                // 回调landmarks
+                DispatchQueue.main.async { landmarksCallback?(finalPts) }
+
+                // 计算decision
+                if currentMode == .wave {
+                    let decision = toggleRef.step(active: anyOpen)
+                    if decision != .none {
+                        self.stateLock.lock()
+                        self.pendingDecision = decision
+                        self.stateLock.unlock()
+                    }
+                }
+
+            } catch {
+                self.stateLock.lock()
+                self.cachedLandmarks = []
+                self.stateLock.unlock()
+                DispatchQueue.main.async { landmarksCallback?([]) }
             }
-            
-            return .none
-            
-        } catch {
-            onLandmarks?([])
-            return .none
         }
+
+        // 立即返回上一帧的缓存结果（不阻塞）
+        if !cached.isEmpty { onLandmarks?(cached) }
+        return currentDecision
     }
 }
 #endif

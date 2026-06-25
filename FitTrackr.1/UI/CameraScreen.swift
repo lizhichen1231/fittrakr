@@ -9,14 +9,22 @@ struct CameraScreen: View {
     var body: some View {
         GeometryReader { geo in
             ZStack {
+
                 // 预览 + 叠加
                 PreviewCanvasView(
                     image: vm.processedCGImage,
                     handLandmarks: vm.handLandmarks,
                     personBoxN: vm.personBox,
-                    deadZoneFraction: vm.deadZoneFraction
+                    // 死区(蓝虚线)随 debug 开关显隐:关时传 .zero → CanvasView 不画。人物框/手部骨架不受影响。
+                    deadZoneFraction: vm.showDebugOverlay ? vm.deadZoneFraction : .zero
                 )
+                SkeletonDebugOverlayView()
                 .ignoresSafeArea()
+
+                // Debug Overlay（仅 DEBUG 模式）：总开关绑到共享 showDebugOverlay(默认关),眼睛图标切它
+                #if DEBUG
+                DebugOverlayView(data: vm.debugData, showAll: $vm.showDebugOverlay)
+                #endif
 
                 // 顶部状态信息
                 VStack {
@@ -32,7 +40,77 @@ struct CameraScreen: View {
                     }
                     .padding(.horizontal, 16)
                     .padding(.top, 60)
-                    
+
+                    // 性能 HUD（阶段耗时 + 实际 FPS）
+                    HStack {
+                        Text(vm.perfHUD)
+                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                            .foregroundColor(.green)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(.black.opacity(0.55), in: Capsule())
+                        Spacer()
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 6)
+
+                    // 一次性捕获配置(format maxFPS vs 当前锁的 fps)——查帧率瓶颈用,看完删
+                    if !vm.captureConfigHUD.isEmpty {
+                        HStack {
+                            Text("📸 " + vm.captureConfigHUD)
+                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                .foregroundColor(.yellow)
+                                .padding(.horizontal, 10).padding(.vertical, 5)
+                                .background(.black.opacity(0.6), in: Capsule())
+                            Spacer()
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.top, 4)
+                    }
+
+                    // 检测输入规格(wide/tele/Vision/out 尺寸)——查 pose=× / 尺寸跳变用
+                    if !vm.detSpecHUD.isEmpty {
+                        HStack {
+                            Text("🔬 " + vm.detSpecHUD)
+                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                .foregroundColor(.orange)
+                                .padding(.horizontal, 10).padding(.vertical, 5)
+                                .background(.black.opacity(0.6), in: Capsule())
+                            Spacer()
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.top, 4)
+                    }
+
+                    // slew 闸最近一次事件(sticky):SNAP=绕过限速 / HIT=真削到了 —— 看 1.85s/4.5s 跳点有没有
+                    if !vm.slewHUD.isEmpty {
+                        HStack {
+                            Text("🚦 " + vm.slewHUD)
+                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                .foregroundColor(.pink)
+                                .padding(.horizontal, 10).padding(.vertical, 5)
+                                .background(.black.opacity(0.6), in: Capsule())
+                            Spacer()
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.top, 4)
+                    }
+
+
+                    // cx vs 几何 诊断行:仅 debug 开关开时 format+绘制(关时热路径与 UI 都零开销)
+                    if vm.showDebugOverlay && !vm.dbgCropHUD.isEmpty {
+                        HStack {
+                            Text(vm.dbgCropHUD)
+                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                .foregroundColor(.cyan)
+                                .padding(.horizontal, 10).padding(.vertical, 5)
+                                .background(.black.opacity(0.6), in: Capsule())
+                            Spacer()
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.top, 4)
+                    }
+
                     Spacer()
                 }
                 
@@ -179,6 +257,7 @@ struct CameraScreen: View {
                 }
             }
             .onAppear {
+                forcePortrait()   // 兜底:若已卡在横屏进来,掰回竖屏
                 vm.updateOutputSize(for: geo.size)
                 vm.start()
             }
@@ -196,7 +275,16 @@ struct CameraScreen: View {
     }
     
     // MARK: - 辅助方法
-    
+
+    /// 掰回竖屏(iOS16+):应对「已经卡在横屏进来」的情况。和 AppDelegate 的 .portrait mask 配合。
+    private func forcePortrait() {
+        guard let scene = UIApplication.shared.connectedScenes
+            .first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene else { return }
+        scene.requestGeometryUpdate(.iOS(interfaceOrientations: .portrait))
+        let window = scene.keyWindow ?? scene.windows.first
+        window?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+    }
+
     private func toggleGesture() {
         if vm.gestureMode == .off {
             vm.gestureMode = .wave
@@ -317,8 +405,9 @@ fileprivate struct TunerSheet: View {
     }
 }
 
-// PreviewCanvasView 和 CanvasView 保持原有代码不变
-fileprivate struct PreviewCanvasView: UIViewRepresentable {
+// PreviewCanvasView 和 CanvasView:渲染处理后帧 + overlay(框/死区/手部骨架)。
+// 由 fileprivate 放宽为 internal,使模拟器回放界面(VideoTrackingPlaybackView)能复用同一套渲染。
+struct PreviewCanvasView: UIViewRepresentable {
     let image: CGImage?
     let handLandmarks: [CGPoint]
     let personBoxN: CGRect?
@@ -333,7 +422,7 @@ fileprivate struct PreviewCanvasView: UIViewRepresentable {
     }
 }
 
-fileprivate final class CanvasView: UIView {
+final class CanvasView: UIView {
     private let contentLayer = CALayer()
     private let personBoxLayer = CAShapeLayer()
     private let deadZoneLayer  = CAShapeLayer()
@@ -447,3 +536,4 @@ fileprivate final class CanvasView: UIView {
                width: rect.width * r.width, height: rect.height * r.height)
     }
 }
+

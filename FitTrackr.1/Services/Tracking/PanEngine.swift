@@ -220,9 +220,12 @@ extension TrackingController {
         }
 
         // 死区处理：在死区内减少目标的移动
+        // 修:死区按 zoom 缩,使其在【输出空间】恒定(全帧死区 / zoom),而不是整帧恒定。
+        //   1x 不变;4x 收紧到 1/4(0.12·W→0.03·W)→ 高 zoom 下 crop 跟得紧,残差不再被放大成左右甩。
         let deadZone = isDoingExerciseInPlace ? cfg.inPlaceDeadZone : cfg.deadZone
-        let deadX = sensorW * deadZone.width
-        let deadY = sensorH * deadZone.height
+        let zoomForDead = max(1.0, zoom)
+        let deadX = sensorW * deadZone.width  / zoomForDead
+        let deadY = sensorH * deadZone.height / zoomForDead
 
         let currentCenter = positionSpring.position
         let dx = targetCenter.x - currentCenter.x

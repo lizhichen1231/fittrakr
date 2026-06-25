@@ -6,11 +6,15 @@ import UIKit
 
 final class CameraViewModel: NSObject, ObservableObject {
 
-    private let camera  = CameraEngine()
+    // 帧源:tracking 只依赖 FrameSource,不再直接依赖 AVCaptureSession。
+    // 默认 LiveCameraSource(实时摄像头,行为同改造前);回放界面传入 VideoFileSource。
+    private let source: FrameSource
     private let follow  = FollowEngine()
     private let recorder = AVWriterRecorder()
     private let gesture = GestureFactory.make()
     private let ciContext = CIContext()
+    
+
     
 
     // æ˜¾ç¤º/å åŠ
@@ -19,13 +23,39 @@ final class CameraViewModel: NSObject, ObservableObject {
     @Published var personBox: CGRect?
     @Published var isTracking = false
     @Published var trackingInfo: String = ""
+    @Published var perfHUD: String = ""        // 性能 HUD：阶段耗时 + 实际 FPS
+    private var perfFrame = 0
 
-    // è°ƒå‚
+    // Debug overlay 总开关(默认关):眼睛图标切它;同时驱动 DebugOverlayView 与 CameraScreen 的死区显隐
+    // 同时门控 tracking 的诊断行 format(关时热路径零开销)
+    @Published var showDebugOverlay = false {
+        didSet { follow.hudDebugEnabled = showDebugOverlay }
+    }
+    // 临时诊断 HUD 行(cx vs 几何):值来自 follow.dbgCropLine(computeFinalCropRect 本帧算出)
+    @Published var dbgCropHUD = ""
+    // 一次性捕获配置(format maxFPS vs 当前锁的 fps),来自 CameraEngine.dumpCaptureConfig
+    @Published var captureConfigHUD = ""
+    // 检测输入规格(wide/tele/Vision/out 尺寸),来自 follow.dbgDetSpec,仅尺寸变化时更新
+    @Published var detSpecHUD = ""
+    // slew 闸最近一次事件(SNAP/HIT),sticky,来自 follow.dbgSlewLine
+    @Published var slewHUD = ""
+
+    // 手势负载控制（调优阶段）：硬开关默认关闭，确保 MediaPipe 不进每帧预算；开启时也仅每 N 帧跑一次
+    var gestureEnabled = false
+    let gestureEveryN = 6
+    private var gestureTick = 0
+
+    #if DEBUG
+    @Published var debugData: DebugData?
+    private var debugFrameCounter = 0
+    #endif
+
+    //è°ƒå‚
     @Published var tunables: FollowEngine.Tunables
     @Published var deadZoneFraction: CGSize
 
     // æ‰‹åŠ¿è§¦å‘é…ç½®
-    @Published var gestureMode: GestureTriggerMode = .wave {
+    @Published var gestureMode: GestureTriggerMode = .off {   // 自检阶段先关掉手势，排除 MediaPipe 负载
         didSet { applyGestureConfig() }
     }
     @Published var gestureSampleEvery: Int = 3 {
@@ -58,7 +88,7 @@ final class CameraViewModel: NSObject, ObservableObject {
     // æ‰‹åŠ¿ ROI å›žæ˜ å°„
     private var currentGestureRoiN: CGRect? = nil
 
-    // æ‰‹éƒ¨å…³é”®ç‚¹ç¨³å®šå™¨
+    // æ‰‹éƒ¨å…³é"®ç‚¹ç¨³å®šå™¨
     private var lmPrev: [CGPoint]? = nil
     private var lmEMA: [CGPoint]?  = nil
     private let lmAlpha: CGFloat = 0.45
@@ -66,17 +96,40 @@ final class CameraViewModel: NSObject, ObservableObject {
     private let lmPalmMin: CGFloat = 0.03
     private let lmPalmMax: CGFloat = 0.60
 
-    override init() {
-        let engine = FollowEngine()
-        var t = engine.getTunables()
+    // 目标锁定（录制开始时自动锁定）
+    private var shouldLockTarget = false
+
+    init(source: FrameSource = LiveCameraSource()) {
+        // 帧源在 super.init 前先就位(非可选 let)。默认实时摄像头,回放界面传 VideoFileSource。
+        self.source = source
+
+        // 用临时引擎拿「应用预设后的」tunables，避免读到默认值
+        let tmp = FollowEngine()
+        tmp.applyPreset(.fitness)                 // 先上预设
+        var t = tmp.getTunables()                 // 再取参数
         t.adaptiveEnabled = true
+
+        // 在 super.init() 之前把存储属性初始化完整
         self.tunables = t
         self.deadZoneFraction = CGSize(width: t.deadZoneW, height: t.deadZoneH)
-        super.init()
-        camera.delegate = self
 
+        super.init()
+
+        // 帧/音频回调接到原来的处理逻辑上(等价于过去的 CameraEngineDelegate)
+        source.onFrame = { [weak self] wide, tele, pts in
+            self?.handleFrame(wide: wide, telephoto: tele, pts: pts)
+        }
+        source.onAudio = { [weak self] sb in
+            self?.handleAudio(sb)
+        }
+
+        // 配置实际工作的 follow 引擎
         follow.applyPreset(.fitness)
         follow.updateTunables(tunables)
+
+       
+    
+
 
         // æ‰‹éƒ¨å…³é”®ç‚¹å›žè°ƒ â†’ ROI æ˜ å°„ â†’ ç¨³å®šåŒ– â†’ å‘å¸ƒ
         gesture.setLandmarks { [weak self] pts in
@@ -95,8 +148,8 @@ final class CameraViewModel: NSObject, ObservableObject {
     }
 
     // MARK: - æŽ§åˆ¶
-    func start() { camera.start() }
-    func stop()  { camera.stop(); stopTimer() }
+    func start() { source.start() }   // 实时专属配置(useUltraWideWithGDC)已收进 LiveCameraSource
+    func stop()  { source.stop(); stopTimer() }
     func toggleRecord() { isRecording ? stopRecord() : startRecord() }
     func toggleLock() { hardLock.toggle() }
 
@@ -104,11 +157,13 @@ final class CameraViewModel: NSObject, ObservableObject {
         guard processedCGImage != nil || videoSize != .zero else { return }
         recorder.start(size: lastOutputSize)
         isRecording = true
+        shouldLockTarget = true  // 下一帧自动锁定目标
         startTimer()
     }
     private func stopRecord() {
         isRecording = false
         stopTimer()
+        PersonIdentifier.shared.unlock()  // 解除目标锁定
         recorder.stopAndSave { ok in
             DispatchQueue.main.async { self.hudText = ok ? "å·²ä¿å­˜åˆ°ç›¸å†Œ" : "ä¿å­˜å¤±è´¥" }
         }
@@ -236,34 +291,57 @@ private extension CGRect {
     }
 }
 
-extension CameraViewModel: CameraEngineDelegate {
-    func cameraEngine(_ engine: CameraEngine,
-                      didOutputVideo pixelBuffer: CVPixelBuffer,
-                      pts: CMTime) {
+extension CameraViewModel {
+    // tracking 入口:由 FrameSource.onFrame 驱动(过去是 CameraEngineDelegate)。逻辑保持不变。
+    func handleFrame(wide wideFrame: CVPixelBuffer,
+                     telephoto telephotoFrame: CVPixelBuffer?,
+                     pts: CMTime) {
+        // 0) 获取髋部数据并传给 FollowEngine
+        let hipData = SkeletonAddon.shared.getHipData()
+        follow.updateHipCenter(hipData.center, confidence: hipData.confidence)
 
-        // FPS
-        dbgFrames += 1
-        if Date().timeIntervalSince(dbgTick) > 1 {
-            DispatchQueue.main.async { self.dbgText = "FPS ~ \(self.dbgFrames)" }
-            dbgFrames = 0; dbgTick = Date()
+        // 0.5) 录制开始时自动锁定目标
+        if shouldLockTarget {
+            shouldLockTarget = false
+            let sensorSize = CGSize(
+                width: CGFloat(CVPixelBufferGetWidth(wideFrame)),
+                height: CGFloat(CVPixelBufferGetHeight(wideFrame))
+            )
+            if PersonIdentifier.shared.lockLargest(in: wideFrame, sensorSize: sensorSize) {
+                print("🎯 录制开始，已锁定目标")
+            } else {
+                print("⚠️ 录制开始，未检测到目标")
+            }
         }
 
-        if videoSize == .zero {
-            videoSize = CGSize(width: CVPixelBufferGetWidth(pixelBuffer),
-                               height: CVPixelBufferGetHeight(pixelBuffer))
-        }
+        // 阶段计时（ms）
+        let _tFrame = CACurrentMediaTime()
 
-        let result = follow.process(pixelBuffer: pixelBuffer, pts: pts)
+        // 1) 跟随主流程（双帧：广角检测 + 长焦渲染）
+        let result = follow.process(wideFrame: wideFrame, telephotoFrame: telephotoFrame, pts: pts)
 
-        // æ‰‹åŠ¿è¯†åˆ«ï¼ˆæ¢å¤åŽŸå§‹é€»è¾‘ï¼‰
-        if gestureMode != .off, let ci = result.ciScaled {
+        // 2) 同步跑骨架（复用主检测 pose，去重，不再自己跑 Vision）
+        let _tSkel = CACurrentMediaTime()
+        SkeletonAddon.shared.process(pixelBuffer: wideFrame,
+                                     orientation: .up,
+                                     pts: pts,
+                                     follow: result,
+                                     pose: follow.lastPoseObservation)
+        let msSkel = (CACurrentMediaTime() - _tSkel) * 1000
+
+        // 3) 手势识别 —— 调优阶段默认关闭（gestureEnabled=false），排除 MediaPipe 负载；开启时每 N 帧才跑一次
+        let _tGest = CACurrentMediaTime()
+        gestureTick &+= 1
+        if gestureEnabled, gestureMode != .off, gestureTick % gestureEveryN == 0, let ci = result.ciScaled {
             var decided: GestureDecision = .none
-            let rois: [CGRect] = (result.confidence > 1 && self.personBox != nil)
+
+            // 修正：> 1 永远为假，改为 > 0.5
+            let rois: [CGRect] = (result.confidence > 0.5 && self.personBox != nil)
                 ? candidateGestureROIs(from: self.personBox!)
                 : []
-           
-            // 限制处理数量
-            for (index, roi) in rois.prefix(2).enumerated() {  // 最多处理2个
+
+            // 限制最多 2 个 ROI
+            for roi in rois.prefix(2) {
                 if let pbRoi = makePixelBuffer(from: ci, roiN: roi, targetSize: CGSize(width: 224, height: 224)) {
                     self.currentGestureRoiN = roi
                     let d = gesture.process(pbRoi, nil)
@@ -273,21 +351,11 @@ extension CameraViewModel: CameraEngineDelegate {
 
             self.currentGestureRoiN = nil
 
-            // ROI ä¼˜å…ˆï¼šå•å°ºåº¦ 224
-            for roi in rois {
-                if let pbRoi = makePixelBuffer(from: ci, roiN: roi, targetSize: CGSize(width: 224, height: 224)) {
-                    self.currentGestureRoiN = roi
-                    let d = gesture.process(pbRoi, nil)
-                    if d != .none { decided = d; break }
-                }
-            }
-
-            // å…œåº•ï¼šæ•´å¸§ 224Ã—224
+            // 兜底：全帧
             if decided == .none,
                let pbFull = makePixelBuffer(from: ci,
                                             roiN: CGRect(x: 0, y: 0, width: 1, height: 1),
                                             targetSize: CGSize(width: 224, height: 224)) {
-                self.currentGestureRoiN = nil
                 decided = gesture.process(pbFull, nil)
             }
 
@@ -297,21 +365,31 @@ extension CameraViewModel: CameraEngineDelegate {
             case .none:  break
             }
         }
+        let msGest = (CACurrentMediaTime() - _tGest) * 1000
+        let msTotal = (CACurrentMediaTime() - _tFrame) * 1000
+        let _perf = String(format: "FPS %.0f · rect %.0f pose %.0f skel %.0f gest %.0f rend %.0f · tot %.0f ms",
+                           result.fps, result.msRect, result.msPose, msSkel, msGest, result.msRender, msTotal)
+        perfFrame += 1
+        if perfFrame % 30 == 0 { print("⏱ " + _perf) }
 
+        // 4) UI / 录制
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            self.isTracking = result.confidence > 0.5
-            
-            if self.isTracking {
-                self.trackingInfo = String(format: "è¿½è¸ªä¸­ %.0f%% ç¼©æ”¾%.2fx",
-                                           result.confidence * 100,
-                                           result.zoom)
-            } else {
-                self.trackingInfo = "æœç´¢ç›®æ ‡â€¦"
+            self.perfHUD = _perf
+            // 一次性:捕获配置就绪后填一次(静态量,启动后几帧内可用)
+            if self.captureConfigHUD.isEmpty, !CameraEngine.lastCaptureConfig.isEmpty {
+                self.captureConfigHUD = CameraEngine.lastCaptureConfig
             }
+            if self.detSpecHUD != self.follow.dbgDetSpec { self.detSpecHUD = self.follow.dbgDetSpec }
+            if self.slewHUD != self.follow.dbgSlewLine { self.slewHUD = self.follow.dbgSlewLine }
+            if self.showDebugOverlay { self.dbgCropHUD = self.follow.dbgCropLine }   // 关时不更新,省 @Published churn
+            self.isTracking = result.confidence > 0.5
+            self.trackingInfo = self.isTracking
+                ? String(format: "追踪中 %.0f%%  |  缩放 %.2fx", result.confidence * 100, result.zoom)
+                : "搜索目标…"
 
             if let cg = result.previewCG { self.processedCGImage = cg }
-
+            
             let crop = result.cropRect
             if let sb = result.stableBox, crop.width > 0, crop.height > 0 {
                 self.personBox = CGRect(
@@ -320,7 +398,17 @@ extension CameraViewModel: CameraEngineDelegate {
                     width:  sb.width / crop.width,
                     height: sb.height / crop.height
                 )
-            } else { self.personBox = nil }
+            } else {
+                self.personBox = nil
+            }
+
+            #if DEBUG
+            // 每 3 帧更新一次 debugData，减少主线程压力
+            self.debugFrameCounter += 1
+            if self.debugFrameCounter % 3 == 0 {
+                self.debugData = self.follow.getDebugData(fps: CGFloat(result.fps))
+            }
+            #endif
 
             if self.isRecording, let ci = result.ciScaled {
                 self.recorder.appendVideo(ciImage: ci, at: result.pts)
@@ -328,10 +416,12 @@ extension CameraViewModel: CameraEngineDelegate {
         }
     }
 
-    func cameraEngine(_ engine: CameraEngine,
-                      didOutputAudio sampleBuffer: CMSampleBuffer) {
+    func handleAudio(_ sampleBuffer: CMSampleBuffer) {
         if isRecording { recorder.appendAudio(sampleBuffer) }
     }
+}
+
+
 
     private func blinkTorch() {
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
@@ -347,7 +437,8 @@ extension CameraViewModel: CameraEngineDelegate {
             }
         } catch { }
     }
-}
+
+
 
 
 
