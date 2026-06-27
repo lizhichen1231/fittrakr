@@ -29,7 +29,12 @@ final class CameraViewModel: NSObject, ObservableObject {
     // Debug overlay 总开关(默认关):眼睛图标切它;同时驱动 DebugOverlayView 与 CameraScreen 的死区显隐
     // 同时门控 tracking 的诊断行 format(关时热路径零开销)
     @Published var showDebugOverlay = false {
-        didSet { follow.hudDebugEnabled = showDebugOverlay }
+        didSet {
+            follow.hudDebugEnabled = showDebugOverlay
+            #if DEBUG
+            FakePersonInjector.shared.enabled = showDebugOverlay   // 卡2:眼睛开关 = 假人注入开关
+            #endif
+        }
     }
     // 临时诊断 HUD 行(cx vs 几何):值来自 follow.dbgCropLine(computeFinalCropRect 本帧算出)
     @Published var dbgCropHUD = ""
@@ -39,6 +44,8 @@ final class CameraViewModel: NSObject, ObservableObject {
     @Published var detSpecHUD = ""
     // slew 闸最近一次事件(SNAP/HIT),sticky,来自 follow.dbgSlewLine
     @Published var slewHUD = ""
+    // 卡2 最简 HUD:候选人数 + 锁谁(细节看 console),来自 follow.dbgFakeHUD
+    @Published var fakeHUD = ""
     // 跳变取证:冻结"最近一次显著跳变那一帧"的整行数据(poseValid/srcUsed/rectConf/各Δ)
     @Published var probeHUD = ""
     let probeJumpThreshold: CGFloat = 0.03   // anchorΔ 或 rectBoxΔ 超此(占画面宽 3%)算一次跳,刷新冻结行
@@ -402,6 +409,7 @@ extension CameraViewModel {
             }
             if self.detSpecHUD != self.follow.dbgDetSpec { self.detSpecHUD = self.follow.dbgDetSpec }
             if self.slewHUD != self.follow.dbgSlewLine { self.slewHUD = self.follow.dbgSlewLine }
+            if self.fakeHUD != self.follow.dbgFakeHUD { self.fakeHUD = self.follow.dbgFakeHUD }
             if self.showDebugOverlay { self.dbgCropHUD = self.follow.dbgCropLine }   // 关时不更新,省 @Published churn
             self.isTracking = result.confidence > 0.5
             self.trackingInfo = self.isTracking

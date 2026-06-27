@@ -288,6 +288,8 @@ final class TrackingController {
     var dbgCfLsh: Float = 0, dbgCfRsh: Float = 0, dbgCfLhp: Float = 0, dbgCfRhp: Float = 0
     var dbgZoomSrc = ""
 
+    var dbgFakeHUD = ""   // 卡2 最简 HUD:候选人数 + 锁谁(细节看 console REPLAY/FAKE 行)
+
     // 跳变取证(只抓数据,不改逻辑):pose 四点门是否过、rect 兜底框 conf、本帧锚/ratio/rect框跳变量
     var dbgPoseValid = false
     var dbgRectConf: CGFloat = -1

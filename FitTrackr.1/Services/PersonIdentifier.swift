@@ -42,7 +42,12 @@ final class PersonIdentifier {
         var shapeWeight: Float = 0.25       // 体型权重
         var positionWeight: Float = 0.15    // 位置连续性权重
 
-        var matchThreshold: Float = 0.50    // 匹配阈值
+        // 匹配阈值,作用在 finalScore(现 ∈0~1,因 histogramSimilarity 已归一化)。
+        // 换算:不是机械的 0.5/2=0.25 —— shapeSim(0.25)+posSim(0.15)上限=0.40 且不受溢出影响,
+        // 假人按主角尺寸造 → 几何项可达 ~0.4。门必须 >0.40,否则同尺寸路人单凭体型过门(与颜色无关)。
+        // 取 0.50:高于几何下限 0.40、真人(归一化后 ~0.85)余量足、且与 Vision conf>0.5(0~1)同量纲,
+        // 消除卡3 跟丢判定的量纲错位。
+        var matchThreshold: Float = 0.50
         var colorHistBins: Int = 16         // 颜色直方图 bins
     }
     var config = Config()
@@ -124,9 +129,11 @@ final class PersonIdentifier {
 
     /// 核心方法：这个人是不是我的目标？
     /// colorBuffer 必须与 personBox/sensorSize 同坐标系(wide 全分辨率帧),否则颜色 region 裁错位。
+    /// overrideHist: 非 nil 时用预设直方图(给假人注入用),不从 colorBuffer 提(假人无真实像素)。默认 nil → 真人行为不变。
     func isTarget(_ personBox: CGRect,
                   in colorBuffer: CVPixelBuffer,
-                  sensorSize: CGSize) -> (match: Bool, score: Float) {
+                  sensorSize: CGSize,
+                  overrideHist: (upper: [Float], lower: [Float])? = nil) -> (match: Bool, score: Float) {
 
         guard isLocked, let target = self.target else {
             return (false, 0)
@@ -135,12 +142,19 @@ final class PersonIdentifier {
         var totalScore: Float = 0
         var totalWeight: Float = 0
 
-        let ciImage = CIImage(cvPixelBuffer: colorBuffer)
+        // 候选颜色:真人从 colorBuffer 提;假人(overrideHist)用预设直方图
+        let personUpperColor: [Float]
+        let personLowerColor: [Float]
+        if let ov = overrideHist {
+            personUpperColor = ov.upper
+            personLowerColor = ov.lower
+        } else {
+            let ciImage = CIImage(cvPixelBuffer: colorBuffer)
+            personUpperColor = extractUpperBodyColor(from: ciImage, personBox: personBox, sensorSize: sensorSize)
+            personLowerColor = extractLowerBodyColor(from: ciImage, personBox: personBox, sensorSize: sensorSize)
+        }
 
         // 1. 上半身颜色匹配
-        let personUpperColor = extractUpperBodyColor(from: ciImage,
-                                                      personBox: personBox,
-                                                      sensorSize: sensorSize)
         if !target.colorHistogram.isEmpty && !personUpperColor.isEmpty {
             let sim = histogramSimilarity(target.colorHistogram, personUpperColor)
             totalScore += config.upperColorWeight * sim
@@ -148,9 +162,6 @@ final class PersonIdentifier {
         }
 
         // 2. 下半身颜色匹配
-        let personLowerColor = extractLowerBodyColor(from: ciImage,
-                                                      personBox: personBox,
-                                                      sensorSize: sensorSize)
         if !target.lowerBodyColorHist.isEmpty && !personLowerColor.isEmpty {
             let sim = histogramSimilarity(target.lowerBodyColorHist, personLowerColor)
             totalScore += config.lowerColorWeight * sim
@@ -200,6 +211,13 @@ final class PersonIdentifier {
 
         guard isLocked else { return nil }
 
+        #if DEBUG
+        // 卡2 假人注入:激活时强制走全量竞争(跳过 track 快速路径,否则 track 咬住主角、假人测不到颜色校验)
+        if FakePersonInjector.shared.enabled {
+            return findTargetWithFake(in: detectBuffer, colorBuffer: colorBuffer, sensorSize: sensorSize)
+        }
+        #endif
+
         // 先尝试用 VNTrackObjectRequest（更快）—— 框按 sensorSize(wide)还原,颜色校验用 colorBuffer(wide)
         if isTrackingActive, let tracked = continueTracking(detectBuffer, sensorSize: sensorSize) {
             // 验证追踪结果是不是真的是目标
@@ -233,6 +251,55 @@ final class PersonIdentifier {
 
         return nil
     }
+
+    #if DEBUG
+    /// 卡2 验证用:强制全量竞争(真人 + 注入假人),颜色校验决定锁谁。逐帧打候选/相似度/锁谁。
+    private func findTargetWithFake(in detectBuffer: CVPixelBuffer,
+                                    colorBuffer: CVPixelBuffer,
+                                    sensorSize: CGSize) -> (box: CGRect, score: Float)? {
+        guard isLocked else { return nil }
+
+        var cands: [(label: String, box: CGRect, match: Bool, score: Float)] = []
+
+        // 真人候选(检测在 detectBuffer,颜色在 colorBuffer)
+        let persons = detectAllPersons(in: detectBuffer, sensorSize: sensorSize)
+        var bestRealBox = CGRect.zero
+        var bestRealScore: Float = -1
+        for (i, p) in persons.enumerated() {
+            let (m, s) = isTarget(p, in: colorBuffer, sensorSize: sensorSize)
+            cands.append(("真人\(i)", p, m, s))
+            if s > bestRealScore { bestRealScore = s; bestRealBox = p }
+        }
+
+        // 注入假人:预设直方图(同色/异色)参与同一套 isTarget 评分
+        var fakeBox = CGRect.zero
+        var fakeScore: Float = -1
+        if let fake = FakePersonInjector.shared.currentFake(target: target, sensorSize: sensorSize) {
+            let (m, s) = isTarget(fake.box, in: colorBuffer, sensorSize: sensorSize,
+                                  overrideHist: (fake.upper, fake.lower))
+            cands.append(("假人", fake.box, m, s))
+            fakeBox = fake.box; fakeScore = s
+        }
+
+        // 选 match 且 score 最高(与生产路径同口径:同一 isTarget + matchThreshold)
+        let winner = cands.filter { $0.match }.max { $0.score < $1.score }
+
+        // 存快照,实际 print 在 detectHuman(带 frameCount/poseValid,帧号对齐)
+        var snap = FakePersonInjector.DebugSnapshot()
+        snap.realCount = persons.count
+        snap.realBox = bestRealBox; snap.realScore = bestRealScore
+        snap.fakeBox = fakeBox; snap.fakeScore = fakeScore
+        snap.candCount = cands.count
+        snap.winner = winner?.label ?? "无"
+        FakePersonInjector.shared.lastSnapshot = snap
+
+        if let w = winner {
+            startTracking(box: w.box, sensorSize: sensorSize)
+            return (w.box, w.score)
+        }
+        return nil
+    }
+    #endif
 
     // MARK: - Vision 追踪（优化性能）
 
@@ -455,12 +522,18 @@ final class PersonIdentifier {
     private func histogramSimilarity(_ a: [Float], _ b: [Float]) -> Float {
         guard a.count == b.count, !a.isEmpty else { return 0 }
 
-        // Bhattacharyya 系数
-        var bc: Float = 0
+        // 直方图 = 「H 段(16 bin,sum=1)+ S 段(8 bin,sum=1)」拼接 → 整体 sum=2。
+        // 旧版对整段做 Bhattacharyya = BC_H + BC_S ∈ 0~2(溢出源)。
+        // 归一化:两段 BC 各 ∈0~1,等权平均 → 整体 ∈0~1(完全同色=1、完全异色=0、自比≈1)。
+        // 等权(非给 H 加权):最简、端点正确、换算可预测;H 判别力更强,若后续撞衫要更强 hue 区分,
+        // 可改 0.6·BC_H + 0.4·BC_S(不破坏端点)。当前等权已足够分离真人/异色假人。
+        let hLen = config.colorHistBins             // H 段长度(16);其余为 S 段
+        var bcH: Float = 0, bcS: Float = 0
         for i in 0..<a.count {
-            bc += sqrt(max(0, a[i]) * max(0, b[i]))
+            let v = sqrt(max(0, a[i]) * max(0, b[i]))
+            if i < hLen { bcH += v } else { bcS += v }
         }
-        return bc
+        return (bcH + bcS) / 2.0
     }
 
     // MARK: - 调试

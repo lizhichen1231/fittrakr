@@ -233,12 +233,29 @@ extension TrackingController {
     func detectHuman(pb: CVPixelBuffer, wide: CVPixelBuffer, dt: CGFloat) -> (CGRect, CGFloat)? {
         let sensorSize = CGSize(width: sensorW, height: sensorH)   // wide 全分辨率尺寸
 
-        // 锁定且找到目标 → 身份识别路径(findTarget→Kalman→颜色校验);检测在 pb(detPB),颜色在 wide
-        if PersonIdentifier.shared.isLocked,
-           let result = PersonIdentifier.shared.findTarget(in: pb, colorBuffer: wide, sensorSize: sensorSize) {
-            return applyKalmanSmoothing(rawRect: result.box, conf: CGFloat(result.score))
+        // 锁定 → 身份识别路径(findTarget→Kalman→颜色校验);检测在 pb(detPB),颜色在 wide
+        if PersonIdentifier.shared.isLocked {
+            let r = PersonIdentifier.shared.findTarget(in: pb, colorBuffer: wide, sensorSize: sensorSize)
+            #if DEBUG
+            // 卡2 验证日志:逐帧打 console(REPLAY + FAKE 两行),带 frameCount/poseValid,可滚动/搜索/复制
+            if FakePersonInjector.shared.enabled {
+                let s = FakePersonInjector.shared.lastSnapshot
+                func bx(_ b: CGRect) -> String { String(format: "(%.0f,%.0f,%.0f,%.0f)", b.minX, b.minY, b.width, b.height) }
+                print(String(format: "REPLAY f=%d 检测真人数=%d 真人box=%@ conf=%.2f poseValid=%@",
+                             frameCount, s.realCount, bx(s.realBox), s.realScore, dbgPoseValid ? "T" : "F"))
+                print(String(format: "FAKE inject=ON 假人box=%@ 假人相似度=%.2f 候选=%d [真人:%.2f 假人:%.2f] → 锁定=%@",
+                             bx(s.fakeBox), s.fakeScore, s.candCount, s.realScore, s.fakeScore, s.winner))
+                dbgFakeHUD = "候选\(s.candCount) 锁:\(s.winner)"
+            } else {
+                dbgFakeHUD = ""
+            }
+            #endif
+            if let result = r {
+                return applyKalmanSmoothing(rawRect: result.box, conf: CGFloat(result.score))
+            }
+            return detectHumanRectFallback(pb: pb)
         }
-        // 未锁定 / 锁定但本帧没找到目标 → 回退现有矩形兜底,行为与卡0(detectHumanRectFallback)一致,不崩、不变行为
+        // 未锁定 → 回退现有矩形兜底,行为与卡0(detectHumanRectFallback)一致,不崩、不变行为
         return detectHumanRectFallback(pb: pb)
     }
 

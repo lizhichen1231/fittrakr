@@ -249,6 +249,30 @@ private struct PlaybackPlayerView: View {
                             .background(.ultraThinMaterial, in: Capsule())
                     }
 
+                    // 卡2 验证控件(纯接线,不碰检测/注入/锁定逻辑)
+                    HStack(spacing: 8) {
+                        // 锁定/录制 → vm.toggleRecord()(触发 lockLargest 锁最大框=主角,isLocked=true → findTarget 开跑)
+                        Button {
+                            vm.toggleRecord()
+                        } label: {
+                            Label(vm.isRecording ? "锁定中" : "锁定",
+                                  systemImage: vm.isRecording ? "lock.fill" : "lock.open")
+                                .font(.system(size: 13, weight: .semibold))
+                                .padding(.horizontal, 12).padding(.vertical, 6)
+                                .background(vm.isRecording ? Color.red.opacity(0.75) : Color.white.opacity(0.15), in: Capsule())
+                        }
+                        #if DEBUG
+                        // 假人注入开关(= showDebugOverlay)。手动 Binding(vm 非 @ObservedObject);刷新靠 vmRelay。
+                        Toggle(isOn: Binding(get: { vm.showDebugOverlay },
+                                             set: { vm.showDebugOverlay = $0 })) {
+                            Text("假人").font(.system(size: 13, weight: .semibold))
+                        }
+                        .toggleStyle(.button)
+                        .tint(.orange)
+                        #endif
+                        Spacer()
+                    }
+
                     HStack {
                         Text(vm.perfHUD)
                             .font(.system(size: 11, weight: .medium, design: .monospaced))
@@ -262,6 +286,18 @@ private struct PlaybackPlayerView: View {
                         }
                         .toggleStyle(.button)
                         .tint(.blue)
+                    }
+
+                    // 卡2 最简 HUD:候选人数 + 锁谁(细节看 console REPLAY/FAKE 行)
+                    if !vm.fakeHUD.isEmpty {
+                        HStack {
+                            Text("👥 " + vm.fakeHUD)
+                                .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                .foregroundColor(vm.fakeHUD.contains("假人") ? .red : .green)
+                                .padding(.horizontal, 10).padding(.vertical, 5)
+                                .background(.black.opacity(0.6), in: Capsule())
+                            Spacer()
+                        }
                     }
 
                     // 临时:cx vs 几何 诊断行(回放也读)
