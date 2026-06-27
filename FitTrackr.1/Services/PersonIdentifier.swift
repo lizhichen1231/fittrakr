@@ -123,8 +123,9 @@ final class PersonIdentifier {
     // MARK: - 判断是不是目标
 
     /// 核心方法：这个人是不是我的目标？
+    /// colorBuffer 必须与 personBox/sensorSize 同坐标系(wide 全分辨率帧),否则颜色 region 裁错位。
     func isTarget(_ personBox: CGRect,
-                  in pixelBuffer: CVPixelBuffer,
+                  in colorBuffer: CVPixelBuffer,
                   sensorSize: CGSize) -> (match: Bool, score: Float) {
 
         guard isLocked, let target = self.target else {
@@ -134,7 +135,7 @@ final class PersonIdentifier {
         var totalScore: Float = 0
         var totalWeight: Float = 0
 
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        let ciImage = CIImage(cvPixelBuffer: colorBuffer)
 
         // 1. 上半身颜色匹配
         let personUpperColor = extractUpperBodyColor(from: ciImage,
@@ -191,15 +192,18 @@ final class PersonIdentifier {
     }
 
     /// 在所有人中找到目标（返回 box 和分数）
-    func findTarget(in pixelBuffer: CVPixelBuffer,
+    /// - detectBuffer: Vision 检测/跟踪用(可降采样 detPB,省算力);坐标按 sensorSize(wide)还原
+    /// - colorBuffer:  颜色直方图用(wide 全分辨率帧,与 sensorSize 同坐标系)
+    func findTarget(in detectBuffer: CVPixelBuffer,
+                    colorBuffer: CVPixelBuffer,
                     sensorSize: CGSize) -> (box: CGRect, score: Float)? {
 
         guard isLocked else { return nil }
 
-        // 先尝试用 VNTrackObjectRequest（更快）
-        if isTrackingActive, let tracked = continueTracking(pixelBuffer) {
+        // 先尝试用 VNTrackObjectRequest（更快）—— 框按 sensorSize(wide)还原,颜色校验用 colorBuffer(wide)
+        if isTrackingActive, let tracked = continueTracking(detectBuffer, sensorSize: sensorSize) {
             // 验证追踪结果是不是真的是目标
-            let (match, score) = isTarget(tracked, in: pixelBuffer, sensorSize: sensorSize)
+            let (match, score) = isTarget(tracked, in: colorBuffer, sensorSize: sensorSize)
             if match {
                 return (tracked, score)
             }
@@ -207,14 +211,14 @@ final class PersonIdentifier {
             isTrackingActive = false
         }
 
-        // 检测所有人，找匹配的
-        let persons = detectAllPersons(in: pixelBuffer, sensorSize: sensorSize)
+        // 检测所有人，找匹配的（检测在 detectBuffer,颜色校验在 colorBuffer）
+        let persons = detectAllPersons(in: detectBuffer, sensorSize: sensorSize)
 
         var bestBox: CGRect?
         var bestScore: Float = 0
 
         for person in persons {
-            let (match, score) = isTarget(person, in: pixelBuffer, sensorSize: sensorSize)
+            let (match, score) = isTarget(person, in: colorBuffer, sensorSize: sensorSize)
             if match && score > bestScore {
                 bestScore = score
                 bestBox = person
@@ -247,7 +251,7 @@ final class PersonIdentifier {
         isTrackingActive = true
     }
 
-    private func continueTracking(_ pixelBuffer: CVPixelBuffer) -> CGRect? {
+    private func continueTracking(_ pixelBuffer: CVPixelBuffer, sensorSize: CGSize) -> CGRect? {
         guard let request = trackingRequest else { return nil }
 
         do {
@@ -256,9 +260,9 @@ final class PersonIdentifier {
             if let result = request.results?.first as? VNDetectedObjectObservation,
                result.confidence > 0.5 {
 
-                // 转换回传感器坐标
-                let sensorW = CGFloat(CVPixelBufferGetWidth(pixelBuffer))
-                let sensorH = CGFloat(CVPixelBufferGetHeight(pixelBuffer))
+                // 转换回传感器坐标 —— 用 sensorSize(wide),与 detectAllPersons/下游统一,不用 detPB 降采样尺寸
+                let sensorW = sensorSize.width
+                let sensorH = sensorSize.height
                 let vBox = result.boundingBox
 
                 let box = CGRect(

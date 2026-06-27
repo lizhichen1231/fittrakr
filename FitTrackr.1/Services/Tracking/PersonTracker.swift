@@ -228,18 +228,18 @@ extension TrackingController {
 
     // MARK: - 检测函数 - 支持身份识别
 
-    func detectHuman(pb: CVPixelBuffer, dt: CGFloat) -> (CGRect, CGFloat)? {
-        let sensorSize = CGSize(width: sensorW, height: sensorH)
+    /// - pb:   Vision 检测/跟踪用(detPB 降采样,省算力);坐标按 sensorSize(wide)还原
+    /// - wide: 颜色直方图用(全分辨率帧,与 sensorSize 同坐标系)
+    func detectHuman(pb: CVPixelBuffer, wide: CVPixelBuffer, dt: CGFloat) -> (CGRect, CGFloat)? {
+        let sensorSize = CGSize(width: sensorW, height: sensorH)   // wide 全分辨率尺寸
 
-        if PersonIdentifier.shared.isLocked {
-            if let result = PersonIdentifier.shared.findTarget(in: pb, sensorSize: sensorSize) {
-                return applyKalmanSmoothing(rawRect: result.box, conf: CGFloat(result.score))
-            } else {
-                return nil
-            }
+        // 锁定且找到目标 → 身份识别路径(findTarget→Kalman→颜色校验);检测在 pb(detPB),颜色在 wide
+        if PersonIdentifier.shared.isLocked,
+           let result = PersonIdentifier.shared.findTarget(in: pb, colorBuffer: wide, sensorSize: sensorSize) {
+            return applyKalmanSmoothing(rawRect: result.box, conf: CGFloat(result.score))
         }
-
-        return detectHumanFallback(pb: pb, dt: dt)
+        // 未锁定 / 锁定但本帧没找到目标 → 回退现有矩形兜底,行为与卡0(detectHumanRectFallback)一致,不崩、不变行为
+        return detectHumanRectFallback(pb: pb)
     }
 
     // 纯矩形检测兜底（骨骼检测失败时使用，不重复跑骨骼检测）

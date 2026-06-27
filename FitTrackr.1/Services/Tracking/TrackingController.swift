@@ -529,10 +529,11 @@ final class TrackingController {
             }
             #endif
 
-            // Step A: 矩形检测 —— 找"人在哪" + 缩放依据（鲁棒性高，遮挡友好）
+            // Step A: 人体检测 —— 锁定时走 detectHuman(多人锁定:findTarget→Kalman→颜色校验),
+            // 未锁定/没找到则内部回退 detectHumanRectFallback(与卡0一致)。返回类型 (CGRect, conf) 不变 → 下游不动。
             var rectDetected = false
             let _tRect = CACurrentMediaTime()
-            let _rectResult = detectHumanRectFallback(pb: detPB)
+            let _rectResult = detectHuman(pb: detPB, wide: wideFrame, dt: dt)
             msRect = (CACurrentMediaTime() - _tRect) * 1000
             dbgRectConf = -1; dbgRectBoxDelta = 0   // 取证:本帧默认(rect 没返回时即此)
             if let (rect, conf) = _rectResult {
