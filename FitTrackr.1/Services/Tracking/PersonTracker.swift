@@ -8,15 +8,32 @@ extension TrackingController {
 
     // MARK: - 统一骨骼检测（只跑一次）
 
-    /// 统一的骨骼检测（每帧只跑一次）
-    func detectPose(pb: CVPixelBuffer) -> VNHumanBodyPoseObservation? {
+    /// 统一的骨骼检测（每帧只跑一次）。
+    /// matchingBox 非 nil(锁定中)→ 返回 tightBox 中心最接近它的 pose(= 锁定的你),而非第一个;
+    /// nil(未锁定)→ 返回第一个(现行为不变)。这是「多人锁定接到 zoom/构图」的最后一接。
+    func detectPose(pb: CVPixelBuffer, matchingBox: CGRect? = nil) -> VNHumanBodyPoseObservation? {
         let handler = VNImageRequestHandler(cvPixelBuffer: pb, orientation: .up, options: [:])
         do {
             try handler.perform([poseRequest])
-            return poseRequest.results?.first
+            guard let results = poseRequest.results, !results.isEmpty else { return nil }
+            #if DEBUG
+            print("👁VNPose results.count=\(results.count) 输入=\(CVPixelBufferGetWidth(pb))x\(CVPixelBufferGetHeight(pb)) matched=\(matchingBox != nil)")
+            #endif
+            // 锁定 + 多人:选 tightBox 中心最接近锁定框的 pose(= 你),爹的 pose 不再喂 zoom/锚点
+            guard let target = matchingBox, results.count > 1 else { return results.first }
+            let tc = CGPoint(x: target.midX, y: target.midY)
+            return results.min { a, b in
+                poseCenterDist(a, to: tc) < poseCenterDist(b, to: tc)
+            }
         } catch {
             return nil
         }
+    }
+
+    /// pose 的 tightBox 中心(wide 传感器坐标)到目标点的距离;无有效 tightBox 视为极远。
+    private func poseCenterDist(_ obs: VNHumanBodyPoseObservation, to target: CGPoint) -> CGFloat {
+        guard let box = getTightBoxFromPose(obs) else { return .greatestFiniteMagnitude }
+        return hypot(box.midX - target.x, box.midY - target.y)
     }
 
     // MARK: - 骨骼点紧贴框计算
@@ -233,6 +250,11 @@ extension TrackingController {
     func detectHuman(pb: CVPixelBuffer, wide: CVPixelBuffer, dt: CGFloat) -> (CGRect, CGFloat)? {
         let sensorSize = CGSize(width: sensorW, height: sensorH)   // wide 全分辨率尺寸
 
+        #if DEBUG
+        // D-场景:每帧打 LOCK 决策(纯假人固定,确诊 lockLargest 按什么选);不改锁定状态
+        PersonIdentifier.shared.diagnoseDLockSelection(frame: frameCount, sensorSize: sensorSize)
+        #endif
+
         // 锁定 → 身份识别路径(findTarget→Kalman→颜色校验);检测在 pb(detPB),颜色在 wide
         if PersonIdentifier.shared.isLocked {
             let r = PersonIdentifier.shared.findTarget(in: pb, colorBuffer: wide, sensorSize: sensorSize)
@@ -241,13 +263,25 @@ extension TrackingController {
             if FakePersonInjector.shared.enabled {
                 let s = FakePersonInjector.shared.lastSnapshot
                 func bx(_ b: CGRect) -> String { String(format: "(%.0f,%.0f,%.0f,%.0f)", b.minX, b.minY, b.width, b.height) }
-                print(String(format: "REPLAY f=%d 检测真人数=%d 真人box=%@ conf=%.2f poseValid=%@",
-                             frameCount, s.realCount, bx(s.realBox), s.realScore, dbgPoseValid ? "T" : "F"))
+                print(String(format: "REPLAY f=%d 检测输入=%dx%d(wide全帧降采样,非crop) 真人数=%d 真人box=%@ conf=%.2f poseValid=%@",
+                             frameCount, CVPixelBufferGetWidth(pb), CVPixelBufferGetHeight(pb),
+                             s.realCount, bx(s.realBox), s.realScore, dbgPoseValid ? "T" : "F"))
                 print(String(format: "FAKE inject=ON 假人box=%@ 假人相似度=%.2f 候选=%d [真人:%.2f 假人:%.2f] → 锁定=%@",
                              bx(s.fakeBox), s.fakeScore, s.candCount, s.realScore, s.fakeScore, s.winner))
                 dbgFakeHUD = "候选\(s.candCount) 锁:\(s.winner)"
             } else {
                 dbgFakeHUD = ""
+            }
+            dbgTrkHUD = PersonIdentifier.shared.dbgTrkLine()   // 卡3:锁谁/状态/找回@(取自已有状态)
+            // 折进 PROBE 的锁定概要:当前锁框 + 是否全帧最大(复检一次全帧候选,仅 DEBUG 锁定时)
+            PersonIdentifier.shared.dbgCurrentBox = r?.box
+            let cands = PersonIdentifier.shared.detectAllPersonsWithConf(in: pb, sensorSize: sensorSize)
+            PersonIdentifier.shared.dbgCandCount = cands.count
+            if let b = r?.box {
+                let a = b.width * b.height
+                let maxA = cands.map { $0.box.width * $0.box.height }.max() ?? 0
+                PersonIdentifier.shared.dbgLockedIsLargest = a >= maxA - 1
+                PersonIdentifier.shared.diagnoseDrift(currentBox: b, cands: cands, sensorSize: sensorSize)
             }
             #endif
             if let result = r {
@@ -255,6 +289,9 @@ extension TrackingController {
             }
             return detectHumanRectFallback(pb: pb)
         }
+        #if DEBUG
+        dbgTrkHUD = PersonIdentifier.shared.dbgTrkLine()   // 未锁定时也刷(显示「未锁定」)
+        #endif
         // 未锁定 → 回退现有矩形兜底,行为与卡0(detectHumanRectFallback)一致,不崩、不变行为
         return detectHumanRectFallback(pb: pb)
     }

@@ -46,6 +46,8 @@ final class CameraViewModel: NSObject, ObservableObject {
     @Published var slewHUD = ""
     // 卡2 最简 HUD:候选人数 + 锁谁(细节看 console),来自 follow.dbgFakeHUD
     @Published var fakeHUD = ""
+    // 卡3 最简 HUD:锁谁/状态/找回@,来自 follow.dbgTrkHUD
+    @Published var trkHUD = ""
     // 跳变取证:冻结"最近一次显著跳变那一帧"的整行数据(poseValid/srcUsed/rectConf/各Δ)
     @Published var probeHUD = ""
     let probeJumpThreshold: CGFloat = 0.03   // anchorΔ 或 rectBoxΔ 超此(占画面宽 3%)算一次跳,刷新冻结行
@@ -387,12 +389,18 @@ extension CameraViewModel {
         if perfFrame % 30 == 0 { print("⏱ " + _perf) }
 
         // 跳变取证:每帧拼一行(poseValid/srcUsed/rectConf/各Δ),console 每帧 print + 最大跳帧冻进 HUD
-        let _probe = String(format: "PROBE t=%.2f f=%d poseValid=%@ srcUsed=%@ rectConf=%.2f anchorΔ=%.3f ratioΔ=%.3f rectBoxΔ=%.3f",
+        var _lockSummary = ""
+        #if DEBUG
+        let _sensorSize = CGSize(width: CVPixelBufferGetWidth(wideFrame), height: CVPixelBufferGetHeight(wideFrame))
+        _lockSummary = PersonIdentifier.shared.dbgLockSummary(sensorSize: _sensorSize)
+        #endif
+        let _probe = String(format: "PROBE t=%.2f f=%d poseValid=%@ srcUsed=%@ rectConf=%.2f anchorΔ=%.3f ratioΔ=%.3f rectBoxΔ=%.3f | %@",
                             pts.seconds, follow.frameCount,
                             follow.dbgPoseValid ? "T" : "F",
                             follow.dbgZoomSrc.isEmpty ? "—" : follow.dbgZoomSrc,
                             Double(follow.dbgRectConf), Double(follow.dbgAnchorDelta),
-                            Double(follow.dbgRatioDelta), Double(follow.dbgRectBoxDelta))
+                            Double(follow.dbgRatioDelta), Double(follow.dbgRectBoxDelta),
+                            _lockSummary)
         print(_probe)
         let _probeJump = max(follow.dbgAnchorDelta, follow.dbgRectBoxDelta)
 
@@ -410,6 +418,7 @@ extension CameraViewModel {
             if self.detSpecHUD != self.follow.dbgDetSpec { self.detSpecHUD = self.follow.dbgDetSpec }
             if self.slewHUD != self.follow.dbgSlewLine { self.slewHUD = self.follow.dbgSlewLine }
             if self.fakeHUD != self.follow.dbgFakeHUD { self.fakeHUD = self.follow.dbgFakeHUD }
+            if self.trkHUD != self.follow.dbgTrkHUD { self.trkHUD = self.follow.dbgTrkHUD }
             if self.showDebugOverlay { self.dbgCropHUD = self.follow.dbgCropLine }   // 关时不更新,省 @Published churn
             self.isTracking = result.confidence > 0.5
             self.trackingInfo = self.isTracking

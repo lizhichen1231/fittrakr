@@ -52,6 +52,59 @@ final class PersonIdentifier {
     }
     var config = Config()
 
+    // C8 重锚:每 reanchorInterval 帧,用 pose 多人检测 + 颜色校验重新确认主角真实框,re-seed VNTrackObject。
+    // 治 continueTracking 自漂(VNTrackObject 用自身输出重建 → 框逐帧缩/漂)。re-seed 把它拉回主角当前真实框。
+    let reanchorInterval = 15       // ~0.25s@60fps;越小越不漂但检测越频
+    private var reanchorCounter = 0
+    #if DEBUG
+    var dbgReanchorLine = ""        // 最近一次重锚结果(sticky)
+    #endif
+
+    // 方案A:主跟踪 = 每帧 pose 重选「延续上一帧目标」+ 换人迟滞(治我/爹闪烁;VNTrackObject 死路仅兜底)
+    var lastLockedBox: CGRect?      // 上一帧真正锁定的框(算延续/迟滞用)
+    let switchMargin: Float = 0.15  // 换人迟滞:挑战者综合分须超当前目标 + 此值才换(大→更黏)
+    let continuityFloor: Float = 0.35 // 延续分低于此 = 上一帧目标本帧没检出 → 暂保持(coast)
+    let maxCoastFrames = 8          // 连续找不到延续目标最多保持帧数,超则重新捕获(最强颜色匹配)
+    private var coastFrames = 0
+    // 延续分权重(颜色占大头:你和爹不同色,这是最强区分)
+    let wCont_color: Float = 0.60
+    let wCont_pos: Float = 0.25
+    let wCont_size: Float = 0.15
+    #if DEBUG
+    var dbgReselectLine = ""
+    #endif
+
+    #if DEBUG
+    // 卡3 HUD 精简实时态(值取自已有计算,不重算):锁谁 / 状态 / 最近找回位置(sticky)
+    var dbgLockWho = "无"          // 真人 / 假人 / 无
+    var dbgTrkState = "未锁定"      // 锁定 / 跟丢 / 重检测找回 / 丢失 / 未锁定 / 竞争
+    var dbgRefindNX: CGFloat = -1   // 最近一次重检测找回的全帧归一化 x(<0=暂无)
+    var dbgRefindNY: CGFloat = -1
+    var lockedBoxArea: CGFloat = -1 // 锁定那帧选中框的面积(px²),锁定后每帧对照「大/小」
+    // 锁定后每帧概要(折进 PROBE):当前锁框 + 是否全帧最大 + 候选数
+    var dbgCurrentBox: CGRect?      // findTarget 本帧返回的框(当前正锁着的)
+    var dbgCandCount = 0            // 本帧全帧候选数
+    var dbgLockedIsLargest = false  // 当前锁框是不是候选里面积最大的
+    var dbgLockMomentCandCount = -1 // ★锁定那一刻候选数(=1 则当时只检出1人,锁它=没得选)
+    var dbgLockMomentAreaFrac: CGFloat = -1 // 锁定那一刻锁框面积比
+    var dbgLockMomentCenter: CGPoint = .zero // 锁定那一刻锁框中心(归一化),算 track 漂移用
+    var dbgDriftLine = ""           // track 漂移诊断:当前框 vs 锁定中心 + 最近候选(向爹/原地缩)
+    /// 折进 PROBE 的锁定概要(每帧)。需传 sensorSize 算归一化/面积比。
+    func dbgLockSummary(sensorSize: CGSize) -> String {
+        guard isLocked, let b = dbgCurrentBox else { return "lock=F" }
+        let fa = sensorSize.width * sensorSize.height
+        let af = b.width * b.height / fa
+        let who = dbgCandCount <= 1 ? "唯一" : (dbgLockedIsLargest ? "近大(最大框)" : "远小(非最大)")
+        return String(format: "lock=T 锁框面积=%.3f nx=%.2f ny=%.2f 候选=%d 锁的是=%@ | 锁定瞬间候选=%d 锁框面积=%.3f",
+                      af, b.midX / sensorSize.width, b.midY / sensorSize.height, dbgCandCount, who,
+                      dbgLockMomentCandCount, Double(dbgLockMomentAreaFrac))
+    }
+    func dbgTrkLine() -> String {
+        let refind = dbgRefindNX >= 0 ? String(format: "找回@(%.2f,%.2f)", dbgRefindNX, dbgRefindNY) : "找回@—"
+        return "TRK 锁=\(dbgLockWho) | 状态=\(dbgTrkState) | \(refind)"
+    }
+    #endif
+
     // Vision 追踪（可选优化）
     private var trackingRequest: VNTrackObjectRequest?
     private var sequenceHandler = VNSequenceRequestHandler()
@@ -99,6 +152,8 @@ final class PersonIdentifier {
 
         self.target = profile
         self.isLocked = true
+        self.lastLockedBox = personBox   // 方案A:延续/迟滞基准 = 锁定那刻的框(你)
+        self.coastFrames = 0
 
         // 5. 启动 Vision 追踪（优化）
         startTracking(box: personBox, sensorSize: sensorSize)
@@ -108,13 +163,121 @@ final class PersonIdentifier {
 
     /// 锁定最大的人
     func lockLargest(in pixelBuffer: CVPixelBuffer, sensorSize: CGSize) -> Bool {
-        guard let largest = detectAllPersons(in: pixelBuffer, sensorSize: sensorSize)
+        let realBoxes = detectAllPersons(in: pixelBuffer, sensorSize: sensorSize)
+
+        #if DEBUG
+        // D-场景:注入假人到候选表,用【同一】.max(面积)比较器选,并打 LOCK 决策(确诊按什么选)
+        if FakePersonInjector.shared.dScenario != .off {
+            let fakes = FakePersonInjector.shared.dFakes(sensorSize: sensorSize)
+            // 候选 = 真人(conf 在 detectAllPersons 已丢=不可见) + 假人(带配置 conf)
+            var cands: [(label: String, box: CGRect, conf: Float)] =
+                realBoxes.enumerated().map { ("真人\($0.offset)", $0.element, Float.nan) }
+            cands += fakes.map { ($0.label, $0.box, $0.conf) }
+            // ★ 与 lockLargest 完全相同的比较器:.max(by 面积)——只注入候选,不改判据
+            let winner = cands.max { $0.box.width * $0.box.height < $1.box.width * $1.box.height }
+            logLockDecision(tag: "LOCK(实锁)", cands: cands, winner: winner, sensorSize: sensorSize)
+            if let w = winner {
+                lock(personBox: w.box, in: pixelBuffer, sensorSize: sensorSize)
+                return true
+            }
+            return false
+        }
+        #endif
+
+        #if DEBUG
+        // 锁定触发那一帧:打完整候选列表(box/面积/位置/conf),标最大,复核 lockLargest 是否选最大
+        let withConf = detectAllPersonsWithConf(in: pixelBuffer, sensorSize: sensorSize)
+        let frameArea = sensorSize.width * sensorSize.height
+        let maxA = withConf.map { $0.box.width * $0.box.height }.max() ?? 0
+        print("🔒LOCK触发 候选数=\(withConf.count)(源=body pose 多人版)")
+        for (i, c) in withConf.enumerated() {
+            let a = c.box.width * c.box.height
+            let isMax = a >= maxA - 1
+            print(String(format: "  候选[%d]: box=(%.0f,%.0f,%.0f,%.0f) 面积=%.4f 位置=(%.2f,%.2f) conf=%.2f%@",
+                         i, c.box.minX, c.box.minY, c.box.width, c.box.height,
+                         a / frameArea, c.box.midX / sensorSize.width, c.box.midY / sensorSize.height,
+                         c.conf, isMax ? " ←面积最大" : ""))
+        }
+        // 与生产 lockLargest 完全相同比较器,仅为复核打印(实际锁仍用下面 realBoxes)
+        if let w = withConf.max(by: { $0.box.width * $0.box.height < $1.box.width * $1.box.height }) {
+            let wa = w.box.width * w.box.height
+            print(String(format: "  候选数=%d lockLargest选中面积=%.4f 位置=(%.2f,%.2f) 是面积最大?=%@",
+                         withConf.count, wa / frameArea, w.box.midX / sensorSize.width, w.box.midY / sensorSize.height,
+                         wa >= maxA - 1 ? "YES" : "NO"))
+        }
+        #endif
+
+        guard let largest = realBoxes
                 .max(by: { $0.width * $0.height < $1.width * $1.height }) else {
             return false
         }
         lock(personBox: largest, in: pixelBuffer, sensorSize: sensorSize)
+        #if DEBUG
+        lockedBoxArea = largest.width * largest.height   // 记锁定框面积,供锁定后每帧对照
+        // sticky:锁定那一刻矩形候选数 + 锁框面积比 → 折进 PROBE,不用滚回去翻 🔒LOCK触发
+        dbgLockMomentCandCount = realBoxes.count
+        dbgLockMomentAreaFrac = largest.width * largest.height / (sensorSize.width * sensorSize.height)
+        dbgLockMomentCenter = CGPoint(x: largest.midX / sensorSize.width, y: largest.midY / sensorSize.height)
+        #endif
         return true
     }
+
+    #if DEBUG
+    /// track 漂移诊断:当前 track 框 vs 锁定瞬间中心(漂多少/往哪),并判最近 pose 候选是大(你)还是小(爹)。
+    func diagnoseDrift(currentBox: CGRect, cands: [(box: CGRect, conf: Float)], sensorSize: CGSize) {
+        let fa = sensorSize.width * sensorSize.height
+        let cx = currentBox.midX / sensorSize.width, cy = currentBox.midY / sensorSize.height
+        let drift = hypot(cx - dbgLockMomentCenter.x, cy - dbgLockMomentCenter.y)
+        // 当前框最近的 pose 候选 + 它是不是最大
+        let maxA = cands.map { $0.box.width * $0.box.height }.max() ?? 0
+        let nearest = cands.min { a, b in
+            hypot(a.box.midX/sensorSize.width - cx, a.box.midY/sensorSize.height - cy) <
+            hypot(b.box.midX/sensorSize.width - cx, b.box.midY/sensorSize.height - cy)
+        }
+        let nearA = nearest.map { $0.box.width * $0.box.height } ?? 0
+        let nearIsLargest = nearA >= maxA - 1
+        // 判向:漂移小+面积缩=原地缩你;最近候选是小框=漂到爹
+        let verdict: String
+        if cands.count >= 2 && !nearIsLargest { verdict = "漂到爹(最近候选=小框)" }
+        else if drift < 0.05 { verdict = "原地缩(贴着你但框缩水)" }
+        else { verdict = "漂移中" }
+        dbgDriftLine = String(format: "DRIFT 当前面积=%.3f 锁定面积=%.3f 中心漂=%.3f(Δx=%.3f Δy=%.3f) 最近候选面积=%.3f(最大?=%@) → %@",
+                              currentBox.width * currentBox.height / fa, Double(dbgLockMomentAreaFrac), drift,
+                              cx - dbgLockMomentCenter.x, cy - dbgLockMomentCenter.y,
+                              nearA / fa, nearIsLargest ? "Y" : "N", verdict)
+        print(dbgDriftLine)
+    }
+    #endif
+
+    #if DEBUG
+    /// 每帧 D-场景诊断(纯假人,固定不动):用 lockLargest 同一 .max(面积) 选,打 LOCK 决策。不改任何锁定状态。
+    func diagnoseDLockSelection(frame: Int, sensorSize: CGSize) {
+        guard FakePersonInjector.shared.dScenario != .off else { return }
+        let fakes = FakePersonInjector.shared.dFakes(sensorSize: sensorSize)
+        guard !fakes.isEmpty else { return }
+        let cands = fakes.map { (label: $0.label, box: $0.box, conf: $0.conf) }
+        let winner = cands.max { $0.box.width * $0.box.height < $1.box.width * $1.box.height }
+        logLockDecision(tag: "LOCK f=\(frame)", cands: cands, winner: winner, sensorSize: sensorSize)
+    }
+
+    /// 统一 LOCK 决策日志:候选[label:面积 conf pos] + 选中 + 是否面积最大 + 依据
+    private func logLockDecision(tag: String,
+                                 cands: [(label: String, box: CGRect, conf: Float)],
+                                 winner: (label: String, box: CGRect, conf: Float)?,
+                                 sensorSize: CGSize) {
+        let frameArea = sensorSize.width * sensorSize.height
+        let line = cands.map { c -> String in
+            let a = c.box.width * c.box.height / frameArea
+            let cf = c.conf.isNaN ? "—" : String(format: "%.2f", c.conf)
+            return String(format: "[%@:面积=%.3f conf=%@ pos=(%.2f,%.2f)]",
+                          c.label, a, cf, c.box.midX / sensorSize.width, c.box.midY / sensorSize.height)
+        }.joined()
+        let maxArea = cands.map { $0.box.width * $0.box.height }.max() ?? 0
+        let winArea = winner.map { $0.box.width * $0.box.height } ?? 0
+        let isMax = winArea >= maxArea - 1   // 容差 1px²
+        print("\(tag) 候选\(line) lockLargest选中=\(winner?.label ?? "无") 选中面积=\(String(format: "%.3f", winArea / frameArea)) 是面积最大?=\(isMax ? "YES" : "NO") 依据=.max(面积)(conf/位置不参与)")
+    }
+    #endif
 
     /// 解除锁定
     func unlock() {
@@ -122,6 +285,12 @@ final class PersonIdentifier {
         target = nil
         trackingRequest = nil
         isTrackingActive = false
+        reanchorCounter = 0
+        lastLockedBox = nil; coastFrames = 0
+        #if DEBUG
+        dbgLockWho = "无"; dbgTrkState = "未锁定"; dbgRefindNX = -1; dbgRefindNY = -1; lockedBoxArea = -1; dbgReanchorLine = ""; dbgReselectLine = ""
+        dbgLockMomentCandCount = -1; dbgLockMomentAreaFrac = -1; dbgLockMomentCenter = .zero; dbgDriftLine = ""
+        #endif
         print("🔓 目标已解锁")
     }
 
@@ -222,34 +391,147 @@ final class PersonIdentifier {
         if isTrackingActive, let tracked = continueTracking(detectBuffer, sensorSize: sensorSize) {
             // 验证追踪结果是不是真的是目标
             let (match, score) = isTarget(tracked, in: colorBuffer, sensorSize: sensorSize)
+            #if DEBUG
+            // LOCK后:走 continueTracking 跟随(非重新 lockLargest)。打当前框面积/位置 + 对照锁定帧大小
+            let a = tracked.width * tracked.height, fa = sensorSize.width * sensorSize.height
+            let rel = lockedBoxArea > 0 ? (a > lockedBoxArea * 1.2 ? "更大" : (a < lockedBoxArea * 0.8 ? "更小" : "≈锁定")) : "?"
+            print(String(format: "LOCK后 分支=continueTracking跟随(非重lockLargest) 当前box面积=%.4f 位置=(%.2f,%.2f) vs锁定帧=%@ 颜色校验=%@(%.2f)",
+                         a / fa, tracked.midX / sensorSize.width, tracked.midY / sensorSize.height,
+                         rel, match ? "match" : "REJECT", score))
+            #endif
             if match {
+                #if DEBUG
+                dbgLockWho = "真人"; dbgTrkState = "锁定"
+                #endif
+                // C8 重锚:每 N 帧用「颜色校验确认的主角真实框」re-seed,防 track 自漂/缩水
+                reanchorCounter += 1
+                if reanchorCounter >= reanchorInterval {
+                    reanchorCounter = 0
+                    if let re = reanchorTarget(detectBuffer: detectBuffer, colorBuffer: colorBuffer, sensorSize: sensorSize) {
+                        startTracking(box: re.box, sensorSize: sensorSize)   // re-seed VNTrackObject 到主角真实框
+                        #if DEBUG
+                        let fa = sensorSize.width * sensorSize.height
+                        dbgReanchorLine = String(format: "重锚✓ track面积%.3f→主角真实%.3f 综合分%.2f 候选%d",
+                                                 tracked.width * tracked.height / fa,
+                                                 re.box.width * re.box.height / fa, re.score, re.candCount)
+                        print("⚓ " + dbgReanchorLine)
+                        dbgTrkState = "锁定(重锚)"
+                        #endif
+                        return (re.box, re.score)
+                    } else {
+                        #if DEBUG
+                        dbgReanchorLine = "重锚✗ 无颜色匹配候选,保持track"; print("⚓ " + dbgReanchorLine)
+                        #endif
+                    }
+                }
                 return (tracked, score)
             }
             // 追踪结果不匹配，可能追错了，重新检测
             isTrackingActive = false
+            #if DEBUG
+            dbgTrkState = "跟丢"
+            let dW = CVPixelBufferGetWidth(detectBuffer), dH = CVPixelBufferGetHeight(detectBuffer)
+            print(String(format: "🔁 跟丢→重检测 输入=%dx%d(wide全帧降采样,非crop;aspect %.2f vs sensor %.2f) sensorSize=%dx%d",
+                         dW, dH, Double(dW) / Double(max(dH, 1)),
+                         sensorSize.width / max(sensorSize.height, 1),
+                         Int(sensorSize.width), Int(sensorSize.height)))
+            #endif
         }
 
-        // 检测所有人，找匹配的（检测在 detectBuffer,颜色校验在 colorBuffer）
+        // ===== 方案A 主跟踪:每帧 pose 候选「延续上一帧目标」+ 换人迟滞(治我/爹闪烁)=====
         let persons = detectAllPersons(in: detectBuffer, sensorSize: sensorSize)
+        let fa = sensorSize.width * sensorSize.height
 
-        var bestBox: CGRect?
-        var bestScore: Float = 0
+        // 每个候选:颜色综合分 + match + 对「上一帧锁定框」的延续分(颜色大头 + 位置 + 尺寸)
+        struct Scored { let box: CGRect; let color: Float; let matched: Bool; let cont: Float }
+        let scored: [Scored] = persons.map { p in
+            let (m, s) = isTarget(p, in: colorBuffer, sensorSize: sensorSize)
+            var cont: Float = 0
+            if let last = lastLockedBox {
+                let posDist = Float(hypot((p.midX - last.midX) / sensorSize.width, (p.midY - last.midY) / sensorSize.height))
+                let aP = p.width * p.height, aL = last.width * last.height
+                let sizeDist = Float(abs(aP - aL) / max(aL, 1))
+                let posSim = max(0, 1 - posDist * 2)      // 位置越近越高
+                let sizeSim = max(0, 1 - sizeDist)         // 尺寸越近越高
+                cont = wCont_color * s + wCont_pos * posSim + wCont_size * sizeSim
+            } else {
+                cont = s                                    // 无上一帧 → 退化为综合分
+            }
+            return Scored(box: p, color: s, matched: m, cont: cont)
+        }
 
-        for person in persons {
-            let (match, score) = isTarget(person, in: colorBuffer, sensorSize: sensorSize)
-            if match && score > bestScore {
-                bestScore = score
-                bestBox = person
+        let matched = scored.filter { $0.matched }
+
+        // 延续候选 = 颜色 match 且「延续分」最高(= 上一帧的你连续过来的)
+        let incumbent = matched.max { $0.cont < $1.cont }
+        // 挑战者 = 颜色 match 且综合分最高、且不是延续候选本身
+        let challenger = matched.filter { $0.box != incumbent?.box }.max { $0.color < $1.color }
+
+        var chosen: Scored?
+        var switched = false
+        if let inc = incumbent {
+            if lastLockedBox != nil && inc.cont < continuityFloor {
+                // 上一帧目标本帧没检出(延续分太低)→ 暂保持上一帧框(coast),别跳到爹
+                coastFrames += 1
+                if coastFrames <= maxCoastFrames, let hold = lastLockedBox {
+                    #if DEBUG
+                    dbgReselectLine = String(format: "重选 延续分=%.2f<floor → coast保持(%d/%d) 候选%d", inc.cont, coastFrames, maxCoastFrames, persons.count)
+                    print("🧲 " + dbgReselectLine); dbgTrkState = "保持(目标暂失)"
+                    #endif
+                    return (hold, inc.color)
+                }
+                // 超 coast → 重新捕获:最强颜色匹配
+                chosen = matched.max { $0.color < $1.color }
+            } else {
+                // 换人迟滞:挑战者综合分须 > 延续候选 + margin 才换,否则黏住延续(你)
+                if let ch = challenger, ch.color > inc.color + switchMargin {
+                    chosen = ch; switched = true
+                } else {
+                    chosen = inc
+                }
+                coastFrames = 0
             }
         }
 
-        if let box = bestBox {
-            // 重新启动追踪
-            startTracking(box: box, sensorSize: sensorSize)
-            return (box, bestScore)
+        #if DEBUG
+        let incS = incumbent.map { String(format: "延续%.2f(色%.2f)", $0.cont, $0.color) } ?? "无"
+        let chS = challenger.map { String(format: "色%.2f", $0.color) } ?? "无"
+        dbgReselectLine = String(format: "重选 人数=%d 延续候选=%@ 挑战者=%@ margin=%.2f 换人=%@ → %@",
+                                 persons.count, incS, chS, switchMargin, switched ? "YES" : "NO",
+                                 chosen.map { String(format: "面积%.3f@(%.2f,%.2f)色%.2f", $0.box.width*$0.box.height/fa, $0.box.midX/sensorSize.width, $0.box.midY/sensorSize.height, $0.color) } ?? "丢失")
+        print("🧲 " + dbgReselectLine)
+        #endif
+
+        if let c = chosen {
+            #if DEBUG
+            dbgLockWho = "真人"; dbgTrkState = switched ? "换人" : "锁定(延续)"
+            dbgRefindNX = c.box.midX / sensorSize.width; dbgRefindNY = c.box.midY / sensorSize.height
+            #endif
+            lastLockedBox = c.box
+            startTracking(box: c.box, sensorSize: sensorSize)   // 顺带 re-seed VNTrackObject(成功了就走快速路)
+            return (c.box, c.color)
         }
 
+        #if DEBUG
+        dbgLockWho = "无"; dbgTrkState = "丢失"
+        #endif
         return nil
+    }
+
+    /// C8 重锚候选:pose 多人检测 + 颜色校验,返回最匹配主角的候选(综合分最高的 match)。
+    /// ★用颜色校验(isTarget)、不用最大面积 → 主角蹲下/变小也认得回,不会被站着的大个路人抢。
+    /// 无匹配返回 nil(调用方保持原 track,不丢锁)。
+    private func reanchorTarget(detectBuffer: CVPixelBuffer, colorBuffer: CVPixelBuffer, sensorSize: CGSize)
+        -> (box: CGRect, score: Float, candCount: Int)? {
+        let persons = detectAllPersons(in: detectBuffer, sensorSize: sensorSize)
+        var best: CGRect?
+        var bestScore: Float = 0
+        for p in persons {
+            let (m, s) = isTarget(p, in: colorBuffer, sensorSize: sensorSize)
+            if m && s > bestScore { bestScore = s; best = p }
+        }
+        guard let b = best else { return nil }
+        return (b, bestScore, persons.count)
     }
 
     #if DEBUG
@@ -292,6 +574,13 @@ final class PersonIdentifier {
         snap.candCount = cands.count
         snap.winner = winner?.label ?? "无"
         FakePersonInjector.shared.lastSnapshot = snap
+
+        // 卡3 HUD 状态(假人模式):锁谁=winner、状态=竞争、找回=winner 全帧归一化
+        dbgLockWho = winner?.label ?? "无"
+        dbgTrkState = winner == nil ? "丢失" : "竞争"
+        if let w = winner {
+            dbgRefindNX = w.box.midX / sensorSize.width; dbgRefindNY = w.box.midY / sensorSize.height
+        }
 
         if let w = winner {
             startTracking(box: w.box, sensorSize: sensorSize)
@@ -355,31 +644,53 @@ final class PersonIdentifier {
 
     // MARK: - 特征提取
 
-    /// 检测所有人
+    /// 多人候选源:VNDetectHumanBodyPose(召回多人,矩形召回弱只出1)。每 pose → tightBox(wide 空间)。
+    /// 坐标约定与 PersonTracker.getTightBoxFromPose 完全一致:顶左原点,y=(1-maxY)*h,8% padding。
+    private func detectPersonsViaPose(in pixelBuffer: CVPixelBuffer,
+                                      sensorSize: CGSize) -> [(box: CGRect, conf: Float)] {
+        let request = VNDetectHumanBodyPoseRequest()
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
+        do { try handler.perform([request]) } catch { return [] }
+        guard let results = request.results else { return [] }
+        let boxes: [(box: CGRect, conf: Float)] = results.compactMap { obs in
+            guard let box = Self.tightBox(from: obs, sensorSize: sensorSize) else { return nil }
+            return (box, obs.confidence)
+        }
+        #if DEBUG
+        print("👁VNPose候选 results.count=\(results.count) 有效box=\(boxes.count) 输入=\(CVPixelBufferGetWidth(pixelBuffer))x\(CVPixelBufferGetHeight(pixelBuffer))")
+        #endif
+        return boxes
+    }
+
+    /// 单个 pose → 紧贴 bounding box(wide 传感器坐标)。与 getTightBoxFromPose 同逻辑,sensorSize 版。
+    private static func tightBox(from obs: VNHumanBodyPoseObservation, sensorSize: CGSize) -> CGRect? {
+        guard let points = try? obs.recognizedPoints(.all) else { return nil }
+        let valid = points.values.filter { $0.confidence > 0.3 }
+        guard valid.count >= 5 else { return nil }
+        let xs = valid.map { $0.location.x }, ys = valid.map { $0.location.y }
+        guard let minX = xs.min(), let maxX = xs.max(),
+              let minY = ys.min(), let maxY = ys.max() else { return nil }
+        let padX = (maxX - minX) * 0.08, padY = (maxY - minY) * 0.08
+        let boxMinX = max(0, minX - padX)
+        let boxMaxY = min(1, maxY + padY)
+        let boxMinY = max(0, minY - padY)
+        let w = min(sensorSize.width, (maxX - minX + padX * 2) * sensorSize.width)
+        let h = min(sensorSize.height, (boxMaxY - boxMinY) * sensorSize.height)
+        return CGRect(x: boxMinX * sensorSize.width, y: (1 - boxMaxY) * sensorSize.height, width: w, height: h)
+    }
+
+    #if DEBUG
+    /// 诊断/锁定候选(带 conf):换源到 body pose 多人版(矩形召回弱已弃用)。
+    func detectAllPersonsWithConf(in pixelBuffer: CVPixelBuffer,
+                                  sensorSize: CGSize) -> [(box: CGRect, conf: Float)] {
+        return detectPersonsViaPose(in: pixelBuffer, sensorSize: sensorSize)
+    }
+    #endif
+
+    /// 检测所有人(候选源)= body pose 多人版。lockLargest/重选在这些候选里选,逻辑不变。
     private func detectAllPersons(in pixelBuffer: CVPixelBuffer,
                                    sensorSize: CGSize) -> [CGRect] {
-        let request = VNDetectHumanRectanglesRequest()
-        request.upperBodyOnly = false
-
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer,
-                                             orientation: .up,
-                                             options: [:])
-        do {
-            try handler.perform([request])
-        } catch {
-            return []
-        }
-
-        guard let results = request.results else { return [] }
-
-        return results.map { obs in
-            CGRect(
-                x: obs.boundingBox.minX * sensorSize.width,
-                y: (1 - obs.boundingBox.maxY) * sensorSize.height,
-                width: obs.boundingBox.width * sensorSize.width,
-                height: obs.boundingBox.height * sensorSize.height
-            )
-        }
+        return detectPersonsViaPose(in: pixelBuffer, sensorSize: sensorSize).map { $0.box }
     }
 
     /// 提取上半身颜色直方图

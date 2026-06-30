@@ -289,6 +289,7 @@ final class TrackingController {
     var dbgZoomSrc = ""
 
     var dbgFakeHUD = ""   // 卡2 最简 HUD:候选人数 + 锁谁(细节看 console REPLAY/FAKE 行)
+    var dbgTrkHUD = ""    // 卡3 最简 HUD:锁谁 / 状态 / 找回@(取自 PersonIdentifier.dbgTrkLine,不重算)
 
     // 跳变取证(只抓数据,不改逻辑):pose 四点门是否过、rect 兜底框 conf、本帧锚/ratio/rect框跳变量
     var dbgPoseValid = false
@@ -553,8 +554,10 @@ final class TrackingController {
             }
 
             // Step B: 骨骼检测 —— 判断"人在干什么"（姿态分析 + 黄框显示）
+            // 锁定中:用「最接近锁定框(rawBox=你)的 pose」喂 zoom/锚点,爹的 pose 不污染构图。
             let _tPose = CACurrentMediaTime()
-            let _poseResult = detectPose(pb: detPB)
+            let _matchBox = PersonIdentifier.shared.isLocked ? rawBox : nil
+            let _poseResult = detectPose(pb: detPB, matchingBox: _matchBox)
             msPose = (CACurrentMediaTime() - _tPose) * 1000
             if let pose = _poseResult {
                 lastPoseObservation = pose

@@ -209,6 +209,9 @@ private struct PlaybackPlayerView: View {
     @StateObject private var model: PlaybackModel
     private let onBack: () -> Void
     private let title: String
+    #if DEBUG
+    @State private var dSel = 0   // 0=off 1=D1 2=D2 3=D3,确诊 lockLargest 按什么选
+    #endif
 
     init(url: URL, onBack: @escaping () -> Void) {
         _model = StateObject(wrappedValue: PlaybackModel(url: url))
@@ -273,6 +276,29 @@ private struct PlaybackPlayerView: View {
                         Spacer()
                     }
 
+                    #if DEBUG
+                    // D-场景选择器:点一下即切(不用改代码重 build)。选中后 console 每帧打 LOCK 决策行。
+                    HStack(spacing: 6) {
+                        ForEach(Array(["off", "D1大小", "D2位置", "D3爹"].enumerated()), id: \.offset) { idx, name in
+                            Button {
+                                dSel = idx
+                                switch idx {
+                                case 1: FakePersonInjector.shared.dScenario = .d1
+                                case 2: FakePersonInjector.shared.dScenario = .d2
+                                case 3: FakePersonInjector.shared.dScenario = .d3
+                                default: FakePersonInjector.shared.dScenario = .off
+                                }
+                            } label: {
+                                Text(name)
+                                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                    .padding(.horizontal, 8).padding(.vertical, 4)
+                                    .background(dSel == idx ? Color.purple.opacity(0.8) : Color.white.opacity(0.15), in: Capsule())
+                            }
+                        }
+                        Spacer()
+                    }
+                    #endif
+
                     HStack {
                         Text(vm.perfHUD)
                             .font(.system(size: 11, weight: .medium, design: .monospaced))
@@ -299,6 +325,21 @@ private struct PlaybackPlayerView: View {
                             Spacer()
                         }
                     }
+
+                    #if DEBUG
+                    // 卡3 跟踪态:锁谁/状态/找回@(单色等宽);找回 nx 接近 0/1 = crop 外找回=全帧搜索
+                    if !vm.trkHUD.isEmpty {
+                        HStack {
+                            Text(vm.trkHUD)
+                                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                .foregroundColor(.white)
+                                .lineLimit(1).minimumScaleFactor(0.5)
+                                .padding(.horizontal, 10).padding(.vertical, 5)
+                                .background(.black.opacity(0.55), in: Capsule())
+                            Spacer()
+                        }
+                    }
+                    #endif
 
                     // 临时:cx vs 几何 诊断行(回放也读)
                     if !vm.dbgCropHUD.isEmpty {

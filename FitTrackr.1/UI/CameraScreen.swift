@@ -56,6 +56,22 @@ struct CameraScreen: View {
                     .padding(.horizontal, 16)
                     .padding(.top, 6)
 
+                    #if DEBUG
+                    // 卡3 跟踪态:锁谁/状态/找回@(showDebugOverlay 开时;单色等宽,接诊断行后)
+                    if vm.showDebugOverlay, !vm.trkHUD.isEmpty {
+                        HStack {
+                            Text(vm.trkHUD)
+                                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                .foregroundColor(.white)
+                                .lineLimit(1).minimumScaleFactor(0.5)
+                                .padding(.horizontal, 8).padding(.vertical, 4)
+                                .background(.black.opacity(0.55), in: Capsule())
+                            Spacer(minLength: 0)
+                        }
+                        .padding(.horizontal, 16).padding(.top, 4)
+                    }
+                    #endif
+
                     // 跳变取证:冻结"跳最大那一帧"(poseValid/srcUsed/rectConf/各Δ)——单行小字
                     if !vm.probeHUD.isEmpty {
                         HStack {
