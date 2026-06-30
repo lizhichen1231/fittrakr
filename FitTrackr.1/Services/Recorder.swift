@@ -6,7 +6,7 @@ import CoreImage
 protocol Recorder {
     var isRecording: Bool { get }
     func start(size: CGSize)
-    func appendVideo(ciImage: CIImage, at pts: CMTime)
+    func appendVideo(cgImage: CGImage, at pts: CMTime)
     func appendAudio(_ sampleBuffer: CMSampleBuffer)
     func stopAndSave(_ completion: @escaping (Bool)->Void)
 }
@@ -17,12 +17,11 @@ final class AVWriterRecorder: NSObject, Recorder, AVCaptureAudioDataOutputSample
     private var aInput: AVAssetWriterInput?
     private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
 
-    private let ciContext = CIContext(options: [
-        .workingColorSpace: CGColorSpaceCreateDeviceRGB(),
-        .outputColorSpace : CGColorSpaceCreateDeviceRGB()
-    ])
-
+    // 去冗余:不再用第二个 CIContext 重渲;录制直接拿 tracking 已渲好的 CGImage(previewCG)blit。
     private(set) var isRecording = false
+
+    // 录制专用串行队列:blit + 编码 append 全在此,不压主线程;串行保证按 pts 顺序、不乱序。
+    private let recordQueue = DispatchQueue(label: "recorder.write", qos: .userInitiated)
 
     // 统一时间刻度 & 记录输出尺寸（兜底创建 PB 用）
     private let timescale: Int32 = 600
@@ -91,7 +90,13 @@ final class AVWriterRecorder: NSObject, Recorder, AVCaptureAudioDataOutputSample
         audioBasePTS = nil
     }
 
-    func appendVideo(ciImage: CIImage, at pts: CMTime) {
+    func appendVideo(cgImage: CGImage, at pts: CMTime) {
+        guard isRecording else { return }
+        // CGImage 不可变+引用计数,闭包捕获即 retain → 异步安全,不会被下一帧覆盖,无需拷贝。
+        recordQueue.async { [weak self] in self?._appendVideo(cgImage: cgImage, at: pts) }
+    }
+
+    private func _appendVideo(cgImage: CGImage, at pts: CMTime) {
         guard isRecording, let vInput = vInput, let adaptor = adaptor else { return }
         guard vInput.isReadyForMoreMediaData else { return }
 
@@ -129,9 +134,8 @@ final class AVWriterRecorder: NSObject, Recorder, AVCaptureAudioDataOutputSample
         let height = CVPixelBufferGetHeight(pixelBuffer)
         let rect = CGRect(x: 0, y: 0, width: width, height: height)
 
-        if let cgImage = ciContext.createCGImage(ciImage,
-                                                 from: ciImage.extent.isEmpty ? rect : ciImage.extent),
-           let context = CGContext(data: CVPixelBufferGetBaseAddress(pixelBuffer),
+        // 去冗余:直接用 tracking 已渲好的 cgImage(不再 createCGImage 重渲),只做一次 CPU blit 进编码 buffer
+        if let context = CGContext(data: CVPixelBufferGetBaseAddress(pixelBuffer),
                                    width: width,
                                    height: height,
                                    bitsPerComponent: 8,
@@ -162,6 +166,12 @@ final class AVWriterRecorder: NSObject, Recorder, AVCaptureAudioDataOutputSample
     }
 
     func appendAudio(_ sampleBuffer: CMSampleBuffer) {
+        guard isRecording else { return }
+        // CMSampleBuffer 引用计数,闭包捕获即 retain → 异步安全。与视频同队列,顺序一致。
+        recordQueue.async { [weak self] in self?._appendAudio(sampleBuffer) }
+    }
+
+    private func _appendAudio(_ sampleBuffer: CMSampleBuffer) {
         guard isRecording, let aInput = aInput, aInput.isReadyForMoreMediaData else { return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         if audioBasePTS == nil { audioBasePTS = pts }
@@ -187,23 +197,29 @@ final class AVWriterRecorder: NSObject, Recorder, AVCaptureAudioDataOutputSample
     }
 
     func stopAndSave(_ completion: @escaping (Bool)->Void) {
-        guard isRecording, let writer = writer else { completion(false); return }
-        isRecording = false
-        vInput?.markAsFinished()
-        aInput?.markAsFinished()
-        writer.finishWriting {
-            let url = writer.outputURL
-            PHPhotoLibrary.requestAuthorization { s in
-                guard s == .authorized || s == .limited else {
-                    DispatchQueue.main.async { completion(false) }; return
-                }
-                PHPhotoLibrary.shared().performChanges({
-                    PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
-                }) { ok, _ in
-                    DispatchQueue.main.async { completion(ok) }
-                }
+        guard isRecording else { completion(false); return }
+        isRecording = false   // 同步置 false:已排队的 append 进 _append 后 guard 跳过,不再写
+        // finalize 派到 recordQueue:串行 → 排在所有 pending append 之后,保证写完才 finish
+        recordQueue.async { [weak self] in
+            guard let self = self, let writer = self.writer else {
+                DispatchQueue.main.async { completion(false) }; return
             }
-            self.writer = nil; self.vInput = nil; self.aInput = nil; self.adaptor = nil
+            self.vInput?.markAsFinished()
+            self.aInput?.markAsFinished()
+            writer.finishWriting {
+                let url = writer.outputURL
+                PHPhotoLibrary.requestAuthorization { s in
+                    guard s == .authorized || s == .limited else {
+                        DispatchQueue.main.async { completion(false) }; return
+                    }
+                    PHPhotoLibrary.shared().performChanges({
+                        PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
+                    }) { ok, _ in
+                        DispatchQueue.main.async { completion(ok) }
+                    }
+                }
+                self.writer = nil; self.vInput = nil; self.aInput = nil; self.adaptor = nil
+            }
         }
     }
 }

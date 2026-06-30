@@ -154,16 +154,26 @@ final class PersonIdentifier {
         self.isLocked = true
         self.lastLockedBox = personBox   // 方案A:延续/迟滞基准 = 锁定那刻的框(你)
         self.coastFrames = 0
+        // 修法2:重置 VNSequenceRequestHandler → 每次锁定 VNTrackObject 从干净状态起跟,抹平「第一次vs之后」暖机差异。
+        self.sequenceHandler = VNSequenceRequestHandler()
 
         // 5. 启动 Vision 追踪（优化）
         startTracking(box: personBox, sensorSize: sensorSize)
 
-        print("🔒 目标已锁定 | 上衣颜色bins: \(profile.colorHistogram.count) | 下装颜色bins: \(profile.lowerBodyColorHist.count)")
+        let baseEmpty = profile.colorHistogram.isEmpty && profile.lowerBodyColorHist.isEmpty
+        print("🔒 目标已锁定 | 上衣颜色bins: \(profile.colorHistogram.count) | 下装颜色bins: \(profile.lowerBodyColorHist.count)\(baseEmpty ? "  ★★基准空!色彩verify失效→易漂(就是这次锁定的问题)" : "")")
     }
 
     /// 锁定最大的人
     func lockLargest(in pixelBuffer: CVPixelBuffer, sensorSize: CGSize) -> Bool {
         let realBoxes = detectAllPersons(in: pixelBuffer, sensorSize: sensorSize)
+        // 无真人:早返回(自动锁定每帧重试时不打日志/不重复检测)。D-场景(debug)需无真人也注入假人 → 不早返回。
+        #if DEBUG
+        let dActive = FakePersonInjector.shared.dScenario != .off
+        #else
+        let dActive = false
+        #endif
+        if realBoxes.isEmpty && !dActive { return false }
 
         #if DEBUG
         // D-场景:注入假人到候选表,用【同一】.max(面积)比较器选,并打 LOCK 决策(确诊按什么选)
@@ -365,6 +375,13 @@ final class PersonIdentifier {
 
         // 如果匹配，更新最后位置
         if isMatch {
+            #if DEBUG
+            // 坐实 #4:每个 match 候选都覆盖 lastCenter。打:中心 + 综合分 + 色彩基准空否(verify 是否生效)。
+            // 第一次若 bins=0 → 色彩项跳过 → 别人也 match → lastCenter 被别人覆盖 → 漂。
+            print(String(format: "  isTarget候选 中心=(%.2f,%.2f) 综合分=%.2f 色彩基准=%@ → lastCenter改成此候选",
+                         personCenter.x, personCenter.y, finalScore,
+                         (target.colorHistogram.isEmpty && target.lowerBodyColorHist.isEmpty) ? "★空!verify失效" : "有(上\(target.colorHistogram.count)/下\(target.lowerBodyColorHist.count)bins)"))
+            #endif
             self.target?.lastCenter = personCenter
         }
 
@@ -518,19 +535,25 @@ final class PersonIdentifier {
         return nil
     }
 
-    /// C8 重锚候选:pose 多人检测 + 颜色校验,返回最匹配主角的候选(综合分最高的 match)。
-    /// ★用颜色校验(isTarget)、不用最大面积 → 主角蹲下/变小也认得回,不会被站着的大个路人抢。
-    /// 无匹配返回 nil(调用方保持原 track,不丢锁)。
+    /// C8 重锚候选:纠正【当前目标】的框,绝不换人。
+    /// ★黏当前目标:在「颜色 verify match 当前 target」的候选里,选【离 lastLockedBox 最近】的那个(延续候选),
+    ///   而不是全局颜色分最高(那会被更大/分更高的路人抢→漂)。无 match 延续候选 → 返回 nil(宁可不重锚、保持原框)。
     private func reanchorTarget(detectBuffer: CVPixelBuffer, colorBuffer: CVPixelBuffer, sensorSize: CGSize)
         -> (box: CGRect, score: Float, candCount: Int)? {
         let persons = detectAllPersons(in: detectBuffer, sensorSize: sensorSize)
+        guard let anchor = lastLockedBox else { return nil }   // 没有当前框基准 → 不重锚
+        let ax = anchor.midX / sensorSize.width, ay = anchor.midY / sensorSize.height
         var best: CGRect?
         var bestScore: Float = 0
+        var bestDist = CGFloat.greatestFiniteMagnitude
         for p in persons {
             let (m, s) = isTarget(p, in: colorBuffer, sensorSize: sensorSize)
-            if m && s > bestScore { bestScore = s; best = p }
+            guard m else { continue }                          // 只在颜色 match 当前 target 的候选里选
+            let d = hypot(p.midX / sensorSize.width - ax, p.midY / sensorSize.height - ay)
+            if d < bestDist { bestDist = d; best = p; bestScore = s }   // ★选离当前框最近的(延续),不是分最高的
         }
-        guard let b = best else { return nil }
+        // 延续约束:最近的 match 候选也不能离太远(>20% 画面 = 那不是当前目标的延续,是别人)→ 不重锚
+        guard let b = best, bestDist < 0.20 else { return nil }
         return (b, bestScore, persons.count)
     }
 

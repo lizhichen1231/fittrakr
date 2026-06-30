@@ -41,20 +41,22 @@ struct CameraScreen: View {
                     .padding(.horizontal, 16)
                     .padding(.top, 60)
 
-                    // 整合诊断行:FPS·dt·阶段耗时·tot·四点conf·zoom测量源 —— 单行小字自动缩放,占屏最小
-                    HStack {
-                        Text(vm.perfHUD)
-                            .font(.system(size: 10, weight: .medium, design: .monospaced))
-                            .foregroundColor(.green)
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.5)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(.black.opacity(0.55), in: Capsule())
-                        Spacer(minLength: 0)
+                    // 整合诊断行(调试):默认不显示,眼睛开关(showDebugOverlay)打开才出 → 正式画面干净
+                    if vm.showDebugOverlay {
+                        HStack {
+                            Text(vm.perfHUD)
+                                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                .foregroundColor(.green)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.5)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(.black.opacity(0.55), in: Capsule())
+                            Spacer(minLength: 0)
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.top, 6)
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.top, 6)
 
                     #if DEBUG
                     // 卡3 跟踪态:锁谁/状态/找回@(showDebugOverlay 开时;单色等宽,接诊断行后)
@@ -72,8 +74,8 @@ struct CameraScreen: View {
                     }
                     #endif
 
-                    // 跳变取证:冻结"跳最大那一帧"(poseValid/srcUsed/rectConf/各Δ)——单行小字
-                    if !vm.probeHUD.isEmpty {
+                    // 跳变取证(调试):默认不显示,眼睛开关打开才出
+                    if vm.showDebugOverlay, !vm.probeHUD.isEmpty {
                         HStack {
                             Text(vm.probeHUD)
                                 .font(.system(size: 9, weight: .medium, design: .monospaced))
@@ -264,7 +266,7 @@ struct CameraScreen: View {
 
     private func toggleGesture() {
         if vm.gestureMode == .off {
-            vm.gestureMode = .wave
+            vm.gestureMode = .victory   // 默认比耶✌️
         } else {
             vm.gestureMode = .off
         }
@@ -277,8 +279,8 @@ struct CameraScreen: View {
             return "hand.raised.slash"
         case .wave:
             return "hand.wave"
-        case .okThree:
-            return "hand.thumbsup"
+        case .victory:
+            return "hand.raised.fingers.spread"
         }
     }
     
@@ -288,8 +290,8 @@ struct CameraScreen: View {
             return "手势关"
         case .wave:
             return "挥手"
-        case .okThree:
-            return "OK"
+        case .victory:
+            return "比耶"
         }
     }
     
@@ -300,8 +302,8 @@ struct CameraScreen: View {
             switch vm.gestureMode {
             case .wave:
                 return "挥手开始/停止"
-            case .okThree:
-                return "OK+三指触发"
+            case .victory:
+                return "比耶✌️触发"
             default:
                 return ""
             }
@@ -326,7 +328,7 @@ fileprivate struct TunerSheet: View {
                 Section(header: Text("手势触发")) {
                     Picker("触发方式", selection: $vm.gestureMode) {
                         Text("张开手掌").tag(GestureTriggerMode.wave)
-                        Text("OK + 三指").tag(GestureTriggerMode.okThree)
+                        Text("比耶✌️").tag(GestureTriggerMode.victory)
                         Text("关闭").tag(GestureTriggerMode.off)
                     }
                     .onChange(of: vm.gestureMode) { _ in

@@ -6,7 +6,7 @@ import Vision
 
 // 对外接口保持不变
 enum GestureDecision { case none, start, stop }
-enum GestureTriggerMode: String, CaseIterable { case wave, okThree, off }
+enum GestureTriggerMode: String, CaseIterable { case wave, victory, off }   // victory=比耶✌️(原 okThree 空壳激活)
 
 protocol _HandGestureCore {
     var onLandmarks: (([CGPoint]) -> Void)? { get set }
@@ -27,36 +27,35 @@ fileprivate final class StableToggle {
     private var stable = 0
     private var last: GestureDecision = .stop
     private var lastTriggerTime = Date(timeIntervalSince1970: 0)
-    
+    private var needRelease = false   // 触发后必须先松手(active=false)才能再触发 → 治「保持着反复 toggle」
+
     let needStable: Int
     let cooldownSeconds: TimeInterval
 
-    init(needStable: Int = 2, cooldownSeconds: TimeInterval = 1.0) {
+    init(needStable: Int = 2, cooldownSeconds: TimeInterval = 1.2) {
         self.needStable = needStable
         self.cooldownSeconds = cooldownSeconds
     }
 
     func step(active: Bool) -> GestureDecision {
-        // 基于时间的冷却检查
-        let now = Date()
-        let timeSinceLastTrigger = now.timeIntervalSince(lastTriggerTime)
-        
-        if timeSinceLastTrigger < cooldownSeconds {
-            // 还在冷却期，不响应
+        // 松手:解除「需松手」+ 清累计(下一次比耶重新开始数)
+        if !active {
+            needRelease = false
+            stable = 0
             return .none
         }
-        
-        if active {
-            stable += 1
-            if stable >= needStable {
-                stable = 0
-                lastTriggerTime = now
-                last = (last == .start) ? .stop : .start
-                print("🎬 手势触发: \(last == .start ? "开始" : "停止")录制")
-                return last
-            }
-        } else {
+        // active=true:
+        let now = Date()
+        if now.timeIntervalSince(lastTriggerTime) < cooldownSeconds { return .none }  // 冷却期不响应
+        if needRelease { return .none }   // 触发后还没松手 → 一直举着也不重复触发
+        stable += 1
+        if stable >= needStable {
             stable = 0
+            needRelease = true            // 必须松手才能下一次
+            lastTriggerTime = now
+            last = (last == .start) ? .stop : .start
+            print("🎬 手势触发: \(last == .start ? "开始" : "停止")录制")
+            return last
         }
         return .none
     }
@@ -64,8 +63,15 @@ fileprivate final class StableToggle {
     func reset() {
         stable = 0
         last = .stop
+        needRelease = false
         lastTriggerTime = Date(timeIntervalSince1970: 0)  // 重置时清除冷却
     }
+
+    #if DEBUG
+    var dbgStable: Int { stable }
+    var dbgNeed: Int { needStable }
+    var dbgCooldownRemain: TimeInterval { max(0, cooldownSeconds - Date().timeIntervalSince(lastTriggerTime)) }
+    #endif
 }
 
 // MARK: - 公共判定：张开手掌判定
@@ -106,6 +112,55 @@ fileprivate struct OpenPalmRule {
 
         return true
     }
+
+    #if DEBUG
+    /// 诊断版:返回(过?, 不过的那道门 + 关键量)。门与 isOpenPalm 完全一致,只为打日志。
+    static func reason(_ pts: [CGPoint]) -> (Bool, String) {
+        guard pts.count >= 21 else { return (false, "点数<21") }
+        let wrist = pts[0]; let palm = max(1e-6, GX.dist(wrist, pts[9]))
+        if palm < 0.04 { return (false, String(format: "palm=%.3f<0.04(手太小/糊)", palm)) }
+        func ext(_ tip: Int,_ mcp: Int,_ k: CGFloat) -> Bool { GX.dist(pts[tip], pts[mcp]) > k*palm }
+        let extCount = [ext(8,5,0.75), ext(12,9,0.80), ext(16,13,0.80), ext(20,17,0.78)].filter { $0 }.count
+        if extCount < 3 { return (false, "伸直指=\(extCount)<3(手没张开/握拳)") }
+        if GX.dist(pts[4], pts[5]) <= 0.55*palm { return (false, "拇指外展不足") }
+        let gaps = [GX.dist(pts[8],pts[12]), GX.dist(pts[12],pts[16]), GX.dist(pts[16],pts[20])].filter { $0 > 0.28*palm }.count
+        if gaps < 2 { return (false, "指缝宽=\(gaps)<2(手指并拢)") }
+        let up = zip([pts[8].y,pts[12].y,pts[16].y,pts[20].y], [pts[5].y,pts[9].y,pts[13].y,pts[17].y]).filter { $0 < $1 - 0.02 }.count
+        if up < 3 { return (false, "指尖朝上=\(up)<3(手没竖起)") }
+        return (true, String(format: "过(palm=%.3f 伸%d 缝%d 上%d)", palm, extCount, gaps, up))
+    }
+    #endif
+}
+
+// MARK: - 比耶✌️判定（食/中伸直朝上 + 无名/小指收拢；负条件防误触握拳/张掌）
+fileprivate struct VictoryRule {
+    // 方向无关:不判朝上(正/反/左/右/横/斜比都认)。只要 食/中伸 + 无名/小指收。阈值 0.7→0.6 更易过。
+    static func isVictory(_ pts: [CGPoint]) -> Bool {
+        guard pts.count >= 21 else { return false }
+        let palm = max(1e-6, GX.dist(pts[0], pts[9]))     // wrist→middleMCP
+        if palm < 0.04 { return false }
+        let idxExt  = GX.dist(pts[8],  pts[5])  > 0.6 * palm   // 食指伸
+        let midExt  = GX.dist(pts[12], pts[9])  > 0.6 * palm   // 中指伸
+        let ringFold = GX.dist(pts[16], pts[13]) < 0.5 * palm  // 无名收(★负条件,防误触)
+        let litFold  = GX.dist(pts[20], pts[17]) < 0.5 * palm  // 小指收(★负条件,防误触)
+        return idxExt && midExt && ringFold && litFold
+        // 误触涨再开 V 形分离:&& GX.dist(pts[8], pts[12]) > 0.3 * palm
+    }
+
+    #if DEBUG
+    static func reason(_ pts: [CGPoint]) -> (Bool, String) {
+        guard pts.count >= 21 else { return (false, "点数<21") }
+        let palm = max(1e-6, GX.dist(pts[0], pts[9]))
+        if palm < 0.04 { return (false, String(format: "palm=%.3f<0.04", palm)) }
+        let idxE = GX.dist(pts[8],pts[5])/palm,  midE = GX.dist(pts[12],pts[9])/palm
+        let ringF = GX.dist(pts[16],pts[13])/palm, litF = GX.dist(pts[20],pts[17])/palm
+        if !(idxE > 0.6)  { return (false, String(format: "食指没伸 %.2f<0.6", idxE)) }
+        if !(midE > 0.6)  { return (false, String(format: "中指没伸 %.2f<0.6", midE)) }
+        if !(ringF < 0.5) { return (false, String(format: "无名没收 %.2f>0.5", ringF)) }
+        if !(litF < 0.5)  { return (false, String(format: "小指没收 %.2f>0.5", litF)) }
+        return (true, String(format: "过(食%.2f 中%.2f 无名%.2f 小%.2f V%.2f)", idxE, midE, ringF, litF, GX.dist(pts[8],pts[12])/palm))
+    }
+    #endif
 }
 
 // MARK: - MediaPipe 实现
@@ -119,7 +174,7 @@ final class MPHandGesture: _HandGestureCore {
     private var mode: GestureTriggerMode = .wave
     private var sampleEvery: Int = 6  // 每6帧检测一次（进一步降低频率）
     private var frame = 0
-    private let toggle = StableToggle(needStable: 3, cooldownSeconds: 3.0)
+    private let toggle = StableToggle(needStable: 1, cooldownSeconds: 1.2)  // needStable 2→1(降一档,单帧即触发);松手门控+1.2s冷却防重复
     private var initTime = Date()
     var onLandmarks: (([CGPoint]) -> Void)?
 
@@ -267,7 +322,8 @@ final class MPHandGesture: _HandGestureCore {
                 for hand in result.landmarks {
                     let pts: [CGPoint] = hand.map { CGPoint(x: CGFloat($0.x), y: CGFloat($0.y)) }
 
-                    if OpenPalmRule.isOpenPalm(pts) {
+                    let passed = (currentMode == .victory) ? VictoryRule.isVictory(pts) : OpenPalmRule.isOpenPalm(pts)
+                    if passed {
                         anyOpen = true
                         if openHand == nil {
                             openHand = pts
@@ -292,7 +348,7 @@ final class MPHandGesture: _HandGestureCore {
                 DispatchQueue.main.async { landmarksCallback?(finalPts) }
 
                 // 计算decision
-                if currentMode == .wave {
+                if currentMode != .off {   // wave / victory 都走 toggle
                     let decision = toggleRef.step(active: anyOpen)
                     if decision != .none {
                         self.stateLock.lock()
@@ -321,7 +377,7 @@ final class VisionHandGesture: _HandGestureCore {
     private var mode: GestureTriggerMode = .wave
     private var sampleEvery: Int = 3
     private var frame = 0
-    private let toggle = StableToggle(needStable: 3, cooldownSeconds: 3.0)
+    private let toggle = StableToggle(needStable: 1, cooldownSeconds: 1.2)  // needStable 2→1(降一档,单帧即触发);松手门控+1.2s冷却防重复
     private var initTime = Date()
     var onLandmarks: (([CGPoint]) -> Void)?
 
@@ -359,8 +415,17 @@ final class VisionHandGesture: _HandGestureCore {
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
 
         do {
+            #if DEBUG
+            let _tHand = CFAbsoluteTimeGetCurrent()
+            #endif
             try handler.perform([req])
-            
+            #if DEBUG
+            // 第2步验证:原生手部检测单次耗时 + 召回几个手(输入是 224×224 ROI)
+            let _handMs = (CFAbsoluteTimeGetCurrent() - _tHand) * 1000
+            let _inW = CVPixelBufferGetWidth(pixelBuffer), _inH = CVPixelBufferGetHeight(pixelBuffer)
+            print(String(format: "✋VNHand %.1fms 召回手=%d 输入=%dx%d", _handMs, req.results?.count ?? 0, _inW, _inH))
+            #endif
+
             guard let observations = req.results, !observations.isEmpty else {
                 onLandmarks?([])
                 return .none
@@ -395,8 +460,9 @@ final class VisionHandGesture: _HandGestureCore {
                     if firstValidHand == nil {
                         firstValidHand = pts
                     }
-                    
-                    if OpenPalmRule.isOpenPalm(pts) {
+                    // 按模式选判定:victory=比耶✌️,wave=张掌(OpenPalm 留着可回退)
+                    let passed = (mode == .victory) ? VictoryRule.isVictory(pts) : OpenPalmRule.isOpenPalm(pts)
+                    if passed {
                         anyOpen = true
                         if openHand == nil {
                             openHand = pts
@@ -413,10 +479,38 @@ final class VisionHandGesture: _HandGestureCore {
                 onLandmarks?([])
             }
 
-            if mode == .wave {
-                return toggle.step(active: anyOpen)
+            #if DEBUG
+            // 全链路诊断:每只手 21点 conf 门(<0.15被丢)→ OpenPalmRule 过不过+原因
+            print("HAND 召回手=\(observations.count)")
+            for (hi, obs) in observations.enumerated() {
+                var confs = [Float](); var pts = [CGPoint](repeating: .zero, count: 21); var got = 0
+                for (i, n) in names.enumerated() {
+                    if let p = try? obs.recognizedPoint(n) {
+                        confs.append(p.confidence)
+                        pts[i] = CGPoint(x: CGFloat(p.location.x), y: CGFloat(1 - p.location.y))
+                        if p.confidence >= 0.15 { got += 1 }
+                    }
+                }
+                let minC = confs.min() ?? 0, avgC = confs.isEmpty ? 0 : confs.reduce(0,+)/Float(confs.count)
+                if got == 21 {
+                    let (ok, why) = (mode == .victory) ? VictoryRule.reason(pts) : OpenPalmRule.reason(pts)
+                    let g = (mode == .victory) ? "比耶" : "OpenPalm"
+                    print(String(format: "  hand%d: 21点全过conf门 minConf=%.2f avg=%.2f → %@ %@", hi, minC, avgC, g, ok ? "过 \(why)" : "不过(\(why))"))
+                } else {
+                    print(String(format: "  hand%d: 过conf门=%d/21 minConf=%.2f → 被conf门丢(某点<0.15,手糊/遮挡)", hi, got, minC))
+                }
             }
-            
+            #endif
+
+            if mode != .off {   // wave / victory 都走 toggle
+                let decision = toggle.step(active: anyOpen)
+                #if DEBUG
+                print(String(format: "  anyOpen=%@ | StableToggle 累计=%d/%d 冷却剩=%.1fs 触发=%@",
+                             anyOpen ? "Y" : "N", toggle.dbgStable, toggle.dbgNeed, toggle.dbgCooldownRemain, decision != .none ? "Y" : "N"))
+                #endif
+                return decision
+            }
+
             return .none
             
         } catch {
@@ -435,6 +529,9 @@ enum GestureFactory {
         setMode: (GestureTriggerMode) -> Void,
         setSampleInterval: (Int) -> Void
     ) {
+        // 第1步:切原生 VisionHandGesture(不走 MediaPipe,可逆——把下面整块取消注释即恢复 MediaPipe 优先)。
+        // 验证原生 FPS/触发够用后,第3步再删 MediaPipe pod 解锁 git。
+        /*
         #if canImport(MediaPipeTasksVision)
         if let mp = MPHandGesture() {
             return (
@@ -446,6 +543,7 @@ enum GestureFactory {
             )
         }
         #endif
+        */
 
         let v = VisionHandGesture()
         return (

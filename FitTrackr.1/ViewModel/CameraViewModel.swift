@@ -3,6 +3,7 @@ import AVFoundation
 import CoreImage
 import Combine
 import UIKit
+import Vision
 
 final class CameraViewModel: NSObject, ObservableObject {
 
@@ -52,8 +53,8 @@ final class CameraViewModel: NSObject, ObservableObject {
     @Published var probeHUD = ""
     let probeJumpThreshold: CGFloat = 0.03   // anchorΔ 或 rectBoxΔ 超此(占画面宽 3%)算一次跳,刷新冻结行
 
-    // 手势负载控制（调优阶段）：硬开关默认关闭，确保 MediaPipe 不进每帧预算；开启时也仅每 N 帧跑一次
-    var gestureEnabled = false
+    // 第1步:切原生 VisionHandGesture,打开手势(原 false 排除 MediaPipe 负载)。每 N 帧一次,降频保持。
+    var gestureEnabled = true
     let gestureEveryN = 6
     private var gestureTick = 0
 
@@ -67,7 +68,7 @@ final class CameraViewModel: NSObject, ObservableObject {
     @Published var deadZoneFraction: CGSize
 
     // æ‰‹åŠ¿è§¦å‘é…ç½®
-    @Published var gestureMode: GestureTriggerMode = .off {   // 自检阶段先关掉手势，排除 MediaPipe 负载
+    @Published var gestureMode: GestureTriggerMode = .victory {   // 默认比耶✌️(更鲁棒/一次过门);.wave 张掌留着可回退
         didSet { applyGestureConfig() }
     }
     @Published var gestureSampleEvery: Int = 3 {
@@ -108,8 +109,10 @@ final class CameraViewModel: NSObject, ObservableObject {
     private let lmPalmMin: CGFloat = 0.03
     private let lmPalmMax: CGFloat = 0.60
 
-    // 目标锁定（录制开始时自动锁定）
+    // 目标锁定（录制开始时手动触发,或自动锁定常态）
     private var shouldLockTarget = false
+    // 产品常态:架起来就自动锁定最大/最近的人(=用户),不用手点。默认开。实时+replay 都走 handleFrame,都生效。
+    var autoLockEnabled = true
 
     init(source: FrameSource = LiveCameraSource()) {
         // 帧源在 super.init 前先就位(非可选 let)。默认实时摄像头,回放界面传 VideoFileSource。
@@ -160,7 +163,12 @@ final class CameraViewModel: NSObject, ObservableObject {
     }
 
     // MARK: - æŽ§åˆ¶
-    func start() { source.start() }   // 实时专属配置(useUltraWideWithGDC)已收进 LiveCameraSource
+    func start() {
+        // 会话开始重置锁(PersonIdentifier 是单例,切换视频/重开相机时清掉上一会话的锁与颜色档案)→ 本会话自动锁定新主角。
+        // 这是会话生命周期,不是录制生命周期:录制开关全程不碰锁。
+        PersonIdentifier.shared.unlock()
+        source.start()
+    }
     func stop()  { source.stop(); stopTimer() }
     func toggleRecord() { isRecording ? stopRecord() : startRecord() }
     func toggleLock() { hardLock.toggle() }
@@ -169,13 +177,13 @@ final class CameraViewModel: NSObject, ObservableObject {
         guard processedCGImage != nil || videoSize != .zero else { return }
         recorder.start(size: lastOutputSize)
         isRecording = true
-        shouldLockTarget = true  // 下一帧自动锁定目标
+        // 解耦:录制不碰锁。锁是常态(自动锁定一直在你身上),录制只管存不存视频,不重锁/不改锁。
         startTimer()
     }
     private func stopRecord() {
         isRecording = false
         stopTimer()
-        PersonIdentifier.shared.unlock()  // 解除目标锁定
+        // 解耦:停录【不】解锁,锁原样保持在你身上(不再 unlock 后靠自动重锁救场)。
         recorder.stopAndSave { ok in
             DispatchQueue.main.async { self.hudText = ok ? "å·²ä¿å­˜åˆ°ç›¸å†Œ" : "ä¿å­˜å¤±è´¥" }
         }
@@ -246,6 +254,52 @@ final class CameraViewModel: NSObject, ObservableObject {
 
     private func clamp<T: Comparable>(_ v: T,_ a: T,_ b: T) -> T { max(a, min(b, v)) }
 
+    // 方案iii:以锁定目标 pose 的手腕为中心圈手部 ROI,从 wide【原分辨率】裁(不缩),喂 VNDetectHumanHandPose。
+    // 返回 (ROI 像素 buffer, ROI 归一化 top-left 供叠加映射)。手腕 conf 低/出界 → nil(本帧跳过手势)。
+    let wristRoiSideFrac: CGFloat = 0.32   // ROI 边长 = 人体框宽 × 此(覆盖张开手掌/手指,可调 0.25~0.4)
+    let wristRoiMinPx: CGFloat = 256       // ROI 像素下限(140→256:提 landmark 质量;f1001 证明 381px 时 minConf 0.71 能过门)
+    private func makeWristROIBuffer(pose: VNHumanBodyPoseObservation, wide: CVPixelBuffer) -> (CVPixelBuffer, CGRect)? {
+        // 手腕(Vision 归一化, bottom-left)。选举起来的那只:y 更大=更高;conf 达标
+        func wrist(_ j: VNHumanBodyPoseObservation.JointName) -> CGPoint? {
+            guard let p = try? pose.recognizedPoint(j), p.confidence >= 0.3 else { return nil }
+            return p.location
+        }
+        let cands = [wrist(.leftWrist), wrist(.rightWrist)].compactMap { $0 }
+        guard let w = cands.max(by: { $0.y < $1.y }) else { return nil }   // y 大=高=举起的那只
+
+        let W = CGFloat(CVPixelBufferGetWidth(wide)), H = CGFloat(CVPixelBufferGetHeight(wide))
+        let wxTL = w.x * W, wyTL = (1 - w.y) * H                            // Vision bottom-left → top-left 像素
+        guard wxTL >= 0, wxTL <= W, wyTL >= 0, wyTL <= H else { return nil } // 手腕出界 → 跳过
+
+        // ROI 边长 = 人体框宽(像素)× frac;给像素下限;不超帧
+        let boxWnorm = self.personBox?.width ?? 0.3
+        let side = min(min(W, H), max(wristRoiMinPx, boxWnorm * W * wristRoiSideFrac))
+        var roi = CGRect(x: wxTL - side/2, y: wyTL - side/2, width: side, height: side)
+        roi.origin.x = clamp(roi.origin.x, 0, W - side)
+        roi.origin.y = clamp(roi.origin.y, 0, H - side)
+        roi = roi.integral
+
+        // 从 wide 原分辨率裁(CIImage 是 bottom-left,翻 y),不缩放 → 输出 = ROI 像素尺寸
+        let ci = CIImage(cvPixelBuffer: wide)
+        let cropBL = CGRect(x: roi.minX, y: H - roi.maxY, width: roi.width, height: roi.height)
+        let cropped = ci.cropped(to: cropBL).transformed(by: CGAffineTransform(translationX: -cropBL.minX, y: -cropBL.minY))
+        let wI = Int(roi.width), hI = Int(roi.height)
+        guard wI >= 2, hI >= 2 else { return nil }
+        var pb: CVPixelBuffer?
+        let attrs: [CFString: Any] = [
+            kCVPixelBufferCGImageCompatibilityKey: true,
+            kCVPixelBufferCGBitmapContextCompatibilityKey: true,
+            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA
+        ]
+        guard CVPixelBufferCreate(kCFAllocatorDefault, wI, hI, kCVPixelFormatType_32BGRA, attrs as CFDictionary, &pb) == kCVReturnSuccess,
+              let buf = pb else { return nil }
+        CVPixelBufferLockBaseAddress(buf, [])
+        ciContext.render(cropped, to: buf)
+        CVPixelBufferUnlockBaseAddress(buf, [])
+        let roiN = CGRect(x: roi.minX / W, y: roi.minY / H, width: roi.width / W, height: roi.height / H)
+        return (buf, roiN)
+    }
+
     // æ‰‹éƒ¨å…³é”®ç‚¹ç¨³å®šåŒ–
     private func stabilizeLandmarks(_ pts: [CGPoint]) -> [CGPoint] {
         guard pts.count >= 21 else { lmPrev = nil; lmEMA = nil; return [] }
@@ -312,17 +366,17 @@ extension CameraViewModel {
         let hipData = SkeletonAddon.shared.getHipData()
         follow.updateHipCenter(hipData.center, confidence: hipData.confidence)
 
-        // 0.5) 录制开始时自动锁定目标
-        if shouldLockTarget {
+        // 0.5) 自动锁定常态:未锁定就持续尝试锁最大框(检测到人即锁,锁成后不再试);或录制手动触发。
+        //      lockLargest 无人时返回 false → 下一帧重试,直到检测到人。锁定后 isLocked=true → 条件假 → 停。
+        if shouldLockTarget || (autoLockEnabled && !PersonIdentifier.shared.isLocked) {
+            let wasManual = shouldLockTarget
             shouldLockTarget = false
             let sensorSize = CGSize(
                 width: CGFloat(CVPixelBufferGetWidth(wideFrame)),
                 height: CGFloat(CVPixelBufferGetHeight(wideFrame))
             )
             if PersonIdentifier.shared.lockLargest(in: wideFrame, sensorSize: sensorSize) {
-                print("🎯 录制开始，已锁定目标")
-            } else {
-                print("⚠️ 录制开始，未检测到目标")
+                print(wasManual ? "🎯 手动锁定目标" : "🎯 自动锁定目标(最大框)")
             }
         }
 
@@ -341,34 +395,21 @@ extension CameraViewModel {
                                      pose: follow.lastPoseObservation)
         let msSkel = (CACurrentMediaTime() - _tSkel) * 1000
 
-        // 3) 手势识别 —— 调优阶段默认关闭（gestureEnabled=false），排除 MediaPipe 负载；开启时每 N 帧才跑一次
+        // 3) 手势识别 —— 方案iii:以锁定目标 pose 的手腕为中心圈手部ROI,从 wide 原分辨率裁(不缩到224/512)。
+        // 手占满 ROI → 召回好;ROI 小 → 像素少 → 快、不掉帧。每 gestureEveryN 帧一次。
         let _tGest = CACurrentMediaTime()
         gestureTick &+= 1
-        if gestureEnabled, gestureMode != .off, gestureTick % gestureEveryN == 0, let ci = result.ciScaled {
+        if gestureEnabled, gestureMode != .off, gestureTick % gestureEveryN == 0 {
             var decided: GestureDecision = .none
-
-            // 修正：> 1 永远为假，改为 > 0.5
-            let rois: [CGRect] = (result.confidence > 0.5 && self.personBox != nil)
-                ? candidateGestureROIs(from: self.personBox!)
-                : []
-
-            // 限制最多 2 个 ROI
-            for roi in rois.prefix(2) {
-                if let pbRoi = makePixelBuffer(from: ci, roiN: roi, targetSize: CGSize(width: 224, height: 224)) {
-                    self.currentGestureRoiN = roi
-                    let d = gesture.process(pbRoi, nil)
-                    if d != .none { decided = d; break }
-                }
-            }
-
-            self.currentGestureRoiN = nil
-
-            // 兜底：全帧
-            if decided == .none,
-               let pbFull = makePixelBuffer(from: ci,
-                                            roiN: CGRect(x: 0, y: 0, width: 1, height: 1),
-                                            targetSize: CGSize(width: 224, height: 224)) {
-                decided = gesture.process(pbFull, nil)
+            if let pose = follow.lastPoseObservation,
+               let (pbRoi, roiN) = self.makeWristROIBuffer(pose: pose, wide: wideFrame) {
+                self.currentGestureRoiN = roiN
+                decided = gesture.process(pbRoi, nil)
+                self.currentGestureRoiN = nil
+            } else {
+                #if DEBUG
+                print("✋ROI skip: \(follow.lastPoseObservation == nil ? "无pose" : "手腕conf低/出界")")
+                #endif
             }
 
             switch decided {
@@ -447,8 +488,9 @@ extension CameraViewModel {
             }
             #endif
 
-            if self.isRecording, let ci = result.ciScaled {
-                self.recorder.appendVideo(ciImage: ci, at: result.pts)
+            if self.isRecording, let cg = result.previewCG {
+                // 去冗余:录制直接拿 tracking 已渲好的 CGImage(预览同款),不再重渲 ciScaled
+                self.recorder.appendVideo(cgImage: cg, at: result.pts)
             }
         }
     }
