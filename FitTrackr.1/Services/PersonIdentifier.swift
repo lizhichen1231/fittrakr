@@ -53,10 +53,7 @@ final class PersonIdentifier {
     }
     var config = Config()
 
-    // C8 重锚:每 reanchorInterval 帧,用 pose 多人检测 + 颜色校验重新确认主角真实框,re-seed VNTrackObject。
-    // 治 continueTracking 自漂(VNTrackObject 用自身输出重建 → 框逐帧缩/漂)。re-seed 把它拉回主角当前真实框。
-    let reanchorInterval = 15       // ~0.25s@60fps;越小越不漂但检测越频
-    private var reanchorCounter = 0
+    // 刀3:C8 重锚(reanchorInterval/reanchorCounter)已删。
     #if DEBUG
     var dbgReanchorLine = ""        // 最近一次重锚结果(sticky)
     #endif
@@ -77,6 +74,14 @@ final class PersonIdentifier {
     let gateR0: CGFloat = 0.06           // Config:邻域门起步半径(待影子日志校准)
     let gateVetoThreshold: Float = 0.25  // Config:颜色否决门槛(明显不是一个人才踢)
     let maxExtrapolationSec: CGFloat = 0.08  // Config:预测外推上限(防历史冻结时 pred 无限跑飞)
+    // ===== 刀3 SEARCHING 装牙 =====
+    let reacqMargin: Float = 0.15        // Config:找回 margin(top1−top2)门槛
+    let reacqPosK: Float = 0.002         // Config:位置预算随 searching 帧数线性放宽斜率
+    let reacqPosCap: Float = 0.30        // Config:位置预算上限
+    private var searchFrozenPoint: CGPoint?   // 进入 searching 那刻的丢失位置(归一)
+    private var searchingFrames = 0
+    private var wasSearchMode = false
+    var reacqFailCount = 0, reacqFailColor = 0, reacqFailMargin = 0, reacqFailPos = 0, reacqFailDetector = 0
     var gateHits = 0, gateMissCount = 0, gateVetoCount = 0, gateDetectorMiss = 0  // 门统计(内存累加,规避每帧print)
     private var gateFrameCounter = 0
 
@@ -125,10 +130,7 @@ final class PersonIdentifier {
     }
     #endif
 
-    // Vision 追踪（可选优化）
-    private var trackingRequest: VNTrackObjectRequest?
-    private var sequenceHandler = VNSequenceRequestHandler()
-    private var isTrackingActive = false
+    // 刀3:VNTrackObject 追踪字段(trackingRequest/sequenceHandler/isTrackingActive)已删。
 
     private let ciContext = CIContext()
 
@@ -177,11 +179,7 @@ final class PersonIdentifier {
         // 刀2:预测历史种子 = 锁定中心;门统计清零(新一次锁定新账)
         self.lockedCenterHist = [(CGPoint(x: personBox.midX / sensorSize.width, y: personBox.midY / sensorSize.height), CACurrentMediaTime())]
         self.gateHits = 0; self.gateMissCount = 0; self.gateVetoCount = 0; self.gateDetectorMiss = 0
-        // 修法2:重置 VNSequenceRequestHandler → 每次锁定 VNTrackObject 从干净状态起跟,抹平「第一次vs之后」暖机差异。
-        self.sequenceHandler = VNSequenceRequestHandler()
-
-        // 5. 启动 Vision 追踪（优化）
-        startTracking(box: personBox, sensorSize: sensorSize)
+        // 刀3:LOCKED 走邻域门、SEARCHING 走颜色全局找回,均不用 VNTrackObject,不再 startTracking
 
         let baseEmpty = profile.colorHistogram.isEmpty && profile.lowerBodyColorHist.isEmpty
         print("🔒 目标已锁定 | 上衣颜色bins: \(profile.colorHistogram.count) | 下装颜色bins: \(profile.lowerBodyColorHist.count)\(baseEmpty ? "  ★★基准空!色彩verify失效→易漂(就是这次锁定的问题)" : "")")
@@ -316,11 +314,9 @@ final class PersonIdentifier {
     func unlock() {
         isLocked = false
         target = nil
-        trackingRequest = nil
-        isTrackingActive = false
-        reanchorCounter = 0
         lastLockedBox = nil; coastFrames = 0
         lockedCenterHist.removeAll()   // 刀2:清预测历史
+        searchFrozenPoint = nil; searchingFrames = 0; wasSearchMode = false   // 刀3:清 SEARCHING 装牙状态
         #if DEBUG
         dbgLockWho = "无"; dbgTrkState = "未锁定"; dbgRefindNX = -1; dbgRefindNY = -1; lockedBoxArea = -1; dbgReanchorLine = ""; dbgReselectLine = ""
         dbgLockMomentCandCount = -1; dbgLockMomentAreaFrac = -1; dbgLockMomentCenter = .zero; dbgDriftLine = ""
@@ -429,66 +425,24 @@ final class PersonIdentifier {
         }
         #endif
 
+        // SEARCHING 计时 + 冻结点(装牙用):进入 searching 那刻记丢失位置,之后按帧放宽位置预算
+        if searchMode {
+            if !wasSearchMode {
+                searchFrozenPoint = lastLockedBox.map { CGPoint(x: $0.midX / sensorSize.width, y: $0.midY / sensorSize.height) }
+                searchingFrames = 0
+            }
+            searchingFrames += 1
+        }
+        wasSearchMode = searchMode
+
         // ===== 刀2 连续性主权:LOCKED(非 searchMode)= 预测邻域门;下方全局身份找回仅 SEARCHING 走 =====
         if !searchMode {
             return lockedGate(in: detectBuffer, colorBuffer: colorBuffer, sensorSize: sensorSize)
         }
 
-        // 先尝试用 VNTrackObjectRequest（更快）—— 框按 sensorSize(wide)还原,颜色校验用 colorBuffer(wide)
-        if isTrackingActive, let tracked = continueTracking(detectBuffer, sensorSize: sensorSize) {
-            // 验证追踪结果是不是真的是目标
-            let (match, score) = isTarget(tracked, in: colorBuffer, sensorSize: sensorSize)
-            #if DEBUG
-            // LOCK后:走 continueTracking 跟随(非重新 lockLargest)。打当前框面积/位置 + 对照锁定帧大小
-            let a = tracked.width * tracked.height, fa = sensorSize.width * sensorSize.height
-            let rel = lockedBoxArea > 0 ? (a > lockedBoxArea * 1.2 ? "更大" : (a < lockedBoxArea * 0.8 ? "更小" : "≈锁定")) : "?"
-            print(String(format: "LOCK后 分支=continueTracking跟随(非重lockLargest) 当前box面积=%.4f 位置=(%.2f,%.2f) vs锁定帧=%@ 颜色校验=%@(%.2f)",
-                         a / fa, tracked.midX / sensorSize.width, tracked.midY / sensorSize.height,
-                         rel, match ? "match" : "REJECT", score))
-            #endif
-            if match {
-                #if DEBUG
-                dbgLockWho = "真人"; dbgTrkState = "锁定"
-                #endif
-                // C8 重锚:每 N 帧用「颜色校验确认的主角真实框」re-seed,防 track 自漂/缩水
-                reanchorCounter += 1
-                if reanchorCounter >= reanchorInterval {
-                    reanchorCounter = 0
-                    if let re = reanchorTarget(detectBuffer: detectBuffer, colorBuffer: colorBuffer, sensorSize: sensorSize) {
-                        startTracking(box: re.box, sensorSize: sensorSize)   // re-seed VNTrackObject 到主角真实框
-                        #if DEBUG
-                        let fa = sensorSize.width * sensorSize.height
-                        dbgReanchorLine = String(format: "重锚✓ track面积%.3f→主角真实%.3f 综合分%.2f 候选%d",
-                                                 tracked.width * tracked.height / fa,
-                                                 re.box.width * re.box.height / fa, re.score, re.candCount)
-                        print("⚓ " + dbgReanchorLine)
-                        dbgTrkState = "锁定(重锚)"
-                        #endif
-                        return (re.box, re.score)
-                    } else {
-                        #if DEBUG
-                        dbgReanchorLine = "重锚✗ 无颜色匹配候选,保持track"; print("⚓ " + dbgReanchorLine)
-                        #endif
-                    }
-                }
-                return (tracked, score)
-            }
-            // 追踪结果不匹配，可能追错了，重新检测
-            isTrackingActive = false
-            #if DEBUG
-            dbgTrkState = "跟丢"
-            let dW = CVPixelBufferGetWidth(detectBuffer), dH = CVPixelBufferGetHeight(detectBuffer)
-            print(String(format: "🔁 跟丢→重检测 输入=%dx%d(wide全帧降采样,非crop;aspect %.2f vs sensor %.2f) sensorSize=%dx%d",
-                         dW, dH, Double(dW) / Double(max(dH, 1)),
-                         sensorSize.width / max(sensorSize.height, 1),
-                         Int(sensorSize.width), Int(sensorSize.height)))
-            #endif
-        }
-
-        // ===== 方案A 主跟踪:每帧 pose 候选「延续上一帧目标」+ 换人迟滞(治我/爹闪烁)=====
+        // ===== SEARCHING = 身份主权:全画面找回(刀3:已删 continueTracking/VNTrackObject 兜底)=====
         var persons = detectAllPersons(in: detectBuffer, sensorSize: sensorSize)
-        let fa = sensorSize.width * sensorSize.height
-        let poseCount = persons.count   // 之后并入的 rect 候选下标 >= poseCount(供 REJECT 日志标 src)
+        let poseCount = persons.count   // 之后并入的 rect 候选下标 >= poseCount
 
         // Part 3B:搜索期并入矩形候选(pose 漏检的人靠 VNDetectHumanRectangles 兜),去重(IoU>0.5 视为同人)
         #if DEBUG
@@ -507,137 +461,57 @@ final class PersonIdentifier {
         }
         lastCandidateCount = persons.count
 
-        // 每个候选:颜色综合分 + match + 对「上一帧锁定框」的延续分(颜色大头 + 位置 + 尺寸)+ 位置/尺寸子分 + 源
-        struct Scored { let box: CGRect; let color: Float; let matched: Bool; let cont: Float; let pos: Float; let size: Float; let src: String }
-        let scored: [Scored] = persons.enumerated().map { (idx, p) in
-            let (m, s) = isTarget(p, in: colorBuffer, sensorSize: sensorSize)
-            var cont: Float = 0, posSim: Float = 0, sizeSim: Float = 0
-            if let last = lastLockedBox {
-                let posDist = Float(hypot((p.midX - last.midX) / sensorSize.width, (p.midY - last.midY) / sensorSize.height))
-                let aP = p.width * p.height, aL = last.width * last.height
-                let sizeDist = Float(abs(aP - aL) / max(aL, 1))
-                posSim = max(0, 1 - posDist * 2)      // 位置越近越高
-                sizeSim = max(0, 1 - sizeDist)         // 尺寸越近越高
-                cont = wCont_color * s + wCont_pos * posSim + wCont_size * sizeSim
-            } else {
-                cont = s                                    // 无上一帧 → 退化为综合分
-            }
-            return Scored(box: p, color: s, matched: m, cont: cont, pos: posSim, size: sizeSim,
-                          src: idx < poseCount ? "pose" : "rect")
-        }
+        _ = poseCount
+        // 每候选颜色分(isTarget 综合分,撞衫下色主导),按分降序
+        let scoredC = persons.map { p -> (box: CGRect, color: Float) in
+            let (_, s) = isTarget(p, in: colorBuffer, sensorSize: sensorSize)
+            return (p, s)
+        }.sorted { $0.color > $1.color }
 
-        var matched = scored.filter { $0.matched }
-        #if DEBUG
-        dbgCurThresh = config.matchThreshold
-        #endif
-
-        // Part 3A:单人安全阀——全场仅 1 个候选且与上一帧锁框高度重叠(IoU>0.5),
-        // 即"就他一个、还站在原地",放宽门槛到 soloMatchThreshold(0.30)接纳,避免光照/角度小波动误判丢失。
-        if matched.isEmpty, persons.count == 1, let sole = scored.first, let last = lastLockedBox {
-            let ov = iou(sole.box, last)
-            if ov > 0.5 && sole.color > soloMatchThreshold {
-                matched = [Scored(box: sole.box, color: sole.color, matched: true, cont: sole.cont,
-                                  pos: sole.pos, size: sole.size, src: sole.src)]
-                #if DEBUG
-                dbgCurThresh = soloMatchThreshold
-                print(String(format: "🎯 SOLO-PASS cont=%.2f iou=%.2f (色=%.2f 降门%.2f→接纳)",
-                             sole.cont, ov, sole.color, soloMatchThreshold))
-                #endif
-            }
-        }
-
-        // 延续候选 = 颜色 match 且「延续分」最高(= 上一帧的你连续过来的)
-        let incumbent = matched.max { $0.cont < $1.cont }
-        // 挑战者 = 颜色 match 且综合分最高、且不是延续候选本身
-        let challenger = matched.filter { $0.box != incumbent?.box }.max { $0.color < $1.color }
-
-        var chosen: Scored?
-        var switched = false
-        if let inc = incumbent {
-            if lastLockedBox != nil && inc.cont < continuityFloor {
-                // 上一帧目标本帧没检出(延续分太低)→ 暂保持上一帧框(coast),别跳到爹
-                coastFrames += 1
-                if coastFrames <= maxCoastFrames, let hold = lastLockedBox {
-                    #if DEBUG
-                    dbgCurCont = inc.cont
-                    dbgReselectLine = String(format: "重选 延续分=%.2f<floor → coast保持(%d/%d) 候选%d", inc.cont, coastFrames, maxCoastFrames, persons.count)
-                    print("🧲 " + dbgReselectLine); dbgTrkState = "保持(目标暂失)"
-                    #endif
-                    return (hold, inc.color)
-                }
-                // 超 coast → 重新捕获:最强颜色匹配
-                chosen = matched.max { $0.color < $1.color }
-            } else {
-                // 换人迟滞:挑战者综合分须 > 延续候选 + margin 才换,否则黏住延续(你)
-                if let ch = challenger, ch.color > inc.color + switchMargin {
-                    chosen = ch; switched = true
-                } else {
-                    chosen = inc
-                }
-                coastFrames = 0
-            }
-        }
-
-        #if DEBUG
-        let incS = incumbent.map { String(format: "延续%.2f(色%.2f)", $0.cont, $0.color) } ?? "无"
-        let chS = challenger.map { String(format: "色%.2f", $0.color) } ?? "无"
-        dbgReselectLine = String(format: "重选 人数=%d 延续候选=%@ 挑战者=%@ margin=%.2f 换人=%@ → %@",
-                                 persons.count, incS, chS, switchMargin, switched ? "YES" : "NO",
-                                 chosen.map { String(format: "面积%.3f@(%.2f,%.2f)色%.2f", $0.box.width*$0.box.height/fa, $0.box.midX/sensorSize.width, $0.box.midY/sensorSize.height, $0.color) } ?? "丢失")
-        print("🧲 " + dbgReselectLine)
-        #endif
-
-        if let c = chosen {
+        // ===== 刀3 装牙:三条齐才认找回(① 颜色≥matchThreshold ② margin>reacqMargin,单候选视为满足 ③ 离冻结点≤预算)=====
+        guard !scoredC.isEmpty else {
+            reacqFailCount += 1; reacqFailDetector += 1
             #if DEBUG
-            dbgCurCont = c.cont
-            dbgLockWho = "真人"; dbgTrkState = switched ? "换人" : "锁定(延续)"
-            dbgRefindNX = c.box.midX / sensorSize.width; dbgRefindNY = c.box.midY / sensorSize.height
+            print("🔍 REACQ-FAIL top1=— top2=— margin=— dFreeze=— reason=detectorMiss(候选0)")
             #endif
-            lastLockedBox = c.box
-            startTracking(box: c.box, sensorSize: sensorSize)   // 顺带 re-seed VNTrackObject(成功了就走快速路)
-            // 刀2:SEARCHING 找回后重种预测历史,回到 LOCKED 时门从找回位置起(不吃丢失前的陈旧速度)
-            lockedCenterHist = [(CGPoint(x: c.box.midX / sensorSize.width, y: c.box.midY / sensorSize.height), CACurrentMediaTime())]
-            return (c.box, c.color)
+            return nil
+        }
+        let top1 = scoredC[0]
+        let top2c: Float = scoredC.count > 1 ? scoredC[1].color : 0
+        let t1c = CGPoint(x: top1.box.midX / sensorSize.width, y: top1.box.midY / sensorSize.height)
+        let posBudget = min(Float(gateR0) + reacqPosK * Float(searchingFrames), reacqPosCap)
+        let dFreeze: Float = searchFrozenPoint.map { Float(hypot(t1c.x - $0.x, t1c.y - $0.y)) } ?? 0
+        let toothColor = top1.color >= config.matchThreshold
+        let toothMargin = scoredC.count < 2 || (top1.color - top2c > reacqMargin)
+        let toothPos = (searchFrozenPoint == nil) || (dFreeze <= posBudget)
+
+        if toothColor && toothMargin && toothPos {
+            #if DEBUG
+            dbgLockWho = "真人"; dbgTrkState = "找回"; dbgRefindNX = Double(t1c.x); dbgRefindNY = Double(t1c.y)
+            #endif
+            lastLockedBox = top1.box
+            lockedCenterHist = [(t1c, CACurrentMediaTime())]   // 重种历史 → 回 LOCKED 门从找回位置起
+            return (top1.box, top1.color)
         }
 
+        // 三牙不齐 → 继续 SEARCHING(直到 searchTimeoutSec → LOST)
+        reacqFailCount += 1
+        if !toothColor { reacqFailColor += 1 }
+        if !toothMargin { reacqFailMargin += 1 }
+        if !toothPos { reacqFailPos += 1 }
         #if DEBUG
-        dbgCurCont = 0
-        dbgLockWho = "无"; dbgTrkState = "丢失"
-        // Part 4.2 REJECT:身份未命中,交状态机(冻结/超时回全景);绝不在此抓最大人。逐候选打归因(色/位/尺崩在哪)
-        for (i, sc) in scored.enumerated() {
-            print(String(format: "❌ REJECT cand#%d cont=%.2f (color=%.2f pos=%.2f size=%.2f) thresh=%.2f src=%@",
-                         i, sc.cont, sc.color, sc.pos, sc.size, dbgCurThresh, sc.src))
-        }
-        let best = scored.max { $0.cont < $1.cont }
-        dbgBestRejectCont = best?.cont ?? 0
-        dbgBestRejectColor = best?.color ?? 0
-        print(String(format: "🚫 REJECT-ALL 无匹配候选(候选=%d 门槛=%.2f%@) → findTarget nil",
-                     persons.count, dbgCurThresh, searchMode ? " searchMode" : ""))
+        dbgLockWho = "无"; dbgTrkState = "找回失败"
+        var reason = ""
+        if !toothColor { reason += "色<0.50 " }
+        if !toothMargin { reason += "margin<0.15 " }
+        if !toothPos { reason += "偏冻结>预算 " }
+        print(String(format: "🔍 REACQ-FAIL top1=%.2f top2=%.2f margin=%.2f dFreeze=%.3f/预算%.3f reason=%@",
+                     top1.color, top2c, top1.color - top2c, dFreeze, posBudget, reason.isEmpty ? "?" : reason))
         #endif
         return nil
     }
 
-    /// C8 重锚候选:纠正【当前目标】的框,绝不换人。
-    /// ★黏当前目标:在「颜色 verify match 当前 target」的候选里,选【离 lastLockedBox 最近】的那个(延续候选),
-    ///   而不是全局颜色分最高(那会被更大/分更高的路人抢→漂)。无 match 延续候选 → 返回 nil(宁可不重锚、保持原框)。
-    private func reanchorTarget(detectBuffer: CVPixelBuffer, colorBuffer: CVPixelBuffer, sensorSize: CGSize)
-        -> (box: CGRect, score: Float, candCount: Int)? {
-        let persons = detectAllPersons(in: detectBuffer, sensorSize: sensorSize)
-        guard let anchor = lastLockedBox else { return nil }   // 没有当前框基准 → 不重锚
-        let ax = anchor.midX / sensorSize.width, ay = anchor.midY / sensorSize.height
-        var best: CGRect?
-        var bestScore: Float = 0
-        var bestDist = CGFloat.greatestFiniteMagnitude
-        for p in persons {
-            let (m, s) = isTarget(p, in: colorBuffer, sensorSize: sensorSize)
-            guard m else { continue }                          // 只在颜色 match 当前 target 的候选里选
-            let d = hypot(p.midX / sensorSize.width - ax, p.midY / sensorSize.height - ay)
-            if d < bestDist { bestDist = d; best = p; bestScore = s }   // ★选离当前框最近的(延续),不是分最高的
-        }
-        // 延续约束:最近的 match 候选也不能离太远(>20% 画面 = 那不是当前目标的延续,是别人)→ 不重锚
-        guard let b = best, bestDist < 0.20 else { return nil }
-        return (b, bestScore, persons.count)
-    }
+    // 刀3:reanchorTarget(C8 重锚,VNTrackObject re-seed 用)已删。
 
     #if DEBUG
     /// 卡2 验证用:强制全量竞争(真人 + 注入假人),颜色校验决定锁谁。逐帧打候选/相似度/锁谁。
@@ -688,64 +562,13 @@ final class PersonIdentifier {
         }
 
         if let w = winner {
-            startTracking(box: w.box, sensorSize: sensorSize)
             return (w.box, w.score)
         }
         return nil
     }
     #endif
 
-    // MARK: - Vision 追踪（优化性能）
-
-    private func startTracking(box: CGRect, sensorSize: CGSize) {
-        // 转换为 Vision 坐标（左下原点，归一化）
-        let normalizedBox = CGRect(
-            x: box.minX / sensorSize.width,
-            y: 1 - (box.maxY / sensorSize.height),
-            width: box.width / sensorSize.width,
-            height: box.height / sensorSize.height
-        )
-
-        let observation = VNDetectedObjectObservation(boundingBox: normalizedBox)
-        trackingRequest = VNTrackObjectRequest(detectedObjectObservation: observation)
-        trackingRequest?.trackingLevel = .fast
-        isTrackingActive = true
-    }
-
-    private func continueTracking(_ pixelBuffer: CVPixelBuffer, sensorSize: CGSize) -> CGRect? {
-        guard let request = trackingRequest else { return nil }
-
-        do {
-            try sequenceHandler.perform([request], on: pixelBuffer)
-
-            if let result = request.results?.first as? VNDetectedObjectObservation,
-               result.confidence > 0.5 {
-
-                // 转换回传感器坐标 —— 用 sensorSize(wide),与 detectAllPersons/下游统一,不用 detPB 降采样尺寸
-                let sensorW = sensorSize.width
-                let sensorH = sensorSize.height
-                let vBox = result.boundingBox
-
-                let box = CGRect(
-                    x: vBox.minX * sensorW,
-                    y: (1 - vBox.maxY) * sensorH,
-                    width: vBox.width * sensorW,
-                    height: vBox.height * sensorH
-                )
-
-                // 更新追踪请求
-                trackingRequest = VNTrackObjectRequest(detectedObjectObservation: result)
-                trackingRequest?.trackingLevel = .fast
-
-                return box
-            }
-        } catch {
-            // 追踪失败
-        }
-
-        isTrackingActive = false
-        return nil
-    }
+    // 刀3:VNTrackObject 追踪(startTracking/continueTracking)已删——LOCKED 走邻域门,SEARCHING 走颜色全局找回。
 
     // MARK: - 特征提取
 

@@ -2,6 +2,12 @@ import Vision
 import CoreGraphics
 import AVFoundation
 import CoreImage
+import QuartzCore
+
+#if DEBUG
+// 任务二 Q1 临时计时:拆 detectHuman(rect)每帧成本;摊薄每30帧打一行(不改逻辑)
+private var _dhFindUs = 0.0, _dhWithConfUs = 0.0, _dhDiagUs = 0.0, _dhN = 0
+#endif
 
 // MARK: - 人体检测（骨骼 + 矩形兜底 + 卡尔曼平滑）
 extension TrackingController {
@@ -257,8 +263,14 @@ extension TrackingController {
 
         // 锁定 → 身份识别路径(findTarget→Kalman→颜色校验);检测在 pb(detPB),颜色在 wide
         if PersonIdentifier.shared.isLocked {
+            #if DEBUG
+            let _tFind0 = CACurrentMediaTime()   // 临时计时(任务二 Q1:拆 rect=24ms)
+            #endif
             // searchMode(状态机 .searching):findTarget 内并入 rect 候选 + 单人安全阀降门,扩大找回面
             let r = PersonIdentifier.shared.findTarget(in: pb, colorBuffer: wide, sensorSize: sensorSize, searchMode: searchMode)
+            #if DEBUG
+            _dhFindUs += (CACurrentMediaTime() - _tFind0) * 1000   // findTarget(含 gate 的 detectAllPersons#1 + isTarget)
+            #endif
             // 刀2:SEARCHING 找回后重种预测历史 → 回 LOCKED 时门从找回位置起(旧 continueTracking 路径不更新历史)
             if searchMode, let box = r?.box {
                 PersonIdentifier.shared.seedLockedCenter(CGPoint(x: box.midX / sensorSize.width, y: box.midY / sensorSize.height), at: CACurrentMediaTime())
@@ -280,13 +292,23 @@ extension TrackingController {
             dbgTrkHUD = PersonIdentifier.shared.dbgTrkLine()   // 卡3:锁谁/状态/找回@(取自已有状态)
             // 折进 PROBE 的锁定概要:当前锁框 + 是否全帧最大(复检一次全帧候选,仅 DEBUG 锁定时)
             PersonIdentifier.shared.dbgCurrentBox = r?.box
-            let cands = PersonIdentifier.shared.detectAllPersonsWithConf(in: pb, sensorSize: sensorSize)
+            let _tConf0 = CACurrentMediaTime()
+            let cands = PersonIdentifier.shared.detectAllPersonsWithConf(in: pb, sensorSize: sensorSize)  // POSE#2(DEBUG诊断额外全量)
+            _dhWithConfUs += (CACurrentMediaTime() - _tConf0) * 1000
+            let _tDiag0 = CACurrentMediaTime()
             PersonIdentifier.shared.dbgCandCount = cands.count
             if let b = r?.box {
                 let a = b.width * b.height
                 let maxA = cands.map { $0.box.width * $0.box.height }.max() ?? 0
                 PersonIdentifier.shared.dbgLockedIsLargest = a >= maxA - 1
                 PersonIdentifier.shared.diagnoseDrift(currentBox: b, cands: cands, sensorSize: sensorSize)
+            }
+            _dhDiagUs += (CACurrentMediaTime() - _tDiag0) * 1000
+            _dhN += 1
+            if _dhN >= 30 {   // 摊薄每30帧一行:rect 里 findTarget / detectAllPersonsWithConf / 诊断 各占多少 ms
+                print(String(format: "⏱🔬 detectHuman/帧: findTarget(gate,pose#1)=%.1fms  detectAllPersonsWithConf(pose#2)=%.1fms  diag=%.1fms  (n=%d)",
+                             _dhFindUs / Double(_dhN), _dhWithConfUs / Double(_dhN), _dhDiagUs / Double(_dhN), _dhN))
+                _dhFindUs = 0; _dhWithConfUs = 0; _dhDiagUs = 0; _dhN = 0
             }
             #endif
             if let result = r {

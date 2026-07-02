@@ -50,6 +50,8 @@ final class ReplayLogger {
     private var disagree = [0, 0, 0]      // 各档「门会选≠现行选中」帧数(=未来行为差异点)
     private var detectorMissCount = 0     // 纯检测断帧(候选0)——Q7 gap 补偿的输入,单列
     private var shadowFrames = 0
+    // —— 刀3 SEARCHING 找回失败(🔍 REACQ-FAIL)——
+    private var reacqFail = 0, reacqFailColor = 0, reacqFailMargin = 0, reacqFailPos = 0, reacqFailDetector = 0
 
     // MARK: - 生命周期
 
@@ -159,6 +161,15 @@ final class ReplayLogger {
             }
         }
 
+        // 刀3 找回失败:🔍 REACQ-FAIL … reason=色<0.50 margin<0.15 偏冻结>预算 / detectorMiss
+        if line.contains("REACQ-FAIL") {
+            reacqFail += 1
+            if line.contains("detectorMiss") { reacqFailDetector += 1 }
+            if line.contains("色<0.50") { reacqFailColor += 1 }
+            if line.contains("margin<0.15") { reacqFailMargin += 1 }
+            if line.contains("偏冻结") { reacqFailPos += 1 }
+        }
+
         if line.hasPrefix("PROBE t=") {
             frames += 1
             if let f = firstFloat(in: line, after: "f=", terminator: " ") { lastFrame = Int(f) }
@@ -231,6 +242,8 @@ final class ReplayLogger {
         R=.07  gateMiss=\(gateMiss[1])  disagree=\(disagree[1])
         R=.10  gateMiss=\(gateMiss[2])  disagree=\(disagree[2])
         detectorMiss(候选0,Q7 gap 输入,单列)=\(detectorMissCount)
+        ──── 刀3 SEARCHING 找回失败 ────
+        REACQ-FAIL total=\(reacqFail)(色<0.50=\(reacqFailColor) margin<0.15=\(reacqFailMargin) 偏冻结>预算=\(reacqFailPos) detectorMiss=\(reacqFailDetector))
         ════════════════════════════════
 
         """
@@ -242,6 +255,7 @@ final class ReplayLogger {
         cSoloPass = 0; cShadow = 0; cShadowRescue = 0; frames = 0
         maxCenterJump = 0; prevLockedNx = nil; prevLockedNy = nil; lockedRunStart = nil; longestLockedSpan = 0
         dPredList = []; dLastList = []; gateMiss = [0,0,0]; disagree = [0,0,0]; detectorMissCount = 0; shadowFrames = 0
+        reacqFail = 0; reacqFailColor = 0; reacqFailMargin = 0; reacqFailPos = 0; reacqFailDetector = 0
         lastFrame = 0; lastTime = 0; lineBuf = ""
     }
 }
