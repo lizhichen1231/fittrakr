@@ -49,6 +49,9 @@ final class CameraViewModel: NSObject, ObservableObject {
     @Published var fakeHUD = ""
     // 卡3 最简 HUD:锁谁/状态/找回@,来自 follow.dbgTrkHUD
     @Published var trkHUD = ""
+    // 三态锁定状态机 HUD:badge/cont/thr/候选/事件,来自 follow.dbgStateLine();stateTag 驱动颜色
+    @Published var stateHUD = ""
+    @Published var stateTag = "U"
     // 跳变取证:冻结"最近一次显著跳变那一帧"的整行数据(poseValid/srcUsed/rectConf/各Δ)
     @Published var probeHUD = ""
     let probeJumpThreshold: CGFloat = 0.03   // anchorΔ 或 rectBoxΔ 超此(占画面宽 3%)算一次跳,刷新冻结行
@@ -460,6 +463,14 @@ extension CameraViewModel {
             if self.slewHUD != self.follow.dbgSlewLine { self.slewHUD = self.follow.dbgSlewLine }
             if self.fakeHUD != self.follow.dbgFakeHUD { self.fakeHUD = self.follow.dbgFakeHUD }
             if self.trkHUD != self.follow.dbgTrkHUD { self.trkHUD = self.follow.dbgTrkHUD }
+            #if DEBUG
+            if self.showDebugOverlay {   // 状态机 HUD:关时不更新,省 @Published churn(SEARCHING 秒数每帧变)
+                let _sl = self.follow.dbgStateLine()
+                if self.stateHUD != _sl { self.stateHUD = _sl }
+                let _st = self.follow.dbgStateTag()
+                if self.stateTag != _st { self.stateTag = _st }
+            }
+            #endif
             if self.showDebugOverlay { self.dbgCropHUD = self.follow.dbgCropLine }   // 关时不更新,省 @Published churn
             self.isTracking = result.confidence > 0.5
             self.trackingInfo = self.isTracking

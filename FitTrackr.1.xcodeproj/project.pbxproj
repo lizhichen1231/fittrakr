@@ -162,6 +162,7 @@
 				518E43732E4A2BE100CCAB9D /* Frameworks */,
 				518E43742E4A2BE100CCAB9D /* Resources */,
 				518E44062E4A7D2C00CCAB9D /* Embed Frameworks */,
+				FEEDFACE00000000CAFE0001 /* [Debug] Copy Replay Clips */,
 			);
 			buildRules = (
 			);
@@ -352,6 +353,40 @@
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
 			shellScript = "diff \"${PODS_PODFILE_DIR_PATH}/Podfile.lock\" \"${PODS_ROOT}/Manifest.lock\" > /dev/null\nif [ $? != 0 ] ; then\n    # print error to STDERR\n    echo \"error: The sandbox is not in sync with the Podfile.lock. Run 'pod install' or update your CocoaPods installation.\" >&2\n    exit 1\nfi\n# This output is used by Xcode 'outputs' to avoid re-running this script phase.\necho \"SUCCESS\" > \"${SCRIPT_OUTPUT_FILE_0}\"\n";
+			showEnvVarsInLog = 0;
+		};
+		FEEDFACE00000000CAFE0001 /* [Debug] Copy Replay Clips */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/DebugReplayClips",
+				"$(SRCROOT)/DebugReplayClips/clip_1_sameshirt_dancetrack0097.mp4",
+				"$(SRCROOT)/DebugReplayClips/clip_2_sameshirt_dancetrack0004.mp4",
+				"$(SRCROOT)/DebugReplayClips/clip_3_sameshirt_dancetrack0005.mp4",
+				"$(SRCROOT)/DebugReplayClips/clip_4_sameshirt_dancetrack0014.mp4",
+				"$(SRCROOT)/DebugReplayClips/clip_5_sameshirt_dancetrack0034.mp4",
+				"$(SRCROOT)/DebugReplayClips/clip_6_sameshirt_dancetrack0026.mp4",
+			);
+			name = "[Debug] Copy Replay Clips";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/DebugReplayClips",
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/DebugReplayClips/clip_1_sameshirt_dancetrack0097.mp4",
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/DebugReplayClips/clip_2_sameshirt_dancetrack0004.mp4",
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/DebugReplayClips/clip_3_sameshirt_dancetrack0005.mp4",
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/DebugReplayClips/clip_4_sameshirt_dancetrack0014.mp4",
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/DebugReplayClips/clip_5_sameshirt_dancetrack0034.mp4",
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/DebugReplayClips/clip_6_sameshirt_dancetrack0026.mp4",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "# DEBUG-only:把 DanceTrack 回放测试片拷进 .app;Release 不拷(包体积零 mp4)\n# 沙盒开启(ENABLE_USER_SCRIPT_SANDBOXING=YES):outputPaths=DST 授写、inputPaths=6个mp4 授读;逐个显式 cp(不 glob)\nDST=\"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/DebugReplayClips\"\nmkdir -p \"$DST\"\nif [ \"${CONFIGURATION}\" = \"Debug\" ]; then\n  n=0\n  for f in clip_1_sameshirt_dancetrack0097 clip_2_sameshirt_dancetrack0004 clip_3_sameshirt_dancetrack0005 clip_4_sameshirt_dancetrack0014 clip_5_sameshirt_dancetrack0034 clip_6_sameshirt_dancetrack0026; do\n    if err=$(cp -f \"${SRCROOT}/DebugReplayClips/${f}.mp4\" \"$DST/${f}.mp4\" 2>&1); then n=$((n+1)); else echo \"  cp FAIL ${f}: $err\"; fi\n  done\n  echo \"DebugReplayClips: copied $n clips (Debug)\"\n  if [ \"$n\" -eq 0 ]; then echo \"warning: 0 clips copied — 确认 ${SRCROOT}/DebugReplayClips 有 mp4(可跑 _rz.py 复现)\"; fi\nelse\n  rm -rf \"$DST\" 2>/dev/null || true\n  echo \"DebugReplayClips: skipped (Release — 目录已清,包内零 mp4)\"\nfi\nexit 0\n";
 			showEnvVarsInLog = 0;
 		};
 /* End PBXShellScriptBuildPhase section */

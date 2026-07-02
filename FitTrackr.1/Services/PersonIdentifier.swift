@@ -6,6 +6,7 @@ import CoreImage
 import CoreGraphics
 import AVFoundation
 import UIKit
+import QuartzCore
 
 // MARK: - 目标档案
 struct TargetProfile {
@@ -59,6 +60,25 @@ final class PersonIdentifier {
     #if DEBUG
     var dbgReanchorLine = ""        // 最近一次重锚结果(sticky)
     #endif
+
+    var lastCandidateCount = 0      // 本帧重选候选数(状态机 locked→searching 日志 + HUD 读)
+    let soloMatchThreshold: Float = 0.30  // Part 3A 单人安全阀:全场仅1人且与锁框高重叠时的放宽门槛
+    #if DEBUG
+    var dbgCurCont: Float = 0       // 本帧选中的延续分(HUD/状态日志)
+    var dbgCurThresh: Float = 0.5   // 本帧生效门槛(安全阀降门时=0.30)
+    var dbgSrcMerged = false        // rect 是否并源(searching 时 P+R)
+    var dbgBestRejectCont: Float = 0   // nil 帧最佳被拒候选延续分(搜索心跳 bestCont)
+    var dbgBestRejectColor: Float = 0  // nil 帧最佳被拒候选颜色分(搜索心跳 bestColor)
+    #endif
+
+    // ===== 刀2 连续性主权:LOCKED 邻域门(转正,非DEBUG也编译)=====
+    var lockedCenterHist: [(c: CGPoint, t: TimeInterval)] = []  // 近3帧「实际选中」中心(归一)+墙钟
+    private let velClampPerSec: CGFloat = 0.5   // 速度幅值上限(归一/秒),防单帧坏值甩飞预测
+    let gateR0: CGFloat = 0.06           // Config:邻域门起步半径(待影子日志校准)
+    let gateVetoThreshold: Float = 0.25  // Config:颜色否决门槛(明显不是一个人才踢)
+    let maxExtrapolationSec: CGFloat = 0.08  // Config:预测外推上限(防历史冻结时 pred 无限跑飞)
+    var gateHits = 0, gateMissCount = 0, gateVetoCount = 0, gateDetectorMiss = 0  // 门统计(内存累加,规避每帧print)
+    private var gateFrameCounter = 0
 
     // 方案A:主跟踪 = 每帧 pose 重选「延续上一帧目标」+ 换人迟滞(治我/爹闪烁;VNTrackObject 死路仅兜底)
     var lastLockedBox: CGRect?      // 上一帧真正锁定的框(算延续/迟滞用)
@@ -154,6 +174,9 @@ final class PersonIdentifier {
         self.isLocked = true
         self.lastLockedBox = personBox   // 方案A:延续/迟滞基准 = 锁定那刻的框(你)
         self.coastFrames = 0
+        // 刀2:预测历史种子 = 锁定中心;门统计清零(新一次锁定新账)
+        self.lockedCenterHist = [(CGPoint(x: personBox.midX / sensorSize.width, y: personBox.midY / sensorSize.height), CACurrentMediaTime())]
+        self.gateHits = 0; self.gateMissCount = 0; self.gateVetoCount = 0; self.gateDetectorMiss = 0
         // 修法2:重置 VNSequenceRequestHandler → 每次锁定 VNTrackObject 从干净状态起跟,抹平「第一次vs之后」暖机差异。
         self.sequenceHandler = VNSequenceRequestHandler()
 
@@ -297,6 +320,7 @@ final class PersonIdentifier {
         isTrackingActive = false
         reanchorCounter = 0
         lastLockedBox = nil; coastFrames = 0
+        lockedCenterHist.removeAll()   // 刀2:清预测历史
         #if DEBUG
         dbgLockWho = "无"; dbgTrkState = "未锁定"; dbgRefindNX = -1; dbgRefindNY = -1; lockedBoxArea = -1; dbgReanchorLine = ""; dbgReselectLine = ""
         dbgLockMomentCandCount = -1; dbgLockMomentAreaFrac = -1; dbgLockMomentCenter = .zero; dbgDriftLine = ""
@@ -393,7 +417,8 @@ final class PersonIdentifier {
     /// - colorBuffer:  颜色直方图用(wide 全分辨率帧,与 sensorSize 同坐标系)
     func findTarget(in detectBuffer: CVPixelBuffer,
                     colorBuffer: CVPixelBuffer,
-                    sensorSize: CGSize) -> (box: CGRect, score: Float)? {
+                    sensorSize: CGSize,
+                    searchMode: Bool = false) -> (box: CGRect, score: Float)? {
 
         guard isLocked else { return nil }
 
@@ -403,6 +428,11 @@ final class PersonIdentifier {
             return findTargetWithFake(in: detectBuffer, colorBuffer: colorBuffer, sensorSize: sensorSize)
         }
         #endif
+
+        // ===== 刀2 连续性主权:LOCKED(非 searchMode)= 预测邻域门;下方全局身份找回仅 SEARCHING 走 =====
+        if !searchMode {
+            return lockedGate(in: detectBuffer, colorBuffer: colorBuffer, sensorSize: sensorSize)
+        }
 
         // 先尝试用 VNTrackObjectRequest（更快）—— 框按 sensorSize(wide)还原,颜色校验用 colorBuffer(wide)
         if isTrackingActive, let tracked = continueTracking(detectBuffer, sensorSize: sensorSize) {
@@ -456,28 +486,65 @@ final class PersonIdentifier {
         }
 
         // ===== 方案A 主跟踪:每帧 pose 候选「延续上一帧目标」+ 换人迟滞(治我/爹闪烁)=====
-        let persons = detectAllPersons(in: detectBuffer, sensorSize: sensorSize)
+        var persons = detectAllPersons(in: detectBuffer, sensorSize: sensorSize)
         let fa = sensorSize.width * sensorSize.height
+        let poseCount = persons.count   // 之后并入的 rect 候选下标 >= poseCount(供 REJECT 日志标 src)
 
-        // 每个候选:颜色综合分 + match + 对「上一帧锁定框」的延续分(颜色大头 + 位置 + 尺寸)
-        struct Scored { let box: CGRect; let color: Float; let matched: Bool; let cont: Float }
-        let scored: [Scored] = persons.map { p in
+        // Part 3B:搜索期并入矩形候选(pose 漏检的人靠 VNDetectHumanRectangles 兜),去重(IoU>0.5 视为同人)
+        #if DEBUG
+        dbgSrcMerged = false
+        #endif
+        if searchMode {
+            let rects = detectAllRects(in: detectBuffer, sensorSize: sensorSize)
+            let extra = rects.filter { rc in !persons.contains { iou($0, rc) > 0.5 } }
+            if !extra.isEmpty {
+                persons.append(contentsOf: extra)
+                #if DEBUG
+                dbgSrcMerged = true
+                print("🔎 SEARCH 并源 pose=\(persons.count - extra.count) +rect=\(extra.count) → 候选=\(persons.count)")
+                #endif
+            }
+        }
+        lastCandidateCount = persons.count
+
+        // 每个候选:颜色综合分 + match + 对「上一帧锁定框」的延续分(颜色大头 + 位置 + 尺寸)+ 位置/尺寸子分 + 源
+        struct Scored { let box: CGRect; let color: Float; let matched: Bool; let cont: Float; let pos: Float; let size: Float; let src: String }
+        let scored: [Scored] = persons.enumerated().map { (idx, p) in
             let (m, s) = isTarget(p, in: colorBuffer, sensorSize: sensorSize)
-            var cont: Float = 0
+            var cont: Float = 0, posSim: Float = 0, sizeSim: Float = 0
             if let last = lastLockedBox {
                 let posDist = Float(hypot((p.midX - last.midX) / sensorSize.width, (p.midY - last.midY) / sensorSize.height))
                 let aP = p.width * p.height, aL = last.width * last.height
                 let sizeDist = Float(abs(aP - aL) / max(aL, 1))
-                let posSim = max(0, 1 - posDist * 2)      // 位置越近越高
-                let sizeSim = max(0, 1 - sizeDist)         // 尺寸越近越高
+                posSim = max(0, 1 - posDist * 2)      // 位置越近越高
+                sizeSim = max(0, 1 - sizeDist)         // 尺寸越近越高
                 cont = wCont_color * s + wCont_pos * posSim + wCont_size * sizeSim
             } else {
                 cont = s                                    // 无上一帧 → 退化为综合分
             }
-            return Scored(box: p, color: s, matched: m, cont: cont)
+            return Scored(box: p, color: s, matched: m, cont: cont, pos: posSim, size: sizeSim,
+                          src: idx < poseCount ? "pose" : "rect")
         }
 
-        let matched = scored.filter { $0.matched }
+        var matched = scored.filter { $0.matched }
+        #if DEBUG
+        dbgCurThresh = config.matchThreshold
+        #endif
+
+        // Part 3A:单人安全阀——全场仅 1 个候选且与上一帧锁框高度重叠(IoU>0.5),
+        // 即"就他一个、还站在原地",放宽门槛到 soloMatchThreshold(0.30)接纳,避免光照/角度小波动误判丢失。
+        if matched.isEmpty, persons.count == 1, let sole = scored.first, let last = lastLockedBox {
+            let ov = iou(sole.box, last)
+            if ov > 0.5 && sole.color > soloMatchThreshold {
+                matched = [Scored(box: sole.box, color: sole.color, matched: true, cont: sole.cont,
+                                  pos: sole.pos, size: sole.size, src: sole.src)]
+                #if DEBUG
+                dbgCurThresh = soloMatchThreshold
+                print(String(format: "🎯 SOLO-PASS cont=%.2f iou=%.2f (色=%.2f 降门%.2f→接纳)",
+                             sole.cont, ov, sole.color, soloMatchThreshold))
+                #endif
+            }
+        }
 
         // 延续候选 = 颜色 match 且「延续分」最高(= 上一帧的你连续过来的)
         let incumbent = matched.max { $0.cont < $1.cont }
@@ -492,6 +559,7 @@ final class PersonIdentifier {
                 coastFrames += 1
                 if coastFrames <= maxCoastFrames, let hold = lastLockedBox {
                     #if DEBUG
+                    dbgCurCont = inc.cont
                     dbgReselectLine = String(format: "重选 延续分=%.2f<floor → coast保持(%d/%d) 候选%d", inc.cont, coastFrames, maxCoastFrames, persons.count)
                     print("🧲 " + dbgReselectLine); dbgTrkState = "保持(目标暂失)"
                     #endif
@@ -521,16 +589,30 @@ final class PersonIdentifier {
 
         if let c = chosen {
             #if DEBUG
+            dbgCurCont = c.cont
             dbgLockWho = "真人"; dbgTrkState = switched ? "换人" : "锁定(延续)"
             dbgRefindNX = c.box.midX / sensorSize.width; dbgRefindNY = c.box.midY / sensorSize.height
             #endif
             lastLockedBox = c.box
             startTracking(box: c.box, sensorSize: sensorSize)   // 顺带 re-seed VNTrackObject(成功了就走快速路)
+            // 刀2:SEARCHING 找回后重种预测历史,回到 LOCKED 时门从找回位置起(不吃丢失前的陈旧速度)
+            lockedCenterHist = [(CGPoint(x: c.box.midX / sensorSize.width, y: c.box.midY / sensorSize.height), CACurrentMediaTime())]
             return (c.box, c.color)
         }
 
         #if DEBUG
+        dbgCurCont = 0
         dbgLockWho = "无"; dbgTrkState = "丢失"
+        // Part 4.2 REJECT:身份未命中,交状态机(冻结/超时回全景);绝不在此抓最大人。逐候选打归因(色/位/尺崩在哪)
+        for (i, sc) in scored.enumerated() {
+            print(String(format: "❌ REJECT cand#%d cont=%.2f (color=%.2f pos=%.2f size=%.2f) thresh=%.2f src=%@",
+                         i, sc.cont, sc.color, sc.pos, sc.size, dbgCurThresh, sc.src))
+        }
+        let best = scored.max { $0.cont < $1.cont }
+        dbgBestRejectCont = best?.cont ?? 0
+        dbgBestRejectColor = best?.color ?? 0
+        print(String(format: "🚫 REJECT-ALL 无匹配候选(候选=%d 门槛=%.2f%@) → findTarget nil",
+                     persons.count, dbgCurThresh, searchMode ? " searchMode" : ""))
         #endif
         return nil
     }
@@ -714,6 +796,143 @@ final class PersonIdentifier {
     private func detectAllPersons(in pixelBuffer: CVPixelBuffer,
                                    sensorSize: CGSize) -> [CGRect] {
         return detectPersonsViaPose(in: pixelBuffer, sensorSize: sensorSize).map { $0.box }
+    }
+
+    /// Part 3B 搜索期兜底候选源:VNDetectHumanRectangles(pose 漏检时能召回人)。
+    /// 坐标统一到 wide(顶左原点,y=(1-maxY)*h),与 detectAllPersons / tightBox 同坐标系(★这里栽过两次)。
+    private func detectAllRects(in pixelBuffer: CVPixelBuffer, sensorSize: CGSize) -> [CGRect] {
+        let request = VNDetectHumanRectanglesRequest()
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
+        do { try handler.perform([request]) } catch { return [] }
+        guard let results = request.results else { return [] }
+        return results.map { obs in
+            let r = obs.boundingBox   // Vision 归一化,左下原点
+            return CGRect(x: r.minX * sensorSize.width,
+                          y: (1 - r.maxY) * sensorSize.height,   // 翻到顶左原点 = wide
+                          width: r.width * sensorSize.width,
+                          height: r.height * sensorSize.height)
+        }
+    }
+
+    /// 两框 IoU(同一坐标系)。用于 rect 并源去重 + 单人安全阀重叠判定 + shadow 诊断。
+    func iou(_ a: CGRect, _ b: CGRect) -> Float {
+        let inter = a.intersection(b)
+        if inter.isNull || inter.width <= 0 || inter.height <= 0 { return 0 }
+        let ai = inter.width * inter.height
+        let au = a.width * a.height + b.width * b.height - ai
+        return au > 0 ? Float(ai / au) : 0
+    }
+
+    #if DEBUG
+    /// 诊断:给定框与「上一帧锁框」的 IoU(HUD/shadow 日志用)。无锁框返回 -1。
+    func dbgIoUWithLast(_ box: CGRect) -> Float {
+        guard let last = lastLockedBox else { return -1 }
+        return iou(box, last)
+    }
+    #endif
+
+    // ===== 刀2 连续性主权:运动预测(转正,非DEBUG也编译)+ LOCKED 邻域门 =====
+
+    /// 推进预测历史。只在「系统本帧实际选中一个框」时调用 → 预测跟着现行为走,无反馈。
+    func recordLockedCenter(_ c: CGPoint, at t: TimeInterval) {
+        lockedCenterHist.append((c, t))
+        if lockedCenterHist.count > 3 { lockedCenterHist.removeFirst() }
+    }
+
+    /// 重种历史(单点,清空重建)。SEARCHING 找回后调 → 回 LOCKED 时门从找回位置起,不吃冻结的陈旧速度。
+    func seedLockedCenter(_ c: CGPoint, at t: TimeInterval) { lockedCenterHist = [(c, t)] }
+
+    /// 预测本帧目标中心 = last + vel·dt。vel = 最近两帧差分/真实dt(不假设恒定帧率),幅值 clamp。
+    /// 历史不足 3 帧 → 退化为 last(安全)。无历史 → nil。
+    func predictedCenter(at now: TimeInterval) -> CGPoint? {
+        guard let last = lockedCenterHist.last else { return nil }
+        guard lockedCenterHist.count >= 3 else { return last.c }
+        let a = lockedCenterHist[lockedCenterHist.count - 2]
+        let dt = last.t - a.t
+        guard dt > 1e-4 else { return last.c }
+        var vx = (last.c.x - a.c.x) / CGFloat(dt)
+        var vy = (last.c.y - a.c.y) / CGFloat(dt)
+        let sp = hypot(vx, vy)
+        if sp > velClampPerSec { let k = velClampPerSec / sp; vx *= k; vy *= k }
+        // ★ 关键:外推时间钳上限。历史一冻结(门连续 miss),now-last.t 会无限增长 →
+        //   pred 跑飞出画面 → 永远 miss 死循环。钳到 maxExtrapolationSec 后 pred 停在 last 附近,下帧能重命中。
+        let pdt = min(CGFloat(now - last.t), maxExtrapolationSec)
+        return CGPoint(x: last.c.x + vx * pdt, y: last.c.y + vy * pdt)
+    }
+
+    /// 刀2 LOCKED 邻域门(连续性主权):预测邻域内取离 pred 最近的候选;颜色仅否决(isTarget 分 <
+    /// gateVetoThreshold 才踢,永不参与「选谁」);门内零可接受候选 → 返回 nil(→SEARCHING)。
+    /// 选中即写 lastLockedBox + 推进历史。坐标全程 wide:候选(detectAllPersons)与 pred(归一 of wide)同系。
+    private func lockedGate(in detectBuffer: CVPixelBuffer, colorBuffer: CVPixelBuffer,
+                            sensorSize: CGSize) -> (box: CGRect, score: Float)? {
+        let now = CACurrentMediaTime()
+        gateFrameCounter += 1
+        let persons = detectAllPersons(in: detectBuffer, sensorSize: sensorSize)
+        lastCandidateCount = persons.count
+        func nc(_ b: CGRect) -> CGPoint { CGPoint(x: b.midX / sensorSize.width, y: b.midY / sensorSize.height) }
+
+        // detectorMiss:零候选(刀5 的 gap 补偿输入)
+        guard !persons.isEmpty else {
+            gateDetectorMiss += 1
+            #if DEBUG
+            print("🚪 DETECTOR-MISS f\(gateFrameCounter) (results.count=0) → nil→SEARCHING")
+            #endif
+            return nil
+        }
+        // 参考中心:预测优先,退化到历史末 / lastLockedBox
+        guard let refC: CGPoint = predictedCenter(at: now) ?? lockedCenterHist.last?.c ?? lastLockedBox.map(nc) else {
+            gateMissCount += 1
+            return nil
+        }
+        let R = gateR0   // 刀5 再上 R = R0 + k·gap
+
+        // 门内候选:|center − pred| ≤ R,且颜色不被否决;取离 pred 最近
+        var best: (box: CGRect, d: CGFloat, score: Float)? = nil
+        var inGateCount = 0, vetoedCount = 0
+        for p in persons {
+            let c = nc(p)
+            let d = hypot(c.x - refC.x, c.y - refC.y)
+            if d > R { continue }
+            inGateCount += 1
+            let (_, s) = isTarget(p, in: colorBuffer, sensorSize: sensorSize)  // 仅取分做否决,不选谁
+            if s < gateVetoThreshold {
+                vetoedCount += 1; gateVetoCount += 1
+                #if DEBUG
+                print(String(format: "🚪 VETO f%d 门内@(%.2f,%.2f) 颜色%.2f<%.2f → 踢", gateFrameCounter, c.x, c.y, s, gateVetoThreshold))
+                #endif
+                continue
+            }
+            if best == nil || d < best!.d { best = (p, d, s) }
+        }
+
+        guard let pick = best else {
+            gateMissCount += 1   // 门内零可接受候选(全出门或全否决)→ nil→SEARCHING
+            #if DEBUG
+            // 诊断:每候选 中心 + 到pred距 + 到lastLockedBox距。dLast 小 = 目标 pose 在(只是噪声出门,该放宽R);
+            //       全部 dLast 大 = 目标 pose 这帧真丢了(该 coast 等它回来,别抓邻居 = 刀5)。
+            let lc = lastLockedBox.map(nc)
+            let cs = persons.map { p -> String in
+                let c = nc(p)
+                let dp = hypot(c.x - refC.x, c.y - refC.y)
+                let dl = lc.map { hypot(c.x - $0.x, c.y - $0.y) } ?? -1
+                return String(format: "(%.2f,%.2f)dP%.3f/dL%.3f", c.x, c.y, dp, dl)
+            }.joined(separator: " ")
+            print("🚪 GATE-MISS f\(gateFrameCounter) pred=(\(String(format:"%.2f",refC.x)),\(String(format:"%.2f",refC.y))) R=\(String(format:"%.2f",R)) lastBox=\(lc.map{String(format:"(%.2f,%.2f)",$0.x,$0.y)} ?? "—") 候选[\(persons.count)]: \(cs) → nil→SEARCHING")
+            #endif
+            return nil
+        }
+
+        // 选中:门内离 pred 最近
+        gateHits += 1
+        lastLockedBox = pick.box
+        recordLockedCenter(nc(pick.box), at: now)
+        #if DEBUG
+        dbgLockWho = "真人"; dbgTrkState = "锁定(门)"
+        if gateFrameCounter % 60 == 0 {
+            print("🚪 GATE hits=\(gateHits) miss=\(gateMissCount) veto=\(gateVetoCount) detMiss=\(gateDetectorMiss) (R=\(String(format: "%.2f", R)))")
+        }
+        #endif
+        return (pick.box, pick.score)
     }
 
     /// 提取上半身颜色直方图
