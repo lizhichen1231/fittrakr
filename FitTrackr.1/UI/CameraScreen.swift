@@ -72,6 +72,19 @@ struct CameraScreen: View {
                         }
                         .padding(.horizontal, 16).padding(.top, 4)
                     }
+                    // 三态锁定状态机 HUD:badge 按 stateTag 上色(L绿/S黄/X红/U灰)
+                    if vm.showDebugOverlay, !vm.stateHUD.isEmpty {
+                        HStack {
+                            Text(vm.stateHUD)
+                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                .foregroundColor(stateColor(vm.stateTag))
+                                .lineLimit(1).minimumScaleFactor(0.4)
+                                .padding(.horizontal, 8).padding(.vertical, 4)
+                                .background(.black.opacity(0.6), in: Capsule())
+                            Spacer(minLength: 0)
+                        }
+                        .padding(.horizontal, 16).padding(.top, 4)
+                    }
                     #endif
 
                     // 跳变取证(调试):默认不显示,眼睛开关打开才出
@@ -256,6 +269,18 @@ struct CameraScreen: View {
     // MARK: - 辅助方法
 
     /// 掰回竖屏(iOS16+):应对「已经卡在横屏进来」的情况。和 AppDelegate 的 .portrait mask 配合。
+    #if DEBUG
+    // 三态锁定状态机 HUD 色标:L=绿(锁定) S=黄(搜索) X=红(丢失) U=灰(未锁)
+    private func stateColor(_ tag: String) -> Color {
+        switch tag {
+        case "L": return .green
+        case "S": return .yellow
+        case "X": return .red
+        default:  return .gray
+        }
+    }
+    #endif
+
     private func forcePortrait() {
         guard let scene = UIApplication.shared.connectedScenes
             .first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene else { return }

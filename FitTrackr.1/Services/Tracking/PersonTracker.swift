@@ -247,7 +247,7 @@ extension TrackingController {
 
     /// - pb:   Vision 检测/跟踪用(detPB 降采样,省算力);坐标按 sensorSize(wide)还原
     /// - wide: 颜色直方图用(全分辨率帧,与 sensorSize 同坐标系)
-    func detectHuman(pb: CVPixelBuffer, wide: CVPixelBuffer, dt: CGFloat) -> (CGRect, CGFloat)? {
+    func detectHuman(pb: CVPixelBuffer, wide: CVPixelBuffer, dt: CGFloat, searchMode: Bool = false) -> (CGRect, CGFloat)? {
         let sensorSize = CGSize(width: sensorW, height: sensorH)   // wide 全分辨率尺寸
 
         #if DEBUG
@@ -257,7 +257,8 @@ extension TrackingController {
 
         // 锁定 → 身份识别路径(findTarget→Kalman→颜色校验);检测在 pb(detPB),颜色在 wide
         if PersonIdentifier.shared.isLocked {
-            let r = PersonIdentifier.shared.findTarget(in: pb, colorBuffer: wide, sensorSize: sensorSize)
+            // searchMode(状态机 .searching):findTarget 内并入 rect 候选 + 单人安全阀降门,扩大找回面
+            let r = PersonIdentifier.shared.findTarget(in: pb, colorBuffer: wide, sensorSize: sensorSize, searchMode: searchMode)
             #if DEBUG
             // 卡2 验证日志:逐帧打 console(REPLAY + FAKE 两行),带 frameCount/poseValid,可滚动/搜索/复制
             if FakePersonInjector.shared.enabled {
@@ -283,11 +284,28 @@ extension TrackingController {
                 PersonIdentifier.shared.dbgLockedIsLargest = a >= maxA - 1
                 PersonIdentifier.shared.diagnoseDrift(currentBox: b, cands: cands, sensorSize: sensorSize)
             }
+            // 刀1 探针:影子门(复用上面已算的 cands;actual=findTarget 本帧返回框;零行为变更)
+            PersonIdentifier.shared.dbgShadowGate(frame: frameCount, cands: cands.map { $0.box },
+                                                  actual: r?.box, sensorSize: sensorSize)
             #endif
             if let result = r {
                 return applyKalmanSmoothing(rawRect: result.box, conf: CGFloat(result.score))
             }
-            return detectHumanRectFallback(pb: pb)
+            // Part 2:锁定/搜索期身份未命中 → 绝不用「最大人矩形」兜底(那正是漂到路人的后门)。
+            // 返回 nil → 状态机 locked→searching(冻结) 或 searching 超时→lost(回全景)。下游只认 lockState。
+            #if DEBUG
+            // 👻 iou高+候选1 = 后门在救场(该被 SOLO-PASS 接住);iou低/候选≥2 = 在抓替身(正是要堵的)
+            if frameCount % 15 == 0, let shadow = detectHumanRectFallback(pb: pb) {
+                let fa = sensorSize.width * sensorSize.height
+                print(String(format: "👻 SHADOW-FALLBACK box=(%.2f,%.2f,a%.3f) iouWithLast=%.2f candidates=%d → 已拦截(return nil, %@)",
+                             shadow.0.midX / sensorSize.width, shadow.0.midY / sensorSize.height,
+                             shadow.0.width * shadow.0.height / fa,
+                             PersonIdentifier.shared.dbgIoUWithLast(shadow.0),
+                             PersonIdentifier.shared.lastCandidateCount,
+                             searchMode ? "searching" : "locked"))
+            }
+            #endif
+            return nil
         }
         #if DEBUG
         dbgTrkHUD = PersonIdentifier.shared.dbgTrkLine()   // 未锁定时也刷(显示「未锁定」)

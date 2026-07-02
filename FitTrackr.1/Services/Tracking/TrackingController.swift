@@ -134,6 +134,22 @@ final class TrackingController {
     var cfg = Cfg()
     var deadZoneFraction: CGSize { cfg.deadZone }
 
+    // ===== 三态锁定状态机(唯一权威:只有 process 的状态推进处写它,下游只读)=====
+    enum LockState: Equatable {
+        case unlocked                        // 未锁定(auto-lock 管进入)
+        case locked                          // 身份匹配正常,跟随
+        case searching(since: TimeInterval)  // 身份匹配不上,冻结+找回
+        case lost                            // 搜索超时(瞬时过渡,立即转 unlocked)
+    }
+    var lockState: LockState = .unlocked
+    let searchTimeoutSec: TimeInterval = 4.0
+    #if DEBUG
+    var dbgStateEvent = ""     // 最近一次事件缩写(保持 3s)
+    var dbgStateEventUntil: TimeInterval = 0
+    var dbgSearchCandSeen = 0  // 本轮 searching 累计看过的候选数(lost 日志 totalCandidatesSeen)
+    // 本帧延续分/生效门槛/候选并源:由 findTarget 写到 PersonIdentifier,HUD 从那读(见 dbgStateLine)
+    #endif
+
     // 运行态
     var frameCount = 0
     var missCount = 0
@@ -536,7 +552,9 @@ final class TrackingController {
             // 未锁定/没找到则内部回退 detectHumanRectFallback(与卡0一致)。返回类型 (CGRect, conf) 不变 → 下游不动。
             var rectDetected = false
             let _tRect = CACurrentMediaTime()
-            let _rectResult = detectHuman(pb: detPB, wide: wideFrame, dt: dt)
+            // searchMode:仅 .searching 时开(rect 并源 + 单人降门找回);其余状态用常规严格匹配
+            let _searchMode: Bool = { if case .searching = lockState { return true }; return false }()
+            let _rectResult = detectHuman(pb: detPB, wide: wideFrame, dt: dt, searchMode: _searchMode)
             msRect = (CACurrentMediaTime() - _tRect) * 1000
             dbgRectConf = -1; dbgRectBoxDelta = 0   // 取证:本帧默认(rect 没返回时即此)
             if let (rect, conf) = _rectResult {
@@ -592,28 +610,12 @@ final class TrackingController {
                 // 骨骼失败不影响缩放：lastTorsoRatio 保留上一帧值，无骨骼则由调用方回退矩形高
             }
 
-            // Step C: 如果矩形也失败，处理丢失
-            if !rectDetected {
-                missCount += 1
+            // Step C: 丢失计数(降级为纯日志计数,不再驱动清空——清空移到 LOST 转移动作 1.4)
+            if !rectDetected { missCount += 1 }
 
-                // 连续丢失超过阈值，清除所有跟踪状态
-                if missCount > cfg.lostFramesThreshold {
-                    rawBox = nil
-                    lastHeightRatio = nil
-                    lastTorsoRatio = nil
-                    lastFedRatio = nil          // 限幅参照清掉,重新检测时首值直通、不被陈旧值钳
-                    torsoMedianBuf.removeAll()
-                    torsoOutlierStreak = 0
-                    torsoLostFrames = 0
-                    lastTightBox = nil
-                    smoothedTightBox = nil
-                    lastPoseObservation = nil
-                    hipHistory.removeAll()
-                    centerHistory.removeAll()
-                    hipBasedInPlace = false
-                    hipStableFrames = 0
-                }
-            }
+            // ===== 三态锁定状态机:唯一权威写入点(下游只读 lockState,别处不许写)=====
+            // identityMatched:锁定时 detectHuman 非nil ⟺ findTarget 命中(Part2 已堵 fallback,非nil只可能是身份命中)
+            advanceLockState(identityMatched: (_rectResult != nil))
 
             // 日志
             if frameCount % 30 == 0 {
@@ -741,7 +743,127 @@ final class TrackingController {
     }
 
     // 重置跟踪状态
+    // ===== 三态状态机推进(唯一权威写入点)=====
+    private func advanceLockState(identityMatched: Bool) {
+        let now = CACurrentMediaTime()
+        guard PersonIdentifier.shared.isLocked else {
+            if lockState != .unlocked { lockState = .unlocked }
+            return
+        }
+        if identityMatched {
+            var elapsed: TimeInterval = 0
+            if case .searching(let since) = lockState { elapsed = now - since }
+            let wasSearching: Bool = { if case .searching = lockState { return true }; return false }()
+            let wasUnlocked = (lockState == .unlocked)
+            lockState = .locked
+            #if DEBUG
+            let pi = PersonIdentifier.shared
+            if wasSearching {
+                let via = pi.dbgSrcMerged ? "P+R" : "pose"   // 并源池标记(chosen 精确源不追,近似)
+                let solo = (pi.dbgCurThresh <= pi.soloMatchThreshold + 0.001) ? "Y" : "N"
+                print(String(format: "🔍 STATE searching→locked @f%d (reacquired %.1fs, cont=%.2f, via=%@, solo=%@)",
+                             frameCount, elapsed, pi.dbgCurCont, via, solo))
+                setStateEvent(String(format: "RELOCK %.2f", pi.dbgCurCont), now)
+            } else if wasUnlocked {
+                print("🔒 STATE unlocked→locked @f\(frameCount)")
+                setStateEvent("LOCK", now)
+            }
+            #endif
+        } else {
+            switch lockState {
+            case .searching(let since):
+                #if DEBUG
+                dbgSearchCandSeen += PersonIdentifier.shared.lastCandidateCount   // 累计本轮看过的候选
+                #endif
+                if now - since > searchTimeoutSec {
+                    #if DEBUG
+                    print(String(format: "👻 STATE searching→lost @f%d (timeout %.1fs, totalCandidatesSeen=%d)",
+                                 frameCount, searchTimeoutSec, dbgSearchCandSeen))
+                    setStateEvent("LOST", now)
+                    #endif
+                    performLostTransition()
+                } else {
+                    // 继续 searching → 不清空 → rawBox 保持旧值 → spring 冻结(1.3)
+                    #if DEBUG
+                    // Part 4.5 搜索心跳:每 30 帧一行,看已搜多久/候选数/最佳被拒分(不改状态)
+                    if frameCount % 30 == 0 {
+                        let pi = PersonIdentifier.shared
+                        print(String(format: "🔍 SEARCHING %.1fs candidates=%d bestCont=%.2f bestColor=%.2f",
+                                     now - since, pi.lastCandidateCount, pi.dbgBestRejectCont, pi.dbgBestRejectColor))
+                    }
+                    #endif
+                }
+            case .locked:
+                lockState = .searching(since: now)
+                #if DEBUG
+                dbgSearchCandSeen = PersonIdentifier.shared.lastCandidateCount   // 新一轮 searching 起点
+                print("🔒 STATE locked→searching @f\(frameCount) (findTarget nil, candidates=\(PersonIdentifier.shared.lastCandidateCount))")
+                setStateEvent("SEARCH", now)
+                #endif
+            default:
+                break
+            }
+        }
+    }
+
+    /// LOST 一次性转移(1.4):① 清空(=原 :600 组)→ 无人分支接管回全景;② unlock → unlocked → 下帧 auto-lock 重锁(lock() 重建颜色模板)
+    private func performLostTransition() {
+        rawBox = nil
+        lastHeightRatio = nil
+        lastTorsoRatio = nil
+        lastFedRatio = nil
+        torsoMedianBuf.removeAll()
+        torsoOutlierStreak = 0
+        torsoLostFrames = 0
+        lastTightBox = nil
+        smoothedTightBox = nil
+        lastPoseObservation = nil
+        hipHistory.removeAll()
+        centerHistory.removeAll()
+        hipBasedInPlace = false
+        hipStableFrames = 0
+        PersonIdentifier.shared.unlock()
+        lockState = .unlocked
+        #if DEBUG
+        print("🔒 STATE lost→unlocked @f\(frameCount) (auto-relock next frame, newTemplate=Y)")
+        #endif
+    }
+
+    #if DEBUG
+    private func setStateEvent(_ s: String, _ now: TimeInterval) {
+        dbgStateEvent = s; dbgStateEventUntil = now + 3.0
+    }
+
+    /// Part 5 状态机 HUD 行:badge + cont/thr + 候选/源 + 最近事件(下游只读 lockState)
+    func dbgStateLine() -> String {
+        let pi = PersonIdentifier.shared
+        let now = CACurrentMediaTime()
+        let badge: String
+        switch lockState {
+        case .unlocked:             badge = "UNLOCKED"
+        case .locked:               badge = "LOCKED"
+        case .searching(let since): badge = String(format: "SEARCHING %.1f/%.1fs", now - since, searchTimeoutSec)
+        case .lost:                 badge = "LOST"
+        }
+        let src = pi.dbgSrcMerged ? "P+R" : "P"
+        let evt = (now < dbgStateEventUntil && !dbgStateEvent.isEmpty) ? " ⚑\(dbgStateEvent)" : ""
+        return String(format: "%@  cont=%.2f/thr=%.2f  cand=%d src=%@%@",
+                      badge, pi.dbgCurCont, pi.dbgCurThresh, pi.lastCandidateCount, src, evt)
+    }
+
+    /// Part 5 状态色标:L=绿 S=黄 X=红 U=灰(view 映射颜色)
+    func dbgStateTag() -> String {
+        switch lockState {
+        case .unlocked:  return "U"
+        case .locked:    return "L"
+        case .searching: return "S"
+        case .lost:      return "X"
+        }
+    }
+    #endif
+
     func resetTrackingState() {
+        lockState = .unlocked
         centerHistory.removeAll()
         aspectRatioHistory.removeAll()
         isDoingExerciseInPlace = false
