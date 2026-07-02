@@ -22,6 +22,17 @@ enum BundleVideos {
     }
 }
 
+#if DEBUG
+/// DEBUG-only:App bundle 内 `DebugReplayClips/` 子目录的 DanceTrack 回放测试片
+/// (由 pbxproj 的 `[Debug] Copy Replay Clips` 脚本相位在 Debug 构建时拷入;Release 不拷)。
+enum DebugReplayClips {
+    static func all() -> [URL] {
+        (Bundle.main.urls(forResourcesWithExtension: "mp4", subdirectory: "DebugReplayClips") ?? [])
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+}
+#endif
+
 /// 把外部(相册/文件)选中的视频拷贝到临时目录,避免安全作用域 / 临时 URL 失效后读不到。
 enum TempVideo {
     static func copyIntoTemp(_ src: URL, securityScoped: Bool) -> URL? {
@@ -90,6 +101,7 @@ struct PhotoVideoPicker: UIViewControllerRepresentable {
 struct VideoTrackingPlaybackView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var selectedURL: URL?
+    @State private var isTestClip = false   // 选中的是 DebugReplayClips 测试片 → loop关 + 落盘SUMMARY
     @State private var showPhotoPicker = false
     @State private var importing = false
     @State private var loadError: String?
@@ -98,7 +110,7 @@ struct VideoTrackingPlaybackView: View {
         NavigationView {
             Group {
                 if let url = selectedURL {
-                    PlaybackPlayerView(url: url) { selectedURL = nil }
+                    PlaybackPlayerView(url: url, isTest: isTestClip) { selectedURL = nil }
                 } else {
                     chooser
                 }
@@ -116,6 +128,24 @@ struct VideoTrackingPlaybackView: View {
 
     private var chooser: some View {
         List {
+            #if DEBUG
+            Section("🎬 DanceTrack 回放测试(DEBUG)") {
+                let clips = DebugReplayClips.all()
+                if clips.isEmpty {
+                    Text("DebugReplayClips 为空。跑 ~/Datasets/DanceTrack_subset/_rz.py 生成 mp4 后重 build(Debug 配置)。")
+                        .font(.footnote).foregroundColor(.secondary)
+                } else {
+                    ForEach(clips, id: \.self) { u in
+                        Button {
+                            isTestClip = true; selectedURL = u   // loop关 + 起 ReplayLogger + 落盘SUMMARY
+                        } label: {
+                            Label(u.lastPathComponent, systemImage: "figure.dance")
+                        }
+                    }
+                }
+            }
+            #endif
+
             Section("App Bundle 内置视频") {
                 let vids = BundleVideos.all()
                 if vids.isEmpty {
@@ -125,7 +155,7 @@ struct VideoTrackingPlaybackView: View {
                 } else {
                     ForEach(vids, id: \.self) { u in
                         Button {
-                            selectedURL = u
+                            isTestClip = false; selectedURL = u
                         } label: {
                             Label(u.lastPathComponent, systemImage: "film")
                         }
@@ -154,7 +184,7 @@ struct VideoTrackingPlaybackView: View {
         }
         .sheet(isPresented: $showPhotoPicker) {
             PhotoVideoPicker { url in
-                if let url { selectedURL = url } else { loadError = "无法加载所选相册视频" }
+                if let url { isTestClip = false; selectedURL = url } else { loadError = "无法加载所选相册视频" }
             }
         }
         .fileImporter(isPresented: $importing,
@@ -164,7 +194,7 @@ struct VideoTrackingPlaybackView: View {
             case .success(let urls):
                 if let src = urls.first,
                    let copied = TempVideo.copyIntoTemp(src, securityScoped: true) {
-                    selectedURL = copied
+                    isTestClip = false; selectedURL = copied
                 } else {
                     loadError = "无法读取所选文件"
                 }
@@ -182,18 +212,29 @@ private final class PlaybackModel: ObservableObject {
     let vm: CameraViewModel
     private let source: VideoFileSource
     private var vmRelay: AnyCancellable?
+    let isTest: Bool
+    let totalFrames: Int
+    @Published var finished = false   // 测试片自然播完(loop关)→ 停末帧 + SUMMARY 已落盘
 
     @Published var dropLate: Bool {
         didSet { source.dropLateFrames = dropLate }
     }
 
-    init(url: URL) {
-        // realtime:按 PTS 节流;loop:播完重播;默认开丢帧(模拟器 Vision 慢,先保证实时观感)。
-        let s = VideoFileSource(url: url, realtime: true, loop: true, dropLateFrames: true)
+    init(url: URL, isTest: Bool) {
+        self.isTest = isTest
+        // realtime:按 PTS 节流(2.2 已确认 → clip_5 LOST 计时成立);
+        // 测试片 loop关(播完停末帧 + 出 SUMMARY);普通片 loop开(免"播完黑屏")。默认开丢帧。
+        let s = VideoFileSource(url: url, realtime: true, loop: !isTest, dropLateFrames: true)
         let camVM = CameraViewModel(source: s)
         self.source = s
         self.vm = camVM
         self.dropLate = true   // init 内赋值不触发 didSet,已在上面以同值初始化 source
+
+        // 总帧数(时长 × 名义帧率),供 HUD 显示 f/total(与 VideoFileSource 同一套同步 API)
+        let asset = AVURLAsset(url: url)
+        let dur = CMTimeGetSeconds(asset.duration)
+        let fps = Double(asset.tracks(withMediaType: .video).first?.nominalFrameRate ?? 30)
+        self.totalFrames = (dur.isFinite && fps > 0) ? Int((dur * fps).rounded()) : 0
 
         // 关键:vm 是嵌套的 ObservableObject。SwiftUI 只订阅了本 model(@StateObject),
         // 不会自动收到 vm 的 @Published 更新(processedCGImage/personBox/isTracking/perfHUD),
@@ -202,6 +243,24 @@ private final class PlaybackModel: ObservableObject {
         vmRelay = camVM.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
         }
+
+        #if DEBUG
+        if isTest {
+            // 起日志器:接管 stdout → 落盘 Documents/ReplayLogs + 边写边解析计数
+            ReplayLogger.shared.start(clip: url.deletingPathExtension().lastPathComponent)
+            source.onFinished = { [weak self] in
+                ReplayLogger.shared.stop()   // 写 SUMMARY + 还原 stdout
+                DispatchQueue.main.async { self?.finished = true }
+            }
+        }
+        #endif
+    }
+
+    /// 返回/关闭时调用:确保 stdout 一定被还原(stop 幂等,未 active 时空转)。
+    func teardown() {
+        #if DEBUG
+        ReplayLogger.shared.stop()
+        #endif
     }
 }
 
@@ -213,8 +272,8 @@ private struct PlaybackPlayerView: View {
     @State private var dSel = 0   // 0=off 1=D1 2=D2 3=D3,确诊 lockLargest 按什么选
     #endif
 
-    init(url: URL, onBack: @escaping () -> Void) {
-        _model = StateObject(wrappedValue: PlaybackModel(url: url))
+    init(url: URL, isTest: Bool = false, onBack: @escaping () -> Void) {
+        _model = StateObject(wrappedValue: PlaybackModel(url: url, isTest: isTest))
         self.onBack = onBack
         self.title = url.lastPathComponent
     }
@@ -238,6 +297,22 @@ private struct PlaybackPlayerView: View {
                     .ignoresSafeArea()
 
                 VStack(spacing: 8) {
+                    #if DEBUG
+                    // Part 2.3 第0行:clip 名 + 帧号/总帧 + 回放时间(与 console 日志逐帧对齐;
+                    // 帧号/时间取自 ReplayLogger 解析的 PROBE,follow 为 private 无法直读)。
+                    if model.isTest {
+                        HStack {
+                            Text("🎬 \(title)  f\(ReplayLogger.shared.lastFrame)/\(model.totalFrames)  t=\(String(format: "%.1f", ReplayLogger.shared.lastTime))s"
+                                 + (model.finished ? "  ✓播完·SUMMARY已写ReplayLogs" : ""))
+                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                .foregroundColor(model.finished ? .green : .white)
+                                .lineLimit(1).minimumScaleFactor(0.4)
+                                .padding(.horizontal, 10).padding(.vertical, 5)
+                                .background(.black.opacity(0.6), in: Capsule())
+                            Spacer()
+                        }
+                    }
+                    #endif
                     HStack {
                         Button(action: onBack) {
                             Label("重选", systemImage: "chevron.left")
@@ -370,7 +445,7 @@ private struct PlaybackPlayerView: View {
             .onChange(of: geo.size) { newSize in
                 vm.updateOutputSize(for: newSize)
             }
-            .onDisappear { vm.stop() }
+            .onDisappear { vm.stop(); model.teardown() }   // teardown:还原 stdout(测试片提前返回也不漏)
         }
         .preferredColorScheme(.dark)
     }

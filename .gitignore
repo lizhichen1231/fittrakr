@@ -11,3 +11,7 @@ DerivedData/
 # Large local test media (not source; back up separately if needed)
 FitTrackr.1/TestVideos/
 *.mov
+
+# DanceTrack 回放测试片(DEBUG-only,~245MB,工程外可由 _rz.py 复现,不进 git)
+FitTrackr.1/DebugReplayClips/*.mp4
+DebugReplayClips/
