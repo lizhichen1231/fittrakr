@@ -45,14 +45,7 @@ protocol CameraEngineDelegate: AnyObject {
     // MARK: - Lifecycle
 
     func start() {
-        // 方向通知在主线程开启
-        DispatchQueue.main.async {
-            UIDevice.current.beginGeneratingDeviceOrientationNotifications()
-            NotificationCenter.default.addObserver(self,
-                                                   selector: #selector(self.handleOrientationChange),
-                                                   name: UIDevice.orientationDidChangeNotification,
-                                                   object: nil)
-        }
+        // 任务零:全应用锁死竖屏——已删设备方向通知订阅(采集层 connection 一次性设死 .portrait,不再跟随旋转)
         sessionQueue.async {
             if !self.configured { self.configureSession() }
             if self.isMultiCamActive {
@@ -99,10 +92,7 @@ protocol CameraEngineDelegate: AnyObject {
                 self.session.stopRunning()
             }
         }
-        DispatchQueue.main.async {
-            NotificationCenter.default.removeObserver(self, name: UIDevice.orientationDidChangeNotification, object: nil)
-            UIDevice.current.endGeneratingDeviceOrientationNotifications()
-        }
+        // 任务零:已删设备方向通知退订(不再订阅方向)
     }
 
     deinit { NotificationCenter.default.removeObserver(self) }
@@ -289,20 +279,8 @@ protocol CameraEngineDelegate: AnyObject {
         }
     }
 
-    // MARK: - Orientation
-
-    private func currentVideoOrientation() -> AVCaptureVideoOrientation {
-        switch UIDevice.current.orientation {
-        case .landscapeLeft:        return .landscapeRight
-        case .landscapeRight:       return .landscapeLeft
-        case .portraitUpsideDown:   return .portraitUpsideDown
-        default:                    return .portrait
-        }
-    }
-
-    @objc private func handleOrientationChange() {
-        // 暂时禁用方向变化，避免 ProRes Raw 旋转崩溃
-    }
+    // 任务零:已删 currentVideoOrientation()(读 UIDevice.orientation,死代码,从未被调用)
+    //         + handleOrientationChange()(空 no-op stub)。采集层 connection 一次性设死 .portrait。
 }
 
 // MARK: - 单摄 Delegates
