@@ -430,7 +430,12 @@ extension CameraViewModel {
                            result.fps, follow.dbgRawDtMs, result.msRect, result.msPose, msSkel, msGest, result.msRender, msTotal)
             + " · cf " + _cf + " · " + (follow.dbgZoomSrc.isEmpty ? "—" : follow.dbgZoomSrc)
         perfFrame += 1
-        if perfFrame % 30 == 0 { print("⏱ " + _perf) }
+        if perfFrame % 30 == 0 {
+            print("⏱ " + _perf)
+            #if DEBUG
+            PerfFileLog.shared.line("⏱ " + _perf)   // ②a:同一行落异步文件 → 脱机 Files app 可取
+            #endif
+        }
 
         // 跳变取证:每帧拼一行(poseValid/srcUsed/rectConf/各Δ),console 每帧 print + 最大跳帧冻进 HUD
         var _lockSummary = ""
