@@ -94,7 +94,7 @@ class MultiCamManager: NSObject {
                 return false
             }
             session.addConnection(connection)
-            connection.videoOrientation = .portrait
+            pinConnectionPortrait(connection)   // 竖屏硬钉,不跟随设备
             print("📷 ✅ 广角设置完成")
         } catch {
             print("📷 ❌ 广角设置失败: \(error)")
@@ -135,7 +135,7 @@ class MultiCamManager: NSObject {
                     return true
                 }
                 session.addConnection(connection)
-                connection.videoOrientation = .portrait
+                pinConnectionPortrait(connection)   // 竖屏硬钉,不跟随设备
                 print("📷 ✅ 长焦设置完成")
             } catch {
                 print("📷 ⚠️ 长焦设置失败: \(error)")
@@ -174,7 +174,7 @@ class MultiCamManager: NSObject {
             session.addOutput(wideOutput!)
 
             if let conn = wideOutput?.connection(with: .video) {
-                conn.videoOrientation = .portrait
+                pinConnectionPortrait(conn)   // 竖屏硬钉,不跟随设备
             }
         } catch {
             print("❌ 单摄设置失败: \(error)")

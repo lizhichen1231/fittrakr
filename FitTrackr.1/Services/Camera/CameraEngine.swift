@@ -1,6 +1,18 @@
 import AVFoundation
 import UIKit
 
+/// 竖屏硬钉:把 capture connection 的旋转固定为 portrait,**永不跟随设备物理朝向**。
+/// iOS 17+ 用 videoRotationAngle=90(portrait);videoOrientation 在 iOS 17+ 已废弃,且部分格式下
+/// 根本不 pin → 连接回落到跟随设备 = 正是「横过来画面转 90°」的根因。iOS 16 回退 videoOrientation=.portrait。
+/// 镜像(isVideoMirrored)与本函数无关,各调用点自理。所有 videoDataOutput connection 都必须过这一道。
+func pinConnectionPortrait(_ connection: AVCaptureConnection) {
+    if #available(iOS 17.0, *), connection.isVideoRotationAngleSupported(90) {
+        connection.videoRotationAngle = 90   // 90° = 竖屏(传感器横向原生 → 转正)
+    } else if connection.isVideoOrientationSupported {
+        connection.videoOrientation = .portrait
+    }
+}
+
 protocol CameraEngineDelegate: AnyObject {
     func cameraEngine(_ engine: CameraEngine,
                       didOutputWideFrame: CVPixelBuffer,
@@ -215,9 +227,7 @@ protocol CameraEngineDelegate: AnyObject {
         if let conn = videoOutput.connection(with: .video) {
             sysStabilizer.applyPreview(feel: .normal, to: conn)
             if conn.isVideoMirroringSupported { conn.isVideoMirrored = usingFront }
-            if conn.isVideoOrientationSupported {
-                conn.videoOrientation = .portrait
-            }
+            pinConnectionPortrait(conn)   // 竖屏硬钉(iOS17+ videoRotationAngle=90),不跟随设备
         }
 
         session.commitConfiguration()
