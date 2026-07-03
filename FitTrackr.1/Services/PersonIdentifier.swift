@@ -612,24 +612,43 @@ final class PersonIdentifier {
 
     // 刀3:已删 VNTrackObject 全部机制(startTracking / continueTracking 定义)——SEARCHING 不再有 track 兜底。
 
+    // MARK: - ① pose 去重(帧级缓存)
+
+    /// 帧级 pose 缓存:key = 帧 pts,帧入口 beginFramePose 重建,不跨帧持有 observations。
+    /// 同帧的 gate(detectAllPersons)/诊断(detectAllPersonsWithConf)/Step B(detectPose)三处共用,
+    /// 把原来同帧同 detPB 的 3× VNDetectHumanBodyPose 收敛成 1×。
+    private var poseCachePts: CMTime = .invalid
+    private var poseCacheObs: [VNHumanBodyPoseObservation] = []
+
+    /// 帧入口:本帧只跑一次 VNDetectHumanBodyPose。pts 命中直接返回(不重复检测);
+    /// pts 变即重建(旧 observations 被整体替换 → 不跨帧持有)。检测在 detPB,orientation 恒 .up
+    /// (与原 detectPersonsViaPose / Step B detectPose 两处完全一致,VNDetectHumanBodyPoseRequest 均为默认)。
+    func beginFramePose(pb: CVPixelBuffer, pts: CMTime) {
+        if CMTimeCompare(poseCachePts, pts) == 0 { return }   // 命中:本帧已检测过
+        let request = VNDetectHumanBodyPoseRequest()
+        let handler = VNImageRequestHandler(cvPixelBuffer: pb, orientation: .up, options: [:])
+        do { try handler.perform([request]); poseCacheObs = request.results ?? [] }
+        catch { poseCacheObs = [] }
+        poseCachePts = pts
+        #if DEBUG
+        print("👁VNPose[帧检1次] count=\(poseCacheObs.count) 输入=\(CVPixelBufferGetWidth(pb))x\(CVPixelBufferGetHeight(pb))")
+        #endif
+    }
+
+    /// 读本帧缓存的 pose observations(Step B detectPose 复用,不再自跑检测)。
+    func cachedPoseObservations() -> [VNHumanBodyPoseObservation] { poseCacheObs }
+
     // MARK: - 特征提取
 
-    /// 多人候选源:VNDetectHumanBodyPose(召回多人,矩形召回弱只出1)。每 pose → tightBox(wide 空间)。
-    /// 坐标约定与 PersonTracker.getTightBoxFromPose 完全一致:顶左原点,y=(1-maxY)*h,8% padding。
+    /// 多人候选源:**复用**本帧缓存的 VNDetectHumanBodyPose observations(① 前是每次自跑一遍)。
+    /// 每 pose → tightBox(wide 空间)。坐标约定与 PersonTracker.getTightBoxFromPose 完全一致。
     private func detectPersonsViaPose(in pixelBuffer: CVPixelBuffer,
                                       sensorSize: CGSize) -> [(box: CGRect, conf: Float)] {
-        let request = VNDetectHumanBodyPoseRequest()
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
-        do { try handler.perform([request]) } catch { return [] }
-        guard let results = request.results else { return [] }
-        let boxes: [(box: CGRect, conf: Float)] = results.compactMap { obs in
+        // ① pose 去重:不再自跑检测,读帧入口 beginFramePose 缓存的 observations(pixelBuffer 仅保签名兼容)
+        return poseCacheObs.compactMap { obs in
             guard let box = Self.tightBox(from: obs, sensorSize: sensorSize) else { return nil }
             return (box, obs.confidence)
         }
-        #if DEBUG
-        print("👁VNPose候选 results.count=\(results.count) 有效box=\(boxes.count) 输入=\(CVPixelBufferGetWidth(pixelBuffer))x\(CVPixelBufferGetHeight(pixelBuffer))")
-        #endif
-        return boxes
     }
 
     /// 单个 pose → 紧贴 bounding box(wide 传感器坐标)。与 getTightBoxFromPose 同逻辑,sensorSize 版。

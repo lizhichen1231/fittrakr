@@ -358,7 +358,7 @@ final class TrackingController {
         r.upperBodyOnly = false
         return r
     }()
-    let poseRequest = VNDetectHumanBodyPoseRequest()
+    // ① pose 去重:原 poseRequest 已删——Step B detectPose 改读 PersonIdentifier 的帧级缓存,不再自跑。
 
     // 初始化时创建滤波器
     init() {
@@ -552,6 +552,9 @@ final class TrackingController {
             // 未锁定/没找到则内部回退 detectHumanRectFallback(与卡0一致)。返回类型 (CGRect, conf) 不变 → 下游不动。
             var rectDetected = false
             let _tRect = CACurrentMediaTime()
+            // ① pose 去重:帧入口只跑一次 VNDetectHumanBodyPose,缓存 observations 供 Step A(gate/诊断)
+            // + Step B(骨骼)共用 → 消除同帧同 detPB 的 3× 重复检测。放在 _tRect 后 → 这唯一一次检测计入 rect。
+            PersonIdentifier.shared.beginFramePose(pb: detPB, pts: pts)
             // searchMode:仅 .searching 时开(rect 并源 + 单人降门找回);其余状态用常规严格匹配
             let _searchMode: Bool = { if case .searching = lockState { return true }; return false }()
             let _rectResult = detectHuman(pb: detPB, wide: wideFrame, dt: dt, searchMode: _searchMode)

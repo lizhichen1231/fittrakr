@@ -12,21 +12,18 @@ extension TrackingController {
     /// matchingBox 非 nil(锁定中)→ 返回 tightBox 中心最接近它的 pose(= 锁定的你),而非第一个;
     /// nil(未锁定)→ 返回第一个(现行为不变)。这是「多人锁定接到 zoom/构图」的最后一接。
     func detectPose(pb: CVPixelBuffer, matchingBox: CGRect? = nil) -> VNHumanBodyPoseObservation? {
-        let handler = VNImageRequestHandler(cvPixelBuffer: pb, orientation: .up, options: [:])
-        do {
-            try handler.perform([poseRequest])
-            guard let results = poseRequest.results, !results.isEmpty else { return nil }
-            #if DEBUG
-            print("👁VNPose results.count=\(results.count) 输入=\(CVPixelBufferGetWidth(pb))x\(CVPixelBufferGetHeight(pb)) matched=\(matchingBox != nil)")
-            #endif
-            // 锁定 + 多人:选 tightBox 中心最接近锁定框的 pose(= 你),爹的 pose 不再喂 zoom/锚点
-            guard let target = matchingBox, results.count > 1 else { return results.first }
-            let tc = CGPoint(x: target.midX, y: target.midY)
-            return results.min { a, b in
-                poseCenterDist(a, to: tc) < poseCenterDist(b, to: tc)
-            }
-        } catch {
-            return nil
+        // ① pose 去重:读帧入口 beginFramePose 缓存的 observations(历史行为=全幅 detPB perform + 事后选框,
+        // 从不对裁剪区检测 → 改读全幅缓存语义完全一致);选框逻辑照旧。pb 仅保签名兼容。
+        let results = PersonIdentifier.shared.cachedPoseObservations()
+        guard !results.isEmpty else { return nil }
+        #if DEBUG
+        print("👁VNPose[复用] count=\(results.count) matched=\(matchingBox != nil)")
+        #endif
+        // 锁定 + 多人:选 tightBox 中心最接近锁定框的 pose(= 你),爹的 pose 不再喂 zoom/锚点
+        guard let target = matchingBox, results.count > 1 else { return results.first }
+        let tc = CGPoint(x: target.midX, y: target.midY)
+        return results.min { a, b in
+            poseCenterDist(a, to: tc) < poseCenterDist(b, to: tc)
         }
     }
 
@@ -280,7 +277,7 @@ extension TrackingController {
             dbgTrkHUD = PersonIdentifier.shared.dbgTrkLine()   // 卡3:锁谁/状态/找回@(取自已有状态)
             // 折进 PROBE 的锁定概要:当前锁框 + 是否全帧最大(复检一次全帧候选,仅 DEBUG 锁定时)
             PersonIdentifier.shared.dbgCurrentBox = r?.box
-            let cands = PersonIdentifier.shared.detectAllPersonsWithConf(in: pb, sensorSize: sensorSize)
+            let cands = PersonIdentifier.shared.detectAllPersonsWithConf(in: pb, sensorSize: sensorSize)  // ① 后:读帧缓存,不再自跑 pose
             PersonIdentifier.shared.dbgCandCount = cands.count
             if let b = r?.box {
                 let a = b.width * b.height
