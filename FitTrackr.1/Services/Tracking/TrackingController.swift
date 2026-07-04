@@ -143,6 +143,9 @@ final class TrackingController {
     }
     var lockState: LockState = .unlocked
     let searchTimeoutSec: TimeInterval = 4.0
+    // ⑤ 找回冷却(旋转门另一半):searching→locked 后此时长内禁止再进 SEARCHING(简单计时器;StateDebouncer 仍冻结,不建)
+    let reacqCooldownSec: TimeInterval = 2.0
+    private var reacqLockedAt: TimeInterval = -100   // 上次「找回成功」时刻;-100 = 初始不在冷却
     #if DEBUG
     var dbgStateEvent = ""     // 最近一次事件缩写(保持 3s)
     var dbgStateEventUntil: TimeInterval = 0
@@ -759,6 +762,7 @@ final class TrackingController {
             let wasSearching: Bool = { if case .searching = lockState { return true }; return false }()
             let wasUnlocked = (lockState == .unlocked)
             lockState = .locked
+            if wasSearching { reacqLockedAt = now }   // ⑤:记找回时刻,开启 2s 找回冷却(旋转门另一半)
             #if DEBUG
             let pi = PersonIdentifier.shared
             if wasSearching {
@@ -797,6 +801,15 @@ final class TrackingController {
                     #endif
                 }
             case .locked:
+                // ⑤ 找回冷却:刚找回 <reacqCooldownSec 内,禁止再进 SEARCHING → 保持 locked 冻结(coast),旋转门关闭
+                if now - reacqLockedAt < reacqCooldownSec {
+                    #if DEBUG
+                    if frameCount % 30 == 0 {
+                        print(String(format: "🔒 REACQ-COOLDOWN 保持 locked(距上次找回 %.1fs<%.0fs,不进 searching)", now - reacqLockedAt, reacqCooldownSec))
+                    }
+                    #endif
+                    break
+                }
                 lockState = .searching(since: now)
                 #if DEBUG
                 dbgSearchCandSeen = PersonIdentifier.shared.lastCandidateCount   // 新一轮 searching 起点
