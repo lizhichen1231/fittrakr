@@ -41,6 +41,20 @@ struct CameraScreen: View {
                     .padding(.horizontal, 16)
                     .padding(.top, 60)
 
+                    #if DEBUG
+                    // FPS 测量行:DEBUG 始终显示,不依赖眼睛开关 → 凉机脱离 Xcode 也能直接读 FPS/rect/pose/tot
+                    HStack {
+                        Text(vm.perfMini)
+                            .font(.system(size: 13, weight: .bold, design: .monospaced))
+                            .foregroundColor(.yellow)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 4)
+                            .background(.black.opacity(0.55), in: Capsule())
+                        Spacer()
+                    }
+                    .padding(.horizontal, 16)
+                    #endif
+
                     // 整合诊断行(调试):默认不显示,眼睛开关(showDebugOverlay)打开才出 → 正式画面干净
                     if vm.showDebugOverlay {
                         HStack {

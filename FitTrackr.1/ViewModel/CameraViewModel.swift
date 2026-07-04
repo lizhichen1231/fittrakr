@@ -25,6 +25,7 @@ final class CameraViewModel: NSObject, ObservableObject {
     @Published var isTracking = false
     @Published var trackingInfo: String = ""
     @Published var perfHUD: String = ""        // 性能 HUD：阶段耗时 + 实际 FPS
+    @Published var perfMini: String = ""       // FPS 测量专用精简行(FPS/rect/tot),DEBUG 始终显示,凉机脱机直接读
     private var perfFrame = 0
 
     // Debug overlay 总开关(默认关):眼睛图标切它;同时驱动 DebugOverlayView 与 CameraScreen 的死区显隐
@@ -429,6 +430,8 @@ extension CameraViewModel {
         let _perf = String(format: "FPS %.0f · dt %.0f · rect %.0f pose %.0f skel %.0f gest %.0f rend %.0f · tot %.0f ms",
                            result.fps, follow.dbgRawDtMs, result.msRect, result.msPose, msSkel, msGest, result.msRender, msTotal)
             + " · cf " + _cf + " · " + (follow.dbgZoomSrc.isEmpty ? "—" : follow.dbgZoomSrc)
+        let _perfMini = String(format: "FPS %.0f · rect %.1f · pose %.1f · tot %.1f ms",
+                               result.fps, result.msRect, result.msPose, msTotal)
         perfFrame += 1
         if perfFrame % 30 == 0 {
             print("⏱ " + _perf)
@@ -457,6 +460,7 @@ extension CameraViewModel {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             self.perfHUD = _perf
+            self.perfMini = _perfMini
             if _probeJump > self.probeJumpThreshold {   // 最近一次显著跳变那一帧,冻结给真机直接读
                 self.probeHUD = _probe
             }
