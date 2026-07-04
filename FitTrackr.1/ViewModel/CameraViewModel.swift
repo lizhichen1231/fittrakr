@@ -430,8 +430,10 @@ extension CameraViewModel {
         let _perf = String(format: "FPS %.0f · dt %.0f · rect %.0f pose %.0f skel %.0f gest %.0f rend %.0f · tot %.0f ms",
                            result.fps, follow.dbgRawDtMs, result.msRect, result.msPose, msSkel, msGest, result.msRender, msTotal)
             + " · cf " + _cf + " · " + (follow.dbgZoomSrc.isEmpty ? "—" : follow.dbgZoomSrc)
-        let _perfMini = String(format: "FPS %.0f · rect %.1f · pose %.1f · tot %.1f ms",
-                               result.fps, result.msRect, result.msPose, msTotal)
+        let _bufW = CVPixelBufferGetWidth(wideFrame), _bufH = CVPixelBufferGetHeight(wideFrame)
+        let _perfMini = String(format: "FPS %.0f r%.1f p%.1f t%.1f · buf %dx%d %@",
+                               result.fps, result.msRect, result.msPose, msTotal,
+                               _bufW, _bufH, _bufW > _bufH ? "横!" : "竖")
         perfFrame += 1
         if perfFrame % 30 == 0 {
             print("⏱ " + _perf)
