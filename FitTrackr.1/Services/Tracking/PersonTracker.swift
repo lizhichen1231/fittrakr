@@ -17,7 +17,7 @@ extension TrackingController {
         let results = PersonIdentifier.shared.cachedPoseObservations()
         guard !results.isEmpty else { return nil }
         #if DEBUG
-        print("👁VNPose[复用] count=\(results.count) matched=\(matchingBox != nil)")
+        DebugLog.frame("👁VNPose[复用] count=\(results.count) matched=\(matchingBox != nil)")
         #endif
         // 锁定 + 多人:选 tightBox 中心最接近锁定框的 pose(= 你),爹的 pose 不再喂 zoom/锚点
         guard let target = matchingBox, results.count > 1 else { return results.first }

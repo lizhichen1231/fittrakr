@@ -74,7 +74,8 @@ final class ReplayLogger {
         // 接管 stdout:保存原 fd,重定向到 pipe
         let p = Pipe()
         origStdout = dup(STDOUT_FILENO)
-        setvbuf(stdout, nil, _IONBF, 0)   // 关缓冲,print 立即进 pipe
+        // ③:去掉 setvbuf(_IONBF)——原来关缓冲=每条 print 立即 flush,拖慢全体 print。
+        // 恢复块缓冲(默认);stop() 的 fflush(stdout) 兜住尾部,解析/落盘不丢行。
         dup2(p.fileHandleForWriting.fileDescriptor, STDOUT_FILENO)
         p.fileHandleForReading.readabilityHandler = { [weak self] h in
             guard let self = self else { return }

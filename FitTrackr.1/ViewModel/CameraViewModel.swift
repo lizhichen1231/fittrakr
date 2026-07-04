@@ -455,7 +455,7 @@ extension CameraViewModel {
                             Double(follow.dbgRectConf), Double(follow.dbgAnchorDelta),
                             Double(follow.dbgRatioDelta), Double(follow.dbgRectBoxDelta),
                             _lockSummary)
-        print(_probe)
+        DebugLog.frame(_probe)   // ②b:每帧 PROBE 收编到 verbosity 闸(回放期 ReplayLogger 仍解析)
         let _probeJump = max(follow.dbgAnchorDelta, follow.dbgRectBoxDelta)
 
         // 4) UI / 录制

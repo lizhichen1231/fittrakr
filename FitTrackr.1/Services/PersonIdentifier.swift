@@ -265,7 +265,7 @@ final class PersonIdentifier {
                               currentBox.width * currentBox.height / fa, Double(dbgLockMomentAreaFrac), drift,
                               cx - dbgLockMomentCenter.x, cy - dbgLockMomentCenter.y,
                               nearA / fa, nearIsLargest ? "Y" : "N", verdict)
-        print(dbgDriftLine)
+        DebugLog.frame(dbgDriftLine)   // ②b:每帧 DRIFT 诊断收编到 verbosity 闸
     }
     #endif
 
@@ -386,7 +386,7 @@ final class PersonIdentifier {
             #if DEBUG
             // 坐实 #4:每个 match 候选都覆盖 lastCenter。打:中心 + 综合分 + 色彩基准空否(verify 是否生效)。
             // 第一次若 bins=0 → 色彩项跳过 → 别人也 match → lastCenter 被别人覆盖 → 漂。
-            print(String(format: "  isTarget候选 中心=(%.2f,%.2f) 综合分=%.2f 色彩基准=%@ → lastCenter改成此候选",
+            DebugLog.frame(String(format: "  isTarget候选 中心=(%.2f,%.2f) 综合分=%.2f 色彩基准=%@ → lastCenter改成此候选",
                          personCenter.x, personCenter.y, finalScore,
                          (target.colorHistogram.isEmpty && target.lowerBodyColorHist.isEmpty) ? "★空!verify失效" : "有(上\(target.colorHistogram.count)/下\(target.lowerBodyColorHist.count)bins)"))
             #endif
@@ -631,7 +631,7 @@ final class PersonIdentifier {
         catch { poseCacheObs = [] }
         poseCachePts = pts
         #if DEBUG
-        print("👁VNPose[帧检1次] count=\(poseCacheObs.count) 输入=\(CVPixelBufferGetWidth(pb))x\(CVPixelBufferGetHeight(pb))")
+        DebugLog.frame("👁VNPose[帧检1次] count=\(poseCacheObs.count) 输入=\(CVPixelBufferGetWidth(pb))x\(CVPixelBufferGetHeight(pb))")
         #endif
     }
 
