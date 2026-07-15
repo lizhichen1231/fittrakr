@@ -424,47 +424,61 @@ extension CameraViewModel {
         }
         let msGest = (CACurrentMediaTime() - _tGest) * 1000
         let msTotal = (CACurrentMediaTime() - _tFrame) * 1000
-        let _cf = String(format: "sh %.2f/%.2f hp %.2f/%.2f",
-                         Double(follow.dbgCfLsh), Double(follow.dbgCfRsh),
-                         Double(follow.dbgCfLhp), Double(follow.dbgCfRhp))
-        let _perf = String(format: "FPS %.0f · dt %.0f · rect %.0f pose %.0f skel %.0f gest %.0f rend %.0f · tot %.0f ms",
+        // 刀0:观测者门控。诊断串每帧无条件构造是白烧(拖真实 FPS,Release 也烧)。
+        //  - ⏱ 行(console+文件,每30帧):保留 → _perf 仅 need30 或 HUD 开时构造;
+        //  - perfMini / probe / lockSummary(HUD 串):仅眼睛开关(showDebugOverlay)开时构造,关时零 String 开销。
+        perfFrame += 1
+        let _need30 = (perfFrame % 30 == 0)
+        let _diagOn = showDebugOverlay
+
+        var _perf = ""
+        if _need30 || _diagOn {
+            let _cf = String(format: "sh %.2f/%.2f hp %.2f/%.2f",
+                             Double(follow.dbgCfLsh), Double(follow.dbgCfRsh),
+                             Double(follow.dbgCfLhp), Double(follow.dbgCfRhp))
+            _perf = String(format: "FPS %.0f · dt %.0f · rect %.0f pose %.0f skel %.0f gest %.0f rend %.0f · tot %.0f ms",
                            result.fps, follow.dbgRawDtMs, result.msRect, result.msPose, msSkel, msGest, result.msRender, msTotal)
-            + " · cf " + _cf + " · " + (follow.dbgZoomSrc.isEmpty ? "—" : follow.dbgZoomSrc)
+                + " · cf " + _cf + " · " + (follow.dbgZoomSrc.isEmpty ? "—" : follow.dbgZoomSrc)
+        }
+        if _need30 {
+            print("⏱ " + _perf)
+            #if DEBUG
+            PerfFileLog.shared.line("⏱ " + _perf)   // ②a:脱机 Files app 可取(保留)
+            #endif
+        }
+
+        // 刀0 修订:perfMini(FPS/rect/tot/buf,单条轻串)常显 → 随时屏读 FPS 验证;probe/lockSummary(重)仍闸。
         let _bufW = CVPixelBufferGetWidth(wideFrame), _bufH = CVPixelBufferGetHeight(wideFrame)
         let _perfMini = String(format: "FPS %.0f r%.1f p%.1f t%.1f · buf %dx%d %@",
                                result.fps, result.msRect, result.msPose, msTotal,
                                _bufW, _bufH, _bufW > _bufH ? "横!" : "竖")
-        perfFrame += 1
-        if perfFrame % 30 == 0 {
-            print("⏱ " + _perf)
+        var _probe = ""
+        var _probeJump: CGFloat = 0
+        if _diagOn {
+            var _lockSummary = ""
             #if DEBUG
-            PerfFileLog.shared.line("⏱ " + _perf)   // ②a:同一行落异步文件 → 脱机 Files app 可取
+            _lockSummary = PersonIdentifier.shared.dbgLockSummary(sensorSize: CGSize(width: _bufW, height: _bufH))
             #endif
-        }
-
-        // 跳变取证:每帧拼一行(poseValid/srcUsed/rectConf/各Δ),console 每帧 print + 最大跳帧冻进 HUD
-        var _lockSummary = ""
-        #if DEBUG
-        let _sensorSize = CGSize(width: CVPixelBufferGetWidth(wideFrame), height: CVPixelBufferGetHeight(wideFrame))
-        _lockSummary = PersonIdentifier.shared.dbgLockSummary(sensorSize: _sensorSize)
-        #endif
-        let _probe = String(format: "PROBE t=%.2f f=%d poseValid=%@ srcUsed=%@ rectConf=%.2f anchorΔ=%.3f ratioΔ=%.3f rectBoxΔ=%.3f | %@",
+            _probe = String(format: "PROBE t=%.2f f=%d poseValid=%@ srcUsed=%@ rectConf=%.2f anchorΔ=%.3f ratioΔ=%.3f rectBoxΔ=%.3f | %@",
                             pts.seconds, follow.frameCount,
                             follow.dbgPoseValid ? "T" : "F",
                             follow.dbgZoomSrc.isEmpty ? "—" : follow.dbgZoomSrc,
                             Double(follow.dbgRectConf), Double(follow.dbgAnchorDelta),
                             Double(follow.dbgRatioDelta), Double(follow.dbgRectBoxDelta),
                             _lockSummary)
-        DebugLog.frame(_probe)   // ②b:每帧 PROBE 收编到 verbosity 闸(回放期 ReplayLogger 仍解析)
-        let _probeJump = max(follow.dbgAnchorDelta, follow.dbgRectBoxDelta)
+            DebugLog.frame(_probe)   // ②b:回放期 ReplayLogger 仍解析(闸内)
+            _probeJump = max(follow.dbgAnchorDelta, follow.dbgRectBoxDelta)
+        }
 
         // 4) UI / 录制
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            self.perfHUD = _perf
-            self.perfMini = _perfMini
-            if _probeJump > self.probeJumpThreshold {   // 最近一次显著跳变那一帧,冻结给真机直接读
-                self.probeHUD = _probe
+            self.perfMini = _perfMini   // 刀0 修订:FPS 行常显(轻串),不受眼睛开关 → 随时读
+            if _diagOn {   // 重 HUD 串(perfHUD/probe)仅眼睛开关开时刷(其余 UI:personBox/预览照常)
+                self.perfHUD = _perf
+                if _probeJump > self.probeJumpThreshold {   // 最近一次显著跳变那一帧,冻结给真机直接读
+                    self.probeHUD = _probe
+                }
             }
             // 一次性:捕获配置就绪后填一次(静态量,启动后几帧内可用)
             if self.captureConfigHUD.isEmpty, !CameraEngine.lastCaptureConfig.isEmpty {
