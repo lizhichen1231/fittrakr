@@ -450,17 +450,16 @@ extension CameraViewModel {
             #endif
         }
 
-        // 刀0 修订:perfMini(FPS/rect/tot/buf,单条轻串)常显 → 随时屏读 FPS 验证;probe/lockSummary(重)仍闸。
-        let _bufW = CVPixelBufferGetWidth(wideFrame), _bufH = CVPixelBufferGetHeight(wideFrame)
-        let _perfMini = String(format: "FPS %.0f r%.1f p%.1f t%.1f · buf %dx%d %@",
-                               result.fps, result.msRect, result.msPose, msTotal,
-                               _bufW, _bufH, _bufW > _bufH ? "横!" : "竖")
+        // perfMini(FPS/rect/pose/tot,单条轻串)常显供随时屏读;probe/lockSummary(重)仍闸。
+        // (横屏诊断 buf 横/竖 已撤——横屏 bug 已在 ef8053b 钉死。)
+        let _perfMini = String(format: "FPS %.0f r%.1f p%.1f t%.1f ms",
+                               result.fps, result.msRect, result.msPose, msTotal)
         var _probe = ""
         var _probeJump: CGFloat = 0
         if _diagOn {
             var _lockSummary = ""
             #if DEBUG
-            _lockSummary = PersonIdentifier.shared.dbgLockSummary(sensorSize: CGSize(width: _bufW, height: _bufH))
+            _lockSummary = PersonIdentifier.shared.dbgLockSummary(sensorSize: CGSize(width: CVPixelBufferGetWidth(wideFrame), height: CVPixelBufferGetHeight(wideFrame)))
             #endif
             _probe = String(format: "PROBE t=%.2f f=%d poseValid=%@ srcUsed=%@ rectConf=%.2f anchorΔ=%.3f ratioΔ=%.3f rectBoxΔ=%.3f | %@",
                             pts.seconds, follow.frameCount,
