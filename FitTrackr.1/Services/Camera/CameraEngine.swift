@@ -392,5 +392,10 @@ extension CameraEngine {
 
         let gdc = device.isGeometricDistortionCorrectionSupported ? device.isGeometricDistortionCorrectionEnabled : false
         print("✅ Using: \(device.localizedName) | type=\(device.deviceType.rawValue) | zoom=\(device.videoZoomFactor) | GDC=\(gdc)")
+
+        // 横屏真凶:超广角切换 removeInput/addInput 后是**新连接,从未 pin** → 跟设备转。这里补钉竖屏(与单摄同一道)。
+        if let conn = videoOutput.connection(with: .video) {
+            pinConnectionPortrait(conn)
+        }
     }
 }
