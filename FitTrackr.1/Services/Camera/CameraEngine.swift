@@ -66,6 +66,9 @@ protocol CameraEngineDelegate: AnyObject {
     // MARK: - Lifecycle
 
     func start() {
+        #if DEBUG
+        LensReconProbe.dumpDualWide()   // 【查勘#2 Q2 探针】用完即撤(probe/lens-recon)
+        #endif
         // 任务零:全应用锁死竖屏——已删设备方向通知订阅(采集层 connection 一次性设死 .portrait,不再跟随旋转)
         sessionQueue.async {
             if !self.configured { self.configureSession() }
