@@ -14,6 +14,7 @@ struct FollowResult {
     let cropRect: CGRect
     let previewCG: CGImage?
     let ciScaled: CIImage?
+    var previewPB: CVPixelBuffer? = nil   // 刀1:录制中 renderCrop 直渲的 CVPixelBuffer(供 Recorder 直吃,替软 blit)
     let pts: CMTime
     let sensorSize: CGSize
     // 阶段计时（ms），供 HUD/日志显示
@@ -733,7 +734,7 @@ final class TrackingController {
         }
 
         let _tRender = CACurrentMediaTime()
-        let (cg, ciScaled) = renderCrop(from: frameToUse, crop: cropForRender)
+        let (cg, ciScaled, recPB) = renderCrop(from: frameToUse, crop: cropForRender)
         msRender = (CACurrentMediaTime() - _tRender) * 1000
 
         let fps = dt > 0 ? 1.0/dt : 0
@@ -742,7 +743,7 @@ final class TrackingController {
             fps: fps, zoom: zoom, confidence: confidence,
             rawBox: rawBox,
             stableBox: smoothedTightBox ?? stableBox,
-            cropRect: cropForRender, previewCG: cg, ciScaled: ciScaled,
+            cropRect: cropForRender, previewCG: cg, ciScaled: ciScaled, previewPB: recPB,
             pts: pts, sensorSize: CGSize(width: sensorW, height: sensorH),
             msRect: msRect, msPose: msPose, msRender: msRender
         )
@@ -925,7 +926,33 @@ final class TrackingController {
     }
 
     // MARK: - 渲染
-    func renderCrop(from pixelBuffer: CVPixelBuffer, crop: CGRect) -> (CGImage?, CIImage?) {
+    // 刀1:录制开关(CameraViewModel 起停录制时置);仅录制中才多渲一份 CVPixelBuffer,非录制零新增。
+    var isRecordingActive = false
+    // 刀1:录制用像素缓冲池(outputSize 变即重建)。renderCrop 直渲进池 buffer,Recorder 直吃,免 CGContext.draw 软 blit。
+    private var recPool: CVPixelBufferPool?
+    private var recPoolSize: CGSize = .zero
+    private func dequeueRecPixelBuffer() -> CVPixelBuffer? {
+        let target = cfg.outputSize
+        if recPool == nil || recPoolSize != target {
+            let attrs: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: Int(target.width),
+                kCVPixelBufferHeightKey as String: Int(target.height),
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+                kCVPixelBufferCGImageCompatibilityKey as String: true
+            ]
+            var pool: CVPixelBufferPool?
+            CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &pool)
+            recPool = pool
+            recPoolSize = target
+        }
+        guard let pool = recPool else { return nil }
+        var pb: CVPixelBuffer?
+        CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pb)
+        return pb
+    }
+
+    func renderCrop(from pixelBuffer: CVPixelBuffer, crop: CGRect) -> (CGImage?, CIImage?, CVPixelBuffer?) {
         let ciSrc = CIImage(cvPixelBuffer: pixelBuffer)
         let ciCrop = CGRect(x: crop.minX,
                             y: sensorH - crop.maxY,
@@ -935,21 +962,30 @@ final class TrackingController {
         let ciBounds = CGRect(x: 0, y: 0, width: sensorW, height: sensorH)
         let capped = ciCrop.intersection(ciBounds)
 
+        // 统一算出 scaled(两分支),下方公共尾:显示 createCGImage(不变)+ 录制时渲 pixelBuffer。
+        let scaled: CIImage
         if capped.isNull || capped.width < 4 || capped.height < 4 {
             let sx = cfg.outputSize.width  / sensorW
             let sy = cfg.outputSize.height / sensorH
-            let scaled = ciSrc.transformed(by: CGAffineTransform(scaleX: sx, y: sy))
-            let cg = ciContext.createCGImage(scaled, from: CGRect(origin: .zero, size: cfg.outputSize))
-            return (cg, scaled)
+            scaled = ciSrc.transformed(by: CGAffineTransform(scaleX: sx, y: sy))
+        } else {
+            let cropped = ciSrc.cropped(to: capped)
+            let moved   = cropped.transformed(by: CGAffineTransform(translationX: -capped.origin.x, y: -capped.origin.y))
+            let sx = cfg.outputSize.width  / capped.width
+            let sy = cfg.outputSize.height / capped.height
+            scaled = moved.transformed(by: CGAffineTransform(scaleX: sx, y: sy))
         }
 
-        let cropped = ciSrc.cropped(to: capped)
-        let moved   = cropped.transformed(by: CGAffineTransform(translationX: -capped.origin.x, y: -capped.origin.y))
-        let sx = cfg.outputSize.width  / capped.width
-        let sy = cfg.outputSize.height / capped.height
-        let scaled = moved.transformed(by: CGAffineTransform(scaleX: sx, y: sy))
-        let cg = ciContext.createCGImage(scaled, from: CGRect(origin: .zero, size: cfg.outputSize))
-        return (cg, scaled)
+        let outRect = CGRect(origin: .zero, size: cfg.outputSize)
+        let cg = ciContext.createCGImage(scaled, from: outRect)   // 显示:不变(非录制路径 100% 同旧)
+
+        // 刀1:仅录制中额外渲一份 CVPixelBuffer(GPU render,无 CPU 回读)。非录制 recPB=nil,零新增开销。
+        var recPB: CVPixelBuffer? = nil
+        if isRecordingActive, let pb = dequeueRecPixelBuffer() {
+            ciContext.render(scaled, to: pb, bounds: outRect, colorSpace: CGColorSpaceCreateDeviceRGB())
+            recPB = pb
+        }
+        return (cg, scaled, recPB)
     }
 
     // MARK: - Helpers

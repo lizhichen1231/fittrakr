@@ -7,6 +7,7 @@ protocol Recorder {
     var isRecording: Bool { get }
     func start(size: CGSize)
     func appendVideo(cgImage: CGImage, at pts: CMTime)
+    func appendVideo(pixelBuffer: CVPixelBuffer, at pts: CMTime)   // 刀1:直吃 pixelBuffer,免软 blit
     func appendAudio(_ sampleBuffer: CMSampleBuffer)
     func stopAndSave(_ completion: @escaping (Bool)->Void)
 }
@@ -96,6 +97,21 @@ final class AVWriterRecorder: NSObject, Recorder, AVCaptureAudioDataOutputSample
         recordQueue.async { [weak self] in self?._appendVideo(cgImage: cgImage, at: pts) }
     }
 
+    // 刀1:直吃 renderCrop 渲好的 CVPixelBuffer → adaptor.append,免 CGContext.draw 软 blit + fill(录制掉帧主因)。
+    func appendVideo(pixelBuffer: CVPixelBuffer, at pts: CMTime) {
+        guard isRecording else { return }
+        recordQueue.async { [weak self] in self?._appendVideo(pixelBuffer: pixelBuffer, at: pts) }
+    }
+    private func _appendVideo(pixelBuffer: CVPixelBuffer, at pts: CMTime) {
+        guard isRecording, let vInput = vInput, let adaptor = adaptor else { return }
+        guard vInput.isReadyForMoreMediaData else { return }
+        if videoBasePTS == nil { videoBasePTS = pts }
+        var relPTS = CMTimeSubtract(pts, videoBasePTS!)
+        relPTS = CMTimeConvertScale(relPTS, timescale: timescale, method: .default)
+        _ = adaptor.append(pixelBuffer, withPresentationTime: relPTS)   // 直吃,零 CPU blit
+    }
+
+    // 兜底路径(仅 pb 缺失=池创建失败等异常时走):CGImage → CGContext.draw 软 blit,保录制不断。
     private func _appendVideo(cgImage: CGImage, at pts: CMTime) {
         guard isRecording, let vInput = vInput, let adaptor = adaptor else { return }
         guard vInput.isReadyForMoreMediaData else { return }

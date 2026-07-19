@@ -181,11 +181,13 @@ final class CameraViewModel: NSObject, ObservableObject {
         guard processedCGImage != nil || videoSize != .zero else { return }
         recorder.start(size: lastOutputSize)
         isRecording = true
+        follow.isRecordingActive = true   // 刀1:开录 → renderCrop 开始多渲 CVPixelBuffer 供 Recorder 直吃
         // 解耦:录制不碰锁。锁是常态(自动锁定一直在你身上),录制只管存不存视频,不重锁/不改锁。
         startTimer()
     }
     private func stopRecord() {
         isRecording = false
+        follow.isRecordingActive = false   // 刀1:停录 → renderCrop 不再多渲 pixelBuffer(回到零新增)
         stopTimer()
         // 解耦:停录【不】解锁,锁原样保持在你身上(不再 unlock 后靠自动重锁救场)。
         recorder.stopAndSave { ok in
@@ -524,9 +526,14 @@ extension CameraViewModel {
             }
             #endif
 
-            if self.isRecording, let cg = result.previewCG {
-                // 去冗余:录制直接拿 tracking 已渲好的 CGImage(预览同款),不再重渲 ciScaled
-                self.recorder.appendVideo(cgImage: cg, at: result.pts)
+            if self.isRecording {
+                // 刀1:优先直吃 renderCrop 渲好的 CVPixelBuffer(免 CGContext.draw 软 blit + fill);
+                // pb 缺失(池创建失败等异常)才退回 CGImage 兜底路径。
+                if let pb = result.previewPB {
+                    self.recorder.appendVideo(pixelBuffer: pb, at: result.pts)
+                } else if let cg = result.previewCG {
+                    self.recorder.appendVideo(cgImage: cg, at: result.pts)
+                }
             }
         }
     }
