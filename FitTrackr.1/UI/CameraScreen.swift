@@ -12,6 +12,7 @@ struct CameraScreen: View {
 
                 // 预览 + 叠加
                 PreviewCanvasView(
+                    pixelBuffer: vm.processedPB,
                     image: vm.processedCGImage,
                     handLandmarks: vm.handLandmarks,
                     personBoxN: vm.personBox,
@@ -426,7 +427,8 @@ fileprivate struct TunerSheet: View {
 // PreviewCanvasView 和 CanvasView:渲染处理后帧 + overlay(框/死区/手部骨架)。
 // 由 fileprivate 放宽为 internal,使模拟器回放界面(VideoTrackingPlaybackView)能复用同一套渲染。
 struct PreviewCanvasView: UIViewRepresentable {
-    let image: CGImage?
+    let pixelBuffer: CVPixelBuffer?   // 刀2:主显示路径
+    let image: CGImage?               // 刀2:兜底(池失败)
     let handLandmarks: [CGPoint]
     let personBoxN: CGRect?
     let deadZoneFraction: CGSize
@@ -434,14 +436,15 @@ struct PreviewCanvasView: UIViewRepresentable {
     func makeUIView(context: Context) -> CanvasView { CanvasView() }
 
     func updateUIView(_ uiView: CanvasView, context: Context) {
-        uiView.updateFrameImage(image)
+        uiView.updateFrame(pb: pixelBuffer, cgImage: image)
         uiView.renderOverlays(hand: handLandmarks, personBoxN: personBoxN,
                               deadZone: deadZoneFraction)
     }
 }
 
 final class CanvasView: UIView {
-    private let contentLayer = CALayer()
+    private let sampleLayer = AVSampleBufferDisplayLayer()   // 刀2:主显示层,吃 CVPixelBuffer(零 createCGImage/回读)
+    private let contentLayer = CALayer()                     // 刀2:兜底层(池失败→cgImage),默认隐藏
     private let personBoxLayer = CAShapeLayer()
     private let deadZoneLayer  = CAShapeLayer()
     private let skeletonLayer  = CAShapeLayer()
@@ -458,8 +461,13 @@ final class CanvasView: UIView {
         super.init(frame: frame)
         layer.backgroundColor = UIColor.black.cgColor
 
+        // 刀2:主显示层 = AVSampleBufferDisplayLayer(吃 pb);contentLayer 兜底默认隐藏
+        sampleLayer.videoGravity = .resizeAspectFill
+        layer.addSublayer(sampleLayer)
+
         contentLayer.contentsGravity = .resizeAspectFill
         contentLayer.magnificationFilter = .nearest
+        contentLayer.isHidden = true
         layer.addSublayer(contentLayer)
 
         [personBoxLayer, deadZoneLayer, skeletonLayer].forEach { l in
@@ -486,6 +494,7 @@ final class CanvasView: UIView {
         super.layoutSubviews()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        sampleLayer.frame = bounds
         contentLayer.frame = bounds
         personBoxLayer.frame = bounds
         deadZoneLayer.frame  = bounds
@@ -493,11 +502,38 @@ final class CanvasView: UIView {
         CATransaction.commit()
     }
 
-    func updateFrameImage(_ cgImage: CGImage?) {
+    // 刀2:主显示吃 pb(AVSampleBufferDisplayLayer 直显,零 createCGImage);pb 缺失才用 cgImage 兜底层。
+    func updateFrame(pb: CVPixelBuffer?, cgImage: CGImage?) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        contentLayer.contents = cgImage
+        if let pb = pb {
+            if contentLayer.isHidden == false { contentLayer.isHidden = true }
+            if sampleLayer.isHidden { sampleLayer.isHidden = false }
+            enqueue(pb)
+        } else if let cg = cgImage {
+            if sampleLayer.isHidden == false { sampleLayer.isHidden = true }
+            if contentLayer.isHidden { contentLayer.isHidden = false }
+            contentLayer.contents = cg
+        }
         CATransaction.commit()
+    }
+
+    private func enqueue(_ pb: CVPixelBuffer) {
+        if sampleLayer.status == .failed { sampleLayer.flush() }
+        var fmt: CMVideoFormatDescription?
+        CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pb, formatDescriptionOut: &fmt)
+        guard let fmt = fmt else { return }
+        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: .invalid, decodeTimeStamp: .invalid)
+        var sb: CMSampleBuffer?
+        CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pb,
+                                                 formatDescription: fmt, sampleTiming: &timing, sampleBufferOut: &sb)
+        guard let sb = sb else { return }
+        // 立即显示(实时预览语义,不排队等时钟)
+        if let arr = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: true) as? [NSMutableDictionary],
+           let dict = arr.first {
+            dict[kCMSampleAttachmentKey_DisplayImmediately as NSString] = true
+        }
+        if sampleLayer.isReadyForMoreMediaData { sampleLayer.enqueue(sb) }
     }
 
     func renderOverlays(hand: [CGPoint], personBoxN: CGRect?, deadZone: CGSize) {

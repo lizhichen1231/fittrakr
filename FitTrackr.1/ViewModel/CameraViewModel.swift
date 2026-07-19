@@ -19,7 +19,8 @@ final class CameraViewModel: NSObject, ObservableObject {
     
 
     // æ˜¾ç¤º/å åŠ
-    @Published var processedCGImage: CGImage?
+    @Published var processedCGImage: CGImage?          // 刀2 兜底路径(池失败时)
+    @Published var processedPB: CVPixelBuffer?         // 刀2:显示主路径,CanvasView 的 AVSampleBufferDisplayLayer 直吃
     @Published var handLandmarks: [CGPoint] = []
     @Published var personBox: CGRect?
     @Published var isTracking = false
@@ -178,7 +179,7 @@ final class CameraViewModel: NSObject, ObservableObject {
     func toggleLock() { hardLock.toggle() }
 
     private func startRecord() {
-        guard processedCGImage != nil || videoSize != .zero else { return }
+        guard processedPB != nil || processedCGImage != nil || videoSize != .zero else { return }
         recorder.start(size: lastOutputSize)
         isRecording = true
         follow.isRecordingActive = true   // 刀1:开录 → renderCrop 开始多渲 CVPixelBuffer 供 Recorder 直吃
@@ -504,7 +505,9 @@ extension CameraViewModel {
                 ? String(format: "追踪中 %.0f%%  |  缩放 %.2fx", result.confidence * 100, result.zoom)
                 : "搜索目标…"
 
-            if let cg = result.previewCG { self.processedCGImage = cg }
+            // 刀2:显示主路径 = pb;pb 缺失(池失败)才用 cgImage 兜底
+            if let pb = result.previewPB { self.processedPB = pb }
+            else if let cg = result.previewCG { self.processedCGImage = cg }
             
             let crop = result.cropRect
             if let sb = result.stableBox, crop.width > 0, crop.height > 0 {

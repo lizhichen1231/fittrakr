@@ -285,7 +285,8 @@ private struct PlaybackPlayerView: View {
                 Color.black.ignoresSafeArea()
 
                 // 处理后帧 + 框/死区/手部骨架(与实时相机界面同一套渲染)
-                PreviewCanvasView(image: vm.processedCGImage,
+                PreviewCanvasView(pixelBuffer: vm.processedPB,
+                                  image: vm.processedCGImage,
                                   handLandmarks: vm.handLandmarks,
                                   personBoxN: vm.personBox,
                                   // 死区随 debug 开关显隐(回放默认关 → 干净)

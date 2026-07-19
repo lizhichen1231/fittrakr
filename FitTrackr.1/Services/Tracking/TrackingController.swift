@@ -977,15 +977,15 @@ final class TrackingController {
         }
 
         let outRect = CGRect(origin: .zero, size: cfg.outputSize)
-        let cg = ciContext.createCGImage(scaled, from: outRect)   // 显示:不变(非录制路径 100% 同旧)
-
-        // 刀1:仅录制中额外渲一份 CVPixelBuffer(GPU render,无 CPU 回读)。非录制 recPB=nil,零新增开销。
-        var recPB: CVPixelBuffer? = nil
-        if isRecordingActive, let pb = dequeueRecPixelBuffer() {
+        // 刀2:显示 + 录制吃同一个 CVPixelBuffer,砍掉 createCGImage(GPU 渲染 + CPU 回读)。
+        // 每帧 ciContext.render(scaled, to: pb)——GPU 直渲进池 buffer,**无 CPU 回读**(非录制也受益)。
+        if let pb = dequeueRecPixelBuffer() {
             ciContext.render(scaled, to: pb, bounds: outRect, colorSpace: CGColorSpaceCreateDeviceRGB())
-            recPB = pb
+            return (nil, scaled, pb)
         }
-        return (cg, scaled, recPB)
+        // 兜底(池创建失败等异常):退回 createCGImage 一帧,画面不断。
+        let cg = ciContext.createCGImage(scaled, from: outRect)
+        return (cg, scaled, nil)
     }
 
     // MARK: - Helpers
