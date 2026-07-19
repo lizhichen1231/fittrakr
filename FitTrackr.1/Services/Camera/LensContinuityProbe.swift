@@ -51,6 +51,7 @@ final class LensContinuityProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
             self.session.outputs.forEach { self.session.removeOutput($0) }
             self.running = false
             PerfFileLog.shared.line("════ Q4 stop ════")
+            LensProbeStatus.shared.set("🔬 Q4 完成(ramp 到 2.5,已停)")
         }
     }
 
@@ -74,8 +75,10 @@ final class LensContinuityProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
         frameN += 1
         let gdc = dw.isGeometricDistortionCorrectionSupported ? dw.isGeometricDistortionCorrectionEnabled : false
         let lens = z < 2.0 ? "UW" : "Wide"   // S=2.0 为界(近似;真实切换由虚拟设备内部管,看 buf/center 是否跳)
-        PerfFileLog.shared.line(String(format: "Q4 f%d zoom=%.2f lens≈%@ buf=%dx%d poseC=(%.3f,%.3f) GDC=%@",
-                                       frameN, Double(z), lens, w, h, cx, cy, gdc ? "Y" : "N"))
+        let msg = String(format: "Q4 f%d zoom=%.2f lens≈%@ buf=%dx%d poseC=(%.3f,%.3f) GDC=%@",
+                         frameN, Double(z), lens, w, h, cx, cy, gdc ? "Y" : "N")
+        PerfFileLog.shared.line(msg)
+        LensProbeStatus.shared.set("🔬 " + msg)   // 屏上 HUD
         if z >= 2.5 { stop() }
     }
 }

@@ -99,6 +99,7 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
             self.multiSession = nil
             self.running = false
             PerfFileLog.shared.line("════ Q3 \(self.mode) stop ════")
+            LensProbeStatus.shared.clear()
         }
     }
 
@@ -120,8 +121,10 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
         let tn: String = { switch ProcessInfo.processInfo.thermalState {
             case .nominal: return "nominal"; case .fair: return "fair"
             case .serious: return "serious"; case .critical: return "critical"; @unknown default: return "?" } }()
-        PerfFileLog.shared.line(String(format: "Q3 %@ FPS=%.0f thermal=%@ battery=%.0f%%",
-                                       mode, fps, tn, UIDevice.current.batteryLevel * 100))
+        let msg = String(format: "Q3 %@ FPS=%.0f thermal=%@ battery=%.0f%%",
+                         mode, fps, tn, UIDevice.current.batteryLevel * 100)
+        PerfFileLog.shared.line(msg)
+        LensProbeStatus.shared.set("🔬 " + msg)   // 屏上 HUD
     }
 }
 #endif

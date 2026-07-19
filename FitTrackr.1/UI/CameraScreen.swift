@@ -25,6 +25,7 @@ struct CameraScreen: View {
                 // Debug Overlay（仅 DEBUG 模式）：总开关绑到共享 showDebugOverlay(默认关),眼睛图标切它
                 #if DEBUG
                 DebugOverlayView(data: vm.debugData, showAll: $vm.showDebugOverlay)
+                LensProbeHUDView()   // 【查勘#2】探针跑起来的屏上反馈(cyan 大字;不跑时隐藏)
                 #endif
 
                 // 顶部状态信息
