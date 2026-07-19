@@ -6,11 +6,20 @@ import UIKit
 /// 根本不 pin → 连接回落到跟随设备 = 正是「横过来画面转 90°」的根因。iOS 16 回退 videoOrientation=.portrait。
 /// 镜像(isVideoMirrored)与本函数无关,各调用点自理。所有 videoDataOutput connection 都必须过这一道。
 func pinConnectionPortrait(_ connection: AVCaptureConnection) {
+    var how = "none(两路都不支持!)"
     if #available(iOS 17.0, *), connection.isVideoRotationAngleSupported(90) {
         connection.videoRotationAngle = 90   // 90° = 竖屏(传感器横向原生 → 转正)
+        how = "videoRotationAngle=90 → 实读=\(connection.videoRotationAngle)"
     } else if connection.isVideoOrientationSupported {
         connection.videoOrientation = .portrait
+        how = "videoOrientation=.portrait(废弃兜底,iOS17 可能不 pin→跟设备转)"
     }
+    #if DEBUG
+    let sup90: Bool = { if #available(iOS 17.0, *) { return connection.isVideoRotationAngleSupported(90) }; return false }()
+    let msg = "🔒 pinPortrait → \(how) | 支持90=\(sup90)"
+    print(msg)
+    PerfFileLog.shared.line(msg)
+    #endif
 }
 
 protocol CameraEngineDelegate: AnyObject {
@@ -223,17 +232,22 @@ protocol CameraEngineDelegate: AnyObject {
         if session.canAddOutput(audioOutput) { session.addOutput(audioOutput) }
         audioOutput.setSampleBufferDelegate(self, queue: audioQueue)
 
-        // 方向 + 稳定 + 镜像（先设置，用 portrait 避免旋转问题）
+        // 稳定 + 镜像(竖屏 pin 挪到最终格式敲定之后,见下)
         if let conn = videoOutput.connection(with: .video) {
             sysStabilizer.applyPreview(feel: .normal, to: conn)
             if conn.isVideoMirroringSupported { conn.isVideoMirrored = usingFront }
-            pinConnectionPortrait(conn)   // 竖屏硬钉(iOS17+ videoRotationAngle=90),不跟随设备
         }
 
         session.commitConfiguration()
 
         // 格式选择放到 commitConfiguration 之后，单独处理
         _ = setPreferredFrameRate(60)
+
+        // 竖屏硬钉:**必须在 setPreferredFrameRate(最终 1080p60 格式)之后** —— 否则对临时格式
+        // isVideoRotationAngleSupported(90) 可能 false → 掉废弃 videoOrientation 兜底 → iOS17 跟设备转(横屏 bug 真凶)。
+        if let conn = videoOutput.connection(with: .video) {
+            pinConnectionPortrait(conn)
+        }
     }
 
     // 设置期望帧率（在 sessionQueue 调用）
