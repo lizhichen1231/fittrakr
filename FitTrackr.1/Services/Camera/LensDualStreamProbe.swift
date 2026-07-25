@@ -40,6 +40,11 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
 
     private func _start(dual: Bool) {
         guard !running else { return }
+        // 修复2:计量器互斥——探针启动即停基线计量表(app 相机将被停,计量表继续打=假数污染日志)
+        if LensLoadMeter.shared.running {
+            plog("⚠️ 互斥断言: 基线计量表在跑 → 强制停(探针启动,其后的基线行为假数)")
+            LensLoadMeter.shared.stop()
+        }
         mode = dual ? "双流" : "基线单流"
         UIDevice.current.isBatteryMonitoringEnabled = true
         uwGotFirst = false; mainGotFirst = false
@@ -119,42 +124,108 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
             plog("Q3 双流: 主摄 addInput 失败(仅超广角单流继续)")
         }
         observe(s)
-        s.commitConfiguration(); s.startRunning()
-        plog("Q3 双流: 配置完成,isRunning=\(s.isRunning)")
+        s.commitConfiguration()
+
+        // ═══ 埋点1:MultiCam 配置合法性(commit 之后、startRunning 之前)═══
+        // 判读:hardwareCost >1.0 = 硬件预算超限,会话 isRunning=true 但不投帧(正是 FPS=0 无首帧症状)
+        logMCCost(s, "初始配置(≈1080p60×2)")
+        if s.hardwareCost > 1.0 {
+            setFrameRate(wide, 30, "主摄")                      // 降档B:仅降主摄帧率(超广角感知保 60)
+            logMCCost(s, "降档B(主摄30fps)")
+        }
+        if s.hardwareCost > 1.0 {
+            setMultiCamFormat(uw, "超广角", targetW: 1280)      // 降档C:双设备 720p30
+            setMultiCamFormat(wide, "广角", targetW: 1280)
+            setFrameRate(uw, 30, "超广角"); setFrameRate(wide, 30, "主摄")
+            logMCCost(s, "降档C(双设备720p30)")
+        }
+        plog(String(format: "Q3 双流·埋点1 判读: 最终 hardwareCost=%.2f → %@",
+                    s.hardwareCost,
+                    s.hardwareCost > 1.0 ? "仍>1.0 预算超限,预期不投帧(OPEN-1 关键证据)"
+                                         : "≤1.0 预算内,本行之后的配置即「能跑的最省配置」"))
+
+        // ═══ 埋点2:连线是否建起来(同一位置)═══
+        var cds: [String] = []
+        for (i, c) in s.connections.enumerated() {
+            let ports = c.inputPorts.map { p in
+                "\(p.sourceDeviceType?.rawValue ?? "?")·\(p.mediaType.rawValue)"
+            }.joined(separator: "+")
+            cds.append("#\(i)[\(ports)] enabled=\(c.isEnabled) active=\(c.isActive)")
+        }
+        plog("Q3 双流·埋点2: connections=\(s.connections.count) " + (cds.isEmpty ? "(零连接!)" : cds.joined(separator: " | ")))
+
+        s.startRunning()
+        plog("Q3 双流: startRunning 后 isRunning=\(s.isRunning) connActive=[\(s.connections.map { $0.isActive ? "Y" : "N" }.joined(separator: ","))]")
         return true
     }
 
-    /// 多摄独立设备:activeFormat 必须是 isMultiCamSupported 的,否则会话跑但无帧。选最接近 1920 宽的一档。
-    private func setMultiCamFormat(_ dev: AVCaptureDevice, _ label: String) {
+    /// 埋点1:MultiCam 预算三元组(hardwareCost/systemPressureCost/运行时 isMultiCamSupported)
+    private func logMCCost(_ s: AVCaptureMultiCamSession, _ stage: String) {
+        plog(String(format: "Q3 双流·埋点1 %@: hardwareCost=%.2f systemPressureCost=%.2f isMultiCamSupported(运行时)=%@",
+                    stage, s.hardwareCost, s.systemPressureCost,
+                    AVCaptureMultiCamSession.isMultiCamSupported ? "Y" : "N"))
+    }
+
+    /// 埋点1 降档用:锁帧率(须在 activeFormat 支持范围内;30 在 60max 格式内合法)
+    private func setFrameRate(_ dev: AVCaptureDevice, _ fps: Int32, _ label: String) {
+        do {
+            try dev.lockForConfiguration()
+            let d = CMTimeMake(value: 1, timescale: fps)
+            dev.activeVideoMinFrameDuration = d
+            dev.activeVideoMaxFrameDuration = d
+            dev.unlockForConfiguration()
+            plog("Q3 双流: \(label) 锁 \(fps)fps")
+        } catch { plog("Q3 双流: \(label) 锁 \(fps)fps 失败 \(error)") }
+    }
+
+    /// 多摄独立设备:activeFormat 必须是 isMultiCamSupported 的,否则会话跑但无帧。选最接近 targetW 宽的一档(默认 1920;埋点1 降档传 1280)。
+    private func setMultiCamFormat(_ dev: AVCaptureDevice, _ label: String, targetW: Int = 1920) {
         let cands = dev.formats.filter { $0.isMultiCamSupported }
         func w(_ f: AVCaptureDevice.Format) -> Int { Int(CMVideoFormatDescriptionGetDimensions(f.formatDescription).width) }
-        guard let fmt = cands.min(by: { abs(w($0) - 1920) < abs(w($1) - 1920) }) else {
+        guard let fmt = cands.min(by: { abs(w($0) - targetW) < abs(w($1) - targetW) }) else {
             plog("Q3 双流: \(label) 无 isMultiCamSupported 格式!"); return
         }
         do {
             try dev.lockForConfiguration(); dev.activeFormat = fmt; dev.unlockForConfiguration()
             let d = CMVideoFormatDescriptionGetDimensions(fmt.formatDescription)
-            plog("Q3 双流: \(label) 选多摄格式 \(d.width)x\(d.height)")
+            plog("Q3 双流: \(label) 选多摄格式 \(d.width)x\(d.height)(目标宽\(targetW))")
         } catch {
             plog("Q3 双流: \(label) lockForConfiguration 失败 \(error)")
         }
     }
 
-    /// 会话中断/运行时错误/首次启动 全部落日志——真 0 帧时用它定位是不是被别的 client 抢了摄像头。
+    private var obsTokens: [NSObjectProtocol] = []
+
+    /// 埋点3+修复1:中断(reason+时间戳)/RuntimeError(NSError.code)/中断结束→尝试恢复,失败自动停探针还相机。
+    /// 时间戳=CACurrentMediaTime(单调秒),便于把 Zc 手动切 App 的中断从证据里剔干净。
+    /// block observer 必须存 token 移除(removeObserver(self) 对 block 无效→重复 start 叠观察者,日志重复行)。
     private func observe(_ s: AVCaptureSession) {
         let nc = NotificationCenter.default
-        nc.addObserver(forName: .AVCaptureSessionWasInterrupted, object: s, queue: nil) { note in
+        obsTokens.append(nc.addObserver(forName: .AVCaptureSessionWasInterrupted, object: s, queue: nil) { note in
             let reason = (note.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int).map { String($0) } ?? "?"
-            plog("Q3 ⚠️ 会话被中断 reason=\(reason)(1=后台 2=被其他client占用 3=多前台App 4=系统压力)")
+            plog(String(format: "Q3 ⚠️ 会话被中断 t=%.3f reason=%@(1=后台 2=被其他client占用 3=多前台App 4=系统压力)", CACurrentMediaTime(), reason))
             LensProbeStatus.shared.set("🔬 Q3 会话中断 reason=\(reason)")
-        }
-        nc.addObserver(forName: .AVCaptureSessionInterruptionEnded, object: s, queue: nil) { _ in
-            plog("Q3 ✅ 会话中断结束(恢复)")
-        }
-        nc.addObserver(forName: .AVCaptureSessionRuntimeError, object: s, queue: nil) { note in
-            let err = note.userInfo?[AVCaptureSessionErrorKey]
-            plog("Q3 ❌ 运行时错误 \(String(describing: err))")
-        }
+        })
+        obsTokens.append(nc.addObserver(forName: .AVCaptureSessionInterruptionEnded, object: s, queue: nil) { [weak self] _ in
+            plog(String(format: "Q3 会话中断结束 t=%.3f → 尝试恢复 startRunning", CACurrentMediaTime()))
+            guard let self = self else { return }
+            self.queue.async {
+                guard self.running else { return }
+                if !s.isRunning { s.startRunning() }
+                if s.isRunning {
+                    plog("Q3 ✅ 中断恢复成功 isRunning=true")
+                    LensProbeStatus.shared.set("🔬 Q3 中断恢复,继续")
+                } else {
+                    plog("Q3 ❌❌ 中断恢复失败(isRunning=false)→ 自动停探针,还相机给 app")
+                    LensProbeStatus.shared.set("🔬 Q3 恢复失败,已自动还相机")
+                    self.stop { LensProbeStatus.shared.restoreCameraHook?() }
+                }
+            }
+        })
+        obsTokens.append(nc.addObserver(forName: .AVCaptureSessionRuntimeError, object: s, queue: nil) { note in
+            let e = note.userInfo?[AVCaptureSessionErrorKey] as? NSError
+            plog(String(format: "Q3 ❌ RuntimeError t=%.3f code=%d domain=%@ %@", CACurrentMediaTime(), e?.code ?? 0, e?.domain ?? "?", e?.localizedDescription ?? "?"))
+        })
     }
 
     /// 刀A:completion = 反向有序恢复——探针 session 确认释放后(主线程)才放行调用方 vm.start()。
@@ -166,7 +237,8 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
                 return
             }
             self.timer?.cancel(); self.timer = nil
-            NotificationCenter.default.removeObserver(self)
+            self.obsTokens.forEach { NotificationCenter.default.removeObserver($0) }   // block token 正确移除
+            self.obsTokens.removeAll()
             if self.single.isRunning { self.single.stopRunning() }
             self.single.inputs.forEach { self.single.removeInput($0) }
             self.single.outputs.forEach { self.single.removeOutput($0) }

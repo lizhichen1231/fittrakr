@@ -7,6 +7,8 @@ import UIKit
 /// dualWide 独立会话,videoZoomFactor 1.5→2.5 缓推(10s)跨切换点 S=2.0,逐帧记:
 /// buffer WxH / 当前 zoom / 最大 pose 中心(nx,ny,归一)/ GDC 状态 → 定设计稿 §6 豁免宽度。
 /// ⚠️ 起自己的 session,触发前调用方先 stop 掉 app 相机(避免双会话打架)。输出进 PerfFileLog。
+fileprivate func plog(_ s: String) { print(s); PerfFileLog.shared.line(s) }   // 埋点3:同时上控制台+落盘
+
 final class LensContinuityProbe: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     static let shared = LensContinuityProbe()
     private let session = AVCaptureSession()
@@ -22,6 +24,11 @@ final class LensContinuityProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
     func start() { queue.asyncAfter(deadline: .now() + 0.3) { self._start() } }
     private func _start() {
         guard !running else { return }
+        // 修复2:计量器互斥——探针启动即停基线计量表(app 相机将被停,计量表继续打=假数)
+        if LensLoadMeter.shared.running {
+            plog("⚠️ 互斥断言: 基线计量表在跑 → 强制停(Q4 探针启动)")
+            LensLoadMeter.shared.stop()
+        }
         guard let dw = AVCaptureDevice.default(.builtInDualWideCamera, for: .video, position: .back) else {
             PerfFileLog.shared.line("Q4: dualWide 不可用,探针退出"); return
         }
@@ -39,9 +46,41 @@ final class LensContinuityProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
         if let conn = output.connection(with: .video) { pinConnectionPortrait(conn) }
         session.commitConfiguration()
         try? dw.lockForConfiguration(); dw.videoZoomFactor = 1.5; dw.unlockForConfiguration()
+        observe(session)   // 埋点3+修复1:中断/错误/恢复(放 startRunning 前——更早会在 bail 路径漏 token)
         session.startRunning()
         rampStart = CACurrentMediaTime(); frameN = 0; running = true
         PerfFileLog.shared.line("════ Q4 连续性探针 start(dualWide,ramp 1.5→2.5 跨 S=2.0,静止目标对准)════")
+    }
+
+    private var obsTokens: [NSObjectProtocol] = []
+
+    /// 埋点3+修复1(Q4 版):中断 reason+时间戳 / RuntimeError code / 中断结束→尝试恢复,失败自动停探针还相机。
+    private func observe(_ s: AVCaptureSession) {
+        let nc = NotificationCenter.default
+        obsTokens.append(nc.addObserver(forName: .AVCaptureSessionWasInterrupted, object: s, queue: nil) { note in
+            let reason = (note.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int).map { String($0) } ?? "?"
+            plog(String(format: "Q4 ⚠️ 会话被中断 t=%.3f reason=%@(1=后台 2=被其他client占用 3=多前台App 4=系统压力)", CACurrentMediaTime(), reason))
+            LensProbeStatus.shared.set("🔬 Q4 会话中断 reason=\(reason)")
+        })
+        obsTokens.append(nc.addObserver(forName: .AVCaptureSessionInterruptionEnded, object: s, queue: nil) { [weak self] _ in
+            plog(String(format: "Q4 会话中断结束 t=%.3f → 尝试恢复 startRunning", CACurrentMediaTime()))
+            guard let self = self else { return }
+            self.queue.async {
+                guard self.running else { return }
+                if !s.isRunning { s.startRunning() }
+                if s.isRunning {
+                    plog("Q4 ✅ 中断恢复成功 isRunning=true")
+                } else {
+                    plog("Q4 ❌❌ 中断恢复失败(isRunning=false)→ 自动停探针,还相机给 app")
+                    LensProbeStatus.shared.set("🔬 Q4 恢复失败,已自动还相机")
+                    self.stop { LensProbeStatus.shared.restoreCameraHook?() }
+                }
+            }
+        })
+        obsTokens.append(nc.addObserver(forName: .AVCaptureSessionRuntimeError, object: s, queue: nil) { note in
+            let e = note.userInfo?[AVCaptureSessionErrorKey] as? NSError
+            plog(String(format: "Q4 ❌ RuntimeError t=%.3f code=%d domain=%@ %@", CACurrentMediaTime(), e?.code ?? 0, e?.domain ?? "?", e?.localizedDescription ?? "?"))
+        })
     }
 
     /// 刀A:completion = 反向有序恢复——探针 session 确认释放后(主线程)才放行调用方 vm.start()。
@@ -52,6 +91,8 @@ final class LensContinuityProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
                 if let c = completion { DispatchQueue.main.async(execute: c) }
                 return
             }
+            self.obsTokens.forEach { NotificationCenter.default.removeObserver($0) }   // block token 正确移除
+            self.obsTokens.removeAll()
             if self.session.isRunning { self.session.stopRunning() }
             self.session.inputs.forEach { self.session.removeInput($0) }
             self.session.outputs.forEach { self.session.removeOutput($0) }

@@ -20,6 +20,12 @@ final class LensLoadMeter {
     private(set) var running = false
 
     func start(_ label: String) {
+        // 修复2:互斥(反向)——探针 session 在跑 = app 相机已停,此时计量到的是假数,拒绝启动
+        if LensDualStreamProbe.shared.running || LensContinuityProbe.shared.running {
+            mlog("⚠️ 互斥断言: 探针session在跑,基线计量拒绝启动(先按⏹恢复相机)")
+            LensProbeStatus.shared.set("🔬 互斥: 先按⏹停探针,相机恢复后再计量")
+            return
+        }
         queue.async {
             guard !self.running else { return }
             self.label = label

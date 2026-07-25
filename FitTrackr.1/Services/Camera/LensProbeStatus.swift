@@ -8,6 +8,8 @@ final class LensProbeStatus: ObservableObject {
     static let shared = LensProbeStatus()
     private init() {}
     @Published var line: String = ""    // 空 = 没探针在跑
+    /// 修复1:探针中断恢复失败时「还相机给 app」的通道(CameraScreen onAppear 装配 = { vm.start() })
+    var restoreCameraHook: (() -> Void)? = nil
     func set(_ s: String) { DispatchQueue.main.async { self.line = s } }
     func clear()          { DispatchQueue.main.async { self.line = "" } }
 }

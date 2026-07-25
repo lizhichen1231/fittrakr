@@ -268,6 +268,10 @@ struct CameraScreen: View {
                 forcePortrait()   // 兜底:若已卡在横屏进来,掰回竖屏
                 vm.updateOutputSize(for: geo.size)
                 vm.start()
+                #if DEBUG
+                // 【查勘#2 修复1】探针中断恢复失败 → 自动还相机给 app 的通道(probe/lens-recon 用完即撤)
+                LensProbeStatus.shared.restoreCameraHook = { vm.start() }
+                #endif
             }
             .onChange(of: geo.size) { newSize in
                 vm.updateOutputSize(for: newSize)
@@ -372,6 +376,10 @@ fileprivate struct TunerSheet: View {
                     // 刀B 基线负载对齐:基线组 = app 本身跑典型负载(锁跟踪+录制),不停相机不建会话,只挂计量表。
                     // 自动开录保证「录制 ON」;结束用「计量结束」钮,不要按 ⏹(那是双流/Q4 的恢复钮)。
                     Button("Q3 基线·典型负载 计量开始(自动开录,10min)") {
+                        // 修复2:互斥——探针在跑(app 相机已停)时,开录也是假的,整个动作拒绝
+                        guard !LensDualStreamProbe.shared.running, !LensContinuityProbe.shared.running else {
+                            LensProbeStatus.shared.set("🔬 互斥: 先按⏹停探针,相机恢复后再计量"); return
+                        }
                         if !vm.isRecording { vm.toggleRecord() }
                         LensLoadMeter.shared.start("基线(锁跟踪+录制)")
                     }
