@@ -96,6 +96,29 @@ final class StateDebouncerTests: XCTestCase {
         XCTAssertEqual(reentry, [], "冷却 5s 内禁止切向窄")
     }
 
+    /// ⑥【公式修正卡】贴S悬停(死区下界=S 后的新风险面):恰一次出,此后静默
+    func testHoverAtSNoChatter() {
+        let a = LensArbiter()
+        var t = 0.0, got: [LensCommand] = []
+        for _ in 0..<120 { let c = a.decide(makeInput(zoom: 2.4), at: t).command; if c != .none { got.append(c) }; t += 1.0/60.0 }
+        for i in 0..<600 {
+            let z: CGFloat = (i % 2 == 0) ? 1.98 : 2.05
+            let c = a.decide(makeInput(zoom: z), at: t).command; if c != .none { got.append(c) }; t += 1.0/60.0
+        }
+        XCTAssertEqual(got, [.toWide, .toUW], "贴S悬停应恰一次出 Wide,此后静默")
+    }
+
+    /// ⑦【公式修正卡】锯齿 1.95↔2.30(周期6s×4):zoom-exit 写冷却后频率被封顶(4 次而非 8 次)
+    func testSawtoothCooldownCaps() {
+        let a = LensArbiter()
+        var t = 0.0, got: [LensCommand] = []
+        for _ in 0..<4 {
+            for _ in 0..<180 { let c = a.decide(makeInput(zoom: 2.30), at: t).command; if c != .none { got.append(c) }; t += 1.0/60.0 }
+            for _ in 0..<180 { let c = a.decide(makeInput(zoom: 1.95), at: t).command; if c != .none { got.append(c) }; t += 1.0/60.0 }
+        }
+        XCTAssertEqual(got, [.toWide, .toUW, .toWide, .toUW], "24s 锯齿应仅 4 次迁移(冷却封顶)")
+    }
+
     /// ⑤ Tier 0 旁路:整套策略不产出任何指令
     func testTier0Bypass() {
         let a = LensArbiter()

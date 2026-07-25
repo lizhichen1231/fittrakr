@@ -87,7 +87,12 @@ struct LensArbiterOutput: Equatable {
 final class LensArbiter {
     struct Params {
         var S: CGFloat = 2.0               // 切换点(实测转正;实机以 switchOverZoomFactors 读数注入)
-        var deadzoneLo: CGFloat = 1.9      // 死区下界 ※
+        // 【公式修正卡·处置(a)】死区下界 1.9→2.0(=S):Wide 档 Z_digital = Z_total/S,
+        // 若允许 Z_total<S 仍留 Wide,则 Z_digital<1 = 请求比 Wide 成分镜头更宽的视场——
+        // 边缘像素物理上不存在(上采样解分辨率不解视场),且 dualWide 设 videoZoomFactor<2.0
+        // 会自动切回 UW,无法用设备端补偿;构图偏移还违反不变量 I。
+        // 下界=S 后 Z_digital ≥1 恒成立;迟滞带整体移到 S 上侧 [2.0, 2.2](宽 0.2 仍在)。
+        var deadzoneLo: CGFloat = 2.0      // 死区下界 = S(Wide 档零下探)
         var deadzoneHi: CGFloat = 2.2      // 死区上界 ※
         var exitLine: CGFloat = 0.20       // 出门线(主摄边界 ±0.25 的 80%)※
         var entryLine: CGFloat = 0.15      // 回门线(60%)※
@@ -128,8 +133,10 @@ final class LensArbiter {
             // 仲裁2:通道二 force(锁定中心越出门线)→ 切 UW 即刻;动作写冷却(§3 单边:只锁切向窄)
             debouncer.force(.uw, at: now, cooldownAfter: p.cooldownSec)
         } else if prev == .wide, input.zoomReq < p.deadzoneLo {
-            // 通道一 zoom 下穿死区下界 → 回 UW(迟滞带即防抖,无驻留;非紧急,不写冷却)
-            debouncer.force(.uw, at: now, cooldownAfter: 0)
+            // 通道一 zoom 下穿 S → 回 UW(迟滞带全在 S 上侧后,下穿即出;无驻留)。
+            // 【公式修正卡】改写冷却:下界提到 S 后,zoom 轴贴 S 往返成为现实场景,
+            // 第三层(冷却单边)必须把 zoom 轴振荡也封顶——写 5s,仍只锁切向窄,切向广不受限。
+            debouncer.force(.uw, at: now, cooldownAfter: p.cooldownSec)
         } else if input.stateTag == "L",
                   let c = input.lockedCenter, cheb(c) <= p.entryLine,
                   input.centerVel < p.velMax, input.zoomReq > p.deadzoneHi {
