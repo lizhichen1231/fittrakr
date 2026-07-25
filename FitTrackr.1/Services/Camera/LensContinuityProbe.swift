@@ -129,6 +129,8 @@ final class LensContinuityProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
             self.session.outputs.forEach { self.session.removeOutput($0) }
             self.output.setSampleBufferDelegate(nil, queue: nil)   // 刀A:delegate 置 nil(下次 start 由 _start 重挂)
             self.running = false
+            // 判决卡·五:数据完整性自检——ramp 实记帧数落盘(60fps×10s ramp 应≈600 帧,显著少=有丢)
+            plog("Q4 数据完整性: ramp 共记 \(self.frameN) 帧(逐帧 zoom/lens/buf/poseC/GDC 已落 PerfLog)")
             PerfFileLog.shared.line("════ Q4 stop → 探针session已释放 isRunning=\(self.session.isRunning) → 允许恢复 app 相机 ════")
             LensProbeStatus.shared.set("🔬 Q4 完成(ramp 到 2.5,已停)")
             LensProbeStatus.shared.clearRun()   // 常驻行熄灭 = 探针不再接管相机
