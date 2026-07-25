@@ -101,7 +101,10 @@ protocol CameraEngineDelegate: AnyObject {
             let z = d.videoZoomFactor
             guard abs(z - 1.0) > 0.001 else { return }
             let msg = "❌ 刀1钳死断言: device.videoZoomFactor 被写成 \(String(format: "%.2f", z))(刀4 前禁止物理 zoom)→ 拦回 1.0"
-            print(msg); PerfFileLog.shared.line(msg)
+            print(msg)
+            #if DEBUG
+            PerfFileLog.shared.line(msg)   // PerfFileLog 是 DEBUG-only 类,裸调会破 Release 构建
+            #endif
             assertionFailure(msg)   // DEBUG 当场爆定位写入方;Release 只拦回
             self?.sessionQueue.async {
                 if (try? d.lockForConfiguration()) != nil { d.videoZoomFactor = 1.0; d.unlockForConfiguration() }

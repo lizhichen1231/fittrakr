@@ -636,6 +636,12 @@ final class TrackingController {
             // 每帧组装输入调 decide,仅产出 决策日志+HUD;command 不驱动设备(a3ba32d 钳死仍拦着,刀4 才放行)。
             // decide 无 app 侧副作用 → build 后行为与刀1 逐帧等同。
             let _lensNow = CACurrentMediaTime()
+            // 状态 tag 就地映射(dbgStateTag() 是 DEBUG-only,影子层是正式代码不能依赖它;lockState 只读)
+            let _lensTag: String
+            switch lockState {
+            case .unlocked: _lensTag = "U"; case .locked: _lensTag = "L"
+            case .searching: _lensTag = "S"; case .lost: _lensTag = "X"
+            }
             let _lensCenter: CGPoint? = _rectResult.map { CGPoint(x: $0.0.midX - 0.5, y: $0.0.midY - 0.5) }  // 归一→wide系(原点=中心)
             if let c = _lensCenter, let p = lensShadowPrevCenter, dt > 0 {
                 // 影子速度:锁定中心帧间位移 EMA(影子模式自算;刀4 评估换预测速度估计)
@@ -645,7 +651,7 @@ final class TrackingController {
             if _lensCenter != nil { lensShadowPrevCenter = _lensCenter }
             let _lensOut = lensArbiter.decide(LensArbiterInput(
                 zoomReq: zoom, lockedCenter: _lensCenter, centerVel: lensShadowVel,
-                stateTag: dbgStateTag(), tier1: CameraEngine.currentTier1,
+                stateTag: _lensTag, tier1: CameraEngine.currentTier1,
                 deviceZoom: CameraEngine.lastSelectedDeviceZoom), at: _lensNow)
             if _lensOut.command != .none {
                 // 影子日志(可对答案):帧号/指令/触发线/Z_total/中心/速度/状态/Tier/距上次间隔。print+落盘。
@@ -653,13 +659,21 @@ final class TrackingController {
                 let cstr = _lensCenter.map { String(format: "(%.3f,%.3f)", $0.x, $0.y) } ?? "nil"
                 let msg = String(format: "🎯 LENS-SHADOW f%d cmd=%@ 因=[%@] Z=%.2f c=%@ vel=%.3f tag=%@ tier1=%@ 距上次=%@",
                                  frameCount, "\(_lensOut.command)", _lensOut.reason, zoom, cstr,
-                                 lensShadowVel, dbgStateTag(), CameraEngine.currentTier1 ? "Y" : "N", gap)
-                print(msg); PerfFileLog.shared.line(msg)
+                                 lensShadowVel, _lensTag, CameraEngine.currentTier1 ? "Y" : "N", gap)
+                print(msg)
+                #if DEBUG
+                PerfFileLog.shared.line(msg)   // PerfFileLog 是 DEBUG-only 类,裸调会破 Release 构建
+                #endif
                 lensShadowLastCmdAt = _lensNow
             }
             dbgLensShadow = String(format: "LENS影子 %@ dz=%@ cd=%.1f Z=%.2f",
                                    _lensOut.lens.rawValue, _lensOut.inDeadzone ? "Y" : "N",
                                    lensArbiter.cooldownRemaining(at: _lensNow), zoom)
+            #if DEBUG
+            // 影子心跳:每 150 帧(~2.5s)落一行 zoom/镜头意图/门状态——零指令的场景也可对答案
+            // (没有它,「0 次指令」分不清是三层防抖正确拦住 还是 条件根本没到过)
+            if frameCount % 150 == 0 { PerfFileLog.shared.line("🎯 心跳 f\(frameCount) " + dbgLensShadow + " tag=\(_lensTag)") }
+            #endif
 
             // 日志
             if frameCount % 30 == 0 {
