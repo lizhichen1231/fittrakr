@@ -28,6 +28,8 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
     private let poseReq = VNDetectHumanBodyPoseRequest()
     private var uwFrames = 0
     private var mainFrames = 0   // 帧率口径卡:显示流也计数,tick 两路分开报(产出表的实测 FPS 列)
+    private var uwDev: AVCaptureDevice?      // 判决卡·三/四:遍历重配 + 运行时压力读取用
+    private var mainDev: AVCaptureDevice?
     private var lastTick: TimeInterval = 0
     private var timer: DispatchSourceTimer?
     private var mode = ""
@@ -51,13 +53,22 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
         uwGotFirst = false; mainGotFirst = false
         let ok = dual ? setupDual() : setupSingle()
         guard ok else { plog("Q3 \(mode): setup 失败,退出"); LensProbeStatus.shared.set("🔬 Q3 \(mode) setup 失败"); return }
-        uwFrames = 0; lastTick = CACurrentMediaTime(); running = true
-        let t = DispatchSource.makeTimerSource(queue: queue)
-        t.schedule(deadline: .now() + 5, repeating: 5)
-        t.setEventHandler { [weak self] in self?.tick() }
-        t.resume(); timer = t
-        plog("════ Q3 \(mode) start(超广角感知 + \(dual ? "主摄显示流" : "无显示流"))════")
-        LensProbeStatus.shared.setRun(mode: "Q3\(mode)", firstFrame: false, fps: nil)   // 判决卡·四:常驻行
+        uwFrames = 0; mainFrames = 0; lastTick = CACurrentMediaTime(); running = true
+        if dual {
+            // 判决卡·三:双流 = 阶梯全遍历模式。不开 5s tick(它清帧计数,会污染每档的 10s 测量窗),
+            // 计量与采样全部由 runRung 的「3s 稳定 + 10s 测量」窗自管。
+            rungPassed = []; rungResults = []
+            plog("════ Q3 双流·阶梯全遍历 start(A→B→C[→D],每档 3s稳定+10s测量,不因达标提前退出)════")
+            LensProbeStatus.shared.setRun(mode: "Q3阶梯A", firstFrame: false, fps: nil)
+            runRung(0)
+        } else {
+            let t = DispatchSource.makeTimerSource(queue: queue)
+            t.schedule(deadline: .now() + 5, repeating: 5)
+            t.setEventHandler { [weak self] in self?.tick() }
+            t.resume(); timer = t
+            plog("════ Q3 基线单流 start(超广角感知,无显示流)════")
+            LensProbeStatus.shared.setRun(mode: "Q3基线单流", firstFrame: false, fps: nil)
+        }
     }
 
     private func setupSingle() -> Bool {
@@ -69,6 +80,7 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
             plog("Q3 基线: addInput 失败"); single.commitConfiguration(); return false
         }
         single.addInput(i)
+        uwDev = uw   // 判决卡·四:tick 读运行时压力用
         uwOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
         uwOutput.alwaysDiscardsLateVideoFrames = true
         uwOutput.setSampleBufferDelegate(self, queue: queue)
@@ -124,23 +136,12 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
         } else {
             plog("Q3 双流: 主摄 addInput 失败(仅超广角单流继续)")
         }
+        uwDev = uw; mainDev = wide   // 判决卡·三:遍历重配用
         observe(s)
         s.commitConfiguration()
 
-        // ═══ 埋点1:MultiCam 配置合法性(commit 之后、startRunning 之前)═══
-        // 双门(判决卡·二):hardwareCost >1.0 或 systemPressureCost >1.0 任一超限即降档。
-        // 教训:1080p60×2 实测 hwCost=0.70 但 spCost=3.25(超阈3倍,显示流已掉帧 45-57)——只看 hwCost 会输出假「能跑」。
-        logMCCost(s, "初始配置(≈1080p60×2)")
-        if !gatePass(s) {
-            setFrameRate(wide, 30, "主摄")                      // 降档B:仅降主摄帧率(超广角感知保 60)
-            logMCCost(s, "降档B(主摄30fps)")
-        }
-        if !gatePass(s) {
-            setMultiCamFormat(uw, "超广角", targetW: 1280, targetFPS: 30)   // 降档C:双设备 720p30(锁帧率已在 setMultiCamFormat 内)
-            setMultiCamFormat(wide, "广角", targetW: 1280, targetFPS: 30)
-            logMCCost(s, "降档C(双设备720p30)")
-        }
-        plog(gateLine(s, "最终"))
+        // ═══ 埋点1(基点):commit 之后、startRunning 之前读一次预算——阶梯逐档的 cost 由 runRung 记 ═══
+        logMCCost(s, "初始(启动前,A档配置)")
 
         // ═══ 埋点2:连线是否建起来(同一位置)═══
         var cds: [String] = []
@@ -155,6 +156,64 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
         s.startRunning()
         plog("Q3 双流: startRunning 后 isRunning=\(s.isRunning) connActive=[\(s.connections.map { $0.isActive ? "Y" : "N" }.joined(separator: ","))]")
         return true
+    }
+
+    // ═══ 判决卡·三:阶梯全遍历(强制走完全部档位,不因达标提前退出)═══
+    private struct RungSpec { let name: String; let uwW: Int; let uwFPS: Double; let mainW: Int; let mainFPS: Double }
+    private let rungs: [RungSpec] = [
+        RungSpec(name: "A 1080p60×2",         uwW: 1920, uwFPS: 60, mainW: 1920, mainFPS: 60),
+        RungSpec(name: "B 1080p60+主摄30",     uwW: 1920, uwFPS: 60, mainW: 1920, mainFPS: 30),
+        RungSpec(name: "C 720p30×2",          uwW: 1280, uwFPS: 30, mainW: 1280, mainFPS: 30),
+        RungSpec(name: "D 720p60+主摄720p30",  uwW: 1280, uwFPS: 60, mainW: 1280, mainFPS: 30),   // 仅 B/C 均未过双门时追加
+    ]
+    private var rungPassed: [Bool] = []      // 按执行序:A=0 B=1 C=2 (D=3)
+    private var rungResults: [String] = []
+
+    /// 逐档:重配 format/帧率 → 读双预算+双门判读 → 3s 稳定 → 10s 测量窗(帧计数)→ 档位行 → 下一档
+    private func runRung(_ idx: Int) {
+        guard running, let s = multiSession, let uw = uwDev, let wide = mainDev else { return }
+        if idx == 3 {   // D 档条件:B、C 都没过双门才追加(判决卡·三)
+            let bPass = rungPassed.count > 1 && rungPassed[1]
+            let cPass = rungPassed.count > 2 && rungPassed[2]
+            if bPass || cPass { plog("Q3 阶梯: D 跳过(B 或 C 已过双门)"); finishLadder(); return }
+            plog("Q3 阶梯: B/C 均未过双门 → 追加 D")
+        }
+        guard idx < rungs.count else { finishLadder(); return }
+        let r = rungs[idx]
+        plog("Q3 阶梯 ▶ \(r.name) 配置中…")
+        let uwDesc = setMultiCamFormat(uw, "超广角", targetW: r.uwW, targetFPS: r.uwFPS) ?? "?"
+        let mainDesc = setMultiCamFormat(wide, "广角", targetW: r.mainW, targetFPS: r.mainFPS) ?? "?"
+        logMCCost(s, r.name)
+        plog(gateLine(s, r.name))
+        let pass = gatePass(s)
+        rungPassed.append(pass)
+        let hw = s.hardwareCost, sp = s.systemPressureCost
+        LensProbeStatus.shared.setRun(mode: "Q3阶梯\(r.name)", firstFrame: uwGotFirst, fps: nil)
+        queue.asyncAfter(deadline: .now() + 3) { [weak self] in            // 3s 稳定(丢弃)
+            guard let self = self, self.running else { return }
+            self.uwFrames = 0; self.mainFrames = 0
+            let t0 = CACurrentMediaTime()
+            self.queue.asyncAfter(deadline: .now() + 10) { [weak self] in  // 10s 测量窗
+                guard let self = self, self.running else { return }
+                let dt = max(0.001, CACurrentMediaTime() - t0)
+                let f = Double(self.uwFrames) / dt, mf = Double(self.mainFrames) / dt
+                let line = String(format: "Q3 阶梯 ✔ %@: uw=%@ main=%@ hwCost=%.2f spCost=%.2f 实测FPS=%.0f(感知)/%.0f(显示) %@",
+                                  r.name, uwDesc, mainDesc, hw, sp, f, mf, pass ? "双门过" : "双门未过")
+                plog(line)
+                self.rungResults.append(line)
+                LensProbeStatus.shared.setRun(mode: "Q3阶梯\(r.name)", firstFrame: self.uwGotFirst, fps: f)
+                self.runRung(idx + 1)
+            }
+        }
+    }
+
+    /// 遍历完成:汇总表逐行落 log → 停探针 session(相机仍黑,按⏹恢复)→ 事件行提示
+    private func finishLadder() {
+        plog("════ Q3 阶梯遍历完成(\(rungResults.count) 档)══ 汇总 ══")
+        rungResults.forEach { plog("  " + $0) }
+        stop {
+            LensProbeStatus.shared.set("🔬 Q3 阶梯遍历完成(\(self.rungResults.count)档),数据在 PerfLog,按⏹恢复相机")
+        }
     }
 
     /// 双门(判决卡·二):两个预算都 ≤1.0 才算过——hwCost 管硬件带宽,spCost 管持续压力(超了=掉帧/发热不可持续)
@@ -194,7 +253,8 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
     /// (旧版只按宽度过滤+主路径从不锁帧率 → 默认档 30fps = FPS=30 的成因)。
     /// 无 targetFPS 多摄档时如实报「硬件不提供」,退回宽度最近档,锁到该档 maxFPS。
     /// 二.1 实读:选完打印该 format 的 videoSupportedFrameRateRanges + activeVideoMin/MaxFrameDuration 实际值。
-    private func setMultiCamFormat(_ dev: AVCaptureDevice, _ label: String, targetW: Int = 1920, targetFPS: Double = 60) {
+    @discardableResult
+    private func setMultiCamFormat(_ dev: AVCaptureDevice, _ label: String, targetW: Int = 1920, targetFPS: Double = 60) -> String? {
         let mc = dev.formats.filter { $0.isMultiCamSupported }
         func w(_ f: AVCaptureDevice.Format) -> Int { Int(CMVideoFormatDescriptionGetDimensions(f.formatDescription).width) }
         func maxFPS(_ f: AVCaptureDevice.Format) -> Double { f.videoSupportedFrameRateRanges.map { $0.maxFrameRate }.max() ?? 0 }
@@ -204,7 +264,7 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
         }
         let cands = withFPS.isEmpty ? mc : withFPS
         guard let fmt = cands.min(by: { abs(w($0) - targetW) < abs(w($1) - targetW) }) else {
-            plog("Q3 双流: \(label) 无 isMultiCamSupported 格式!"); return
+            plog("Q3 双流: \(label) 无 isMultiCamSupported 格式!"); return nil
         }
         do {
             try dev.lockForConfiguration()
@@ -221,8 +281,10 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
                         label, d.width, d.height, ranges,
                         fpsOf(dev.activeVideoMinFrameDuration), fpsOf(dev.activeVideoMaxFrameDuration),
                         targetW, targetFPS))
+            // 档位记录列:所选分辨率 + 实锁帧率(判决卡·三)
+            return String(format: "%dx%d@锁%.0f", d.width, d.height, fpsOf(dev.activeVideoMaxFrameDuration))
         } catch {
-            plog("Q3 双流: \(label) lockForConfiguration 失败 \(error)")
+            plog("Q3 双流: \(label) lockForConfiguration 失败 \(error)"); return nil
         }
     }
 
@@ -278,6 +340,7 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
             self.mainOutput.setSampleBufferDelegate(nil, queue: nil)
             if self.multiSession?.isRunning == true { self.multiSession?.stopRunning() }
             self.multiSession = nil
+            self.uwDev = nil; self.mainDev = nil
             self.running = false
             plog("════ Q3 \(self.mode) stop → 探针session已释放 isRunning=\(self.single.isRunning) → 允许恢复 app 相机 ════")
             LensProbeStatus.shared.clear()
