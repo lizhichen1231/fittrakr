@@ -134,8 +134,14 @@ protocol CameraEngineDelegate: AnyObject {
                 self.session.inputs.forEach { self.session.removeInput($0) }
                 self.session.outputs.forEach { self.session.removeOutput($0) }
                 self.session.commitConfiguration()
+                // 刀A:delegate 置 nil——不留任何指向 app 管线的回调,交接干净
+                self.videoOutput.setSampleBufferDelegate(nil, queue: nil)
+                self.audioOutput.setSampleBufferDelegate(nil, queue: nil)
             }
             self.configured = false
+            // 刀A:确认 isRunning=false 落日志——这行必须出现在探针「配置完成」之前,是有序交接的凭证
+            let msg = "🔁 探针交接: app相机已停 isRunning=\(self.session.isRunning) inputs=\(self.session.inputs.count) outputs=\(self.session.outputs.count) delegate=nil → \(self.session.isRunning ? "⚠️ 仍在运行,交接失败!" : "已释放,允许探针接管")"
+            print(msg); PerfFileLog.shared.line(msg)
             DispatchQueue.main.async { completion() }
         }
     }

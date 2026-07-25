@@ -373,7 +373,12 @@ fileprivate struct TunerSheet: View {
                     Button("Q3 双流(超广角感知+主摄显示,10min)") { vm.stopCameraForProbe { LensDualStreamProbe.shared.startDual() } }
                     Button("Q4 连续性 ramp 1.5→2.5(对准静止目标)") { vm.stopCameraForProbe { LensContinuityProbe.shared.start() } }
                     Button("⏹ 停探针 + 恢复相机", role: .destructive) {
-                        LensDualStreamProbe.shared.stop(); LensContinuityProbe.shared.stop(); vm.start()
+                        // 刀A 反向有序恢复:两探针各自确认 session 已释放(completion)后才 vm.start(),杜绝恢复侧 -17281
+                        LensContinuityProbe.shared.stop {
+                            LensDualStreamProbe.shared.stop {
+                                vm.start()
+                            }
+                        }
                     }
                 }
                 #endif

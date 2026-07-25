@@ -157,19 +157,27 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
         }
     }
 
-    func stop() {
+    /// 刀A:completion = 反向有序恢复——探针 session 确认释放后(主线程)才放行调用方 vm.start()。
+    /// 未在跑也必须回调,否则「停探针+恢复相机」链在这里断掉,相机回不来。
+    func stop(_ completion: (() -> Void)? = nil) {
         queue.async {
-            guard self.running else { return }
+            guard self.running else {
+                if let c = completion { DispatchQueue.main.async(execute: c) }
+                return
+            }
             self.timer?.cancel(); self.timer = nil
             NotificationCenter.default.removeObserver(self)
             if self.single.isRunning { self.single.stopRunning() }
             self.single.inputs.forEach { self.single.removeInput($0) }
             self.single.outputs.forEach { self.single.removeOutput($0) }
+            self.uwOutput.setSampleBufferDelegate(nil, queue: nil)     // 刀A:delegate 置 nil(下次 start 由 setup 重挂)
+            self.mainOutput.setSampleBufferDelegate(nil, queue: nil)
             if self.multiSession?.isRunning == true { self.multiSession?.stopRunning() }
             self.multiSession = nil
             self.running = false
-            plog("════ Q3 \(self.mode) stop ════")
+            plog("════ Q3 \(self.mode) stop → 探针session已释放 isRunning=\(self.single.isRunning) → 允许恢复 app 相机 ════")
             LensProbeStatus.shared.clear()
+            if let c = completion { DispatchQueue.main.async(execute: c) }
         }
     }
 

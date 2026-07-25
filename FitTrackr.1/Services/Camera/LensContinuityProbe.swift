@@ -44,15 +44,22 @@ final class LensContinuityProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
         PerfFileLog.shared.line("════ Q4 连续性探针 start(dualWide,ramp 1.5→2.5 跨 S=2.0,静止目标对准)════")
     }
 
-    func stop() {
+    /// 刀A:completion = 反向有序恢复——探针 session 确认释放后(主线程)才放行调用方 vm.start()。
+    /// 未在跑也必须回调,否则「停探针+恢复相机」链断掉。ramp 到 2.5 的自停走 completion=nil,不受影响。
+    func stop(_ completion: (() -> Void)? = nil) {
         queue.async {
-            guard self.running else { return }
+            guard self.running else {
+                if let c = completion { DispatchQueue.main.async(execute: c) }
+                return
+            }
             if self.session.isRunning { self.session.stopRunning() }
             self.session.inputs.forEach { self.session.removeInput($0) }
             self.session.outputs.forEach { self.session.removeOutput($0) }
+            self.output.setSampleBufferDelegate(nil, queue: nil)   // 刀A:delegate 置 nil(下次 start 由 _start 重挂)
             self.running = false
-            PerfFileLog.shared.line("════ Q4 stop ════")
+            PerfFileLog.shared.line("════ Q4 stop → 探针session已释放 isRunning=\(self.session.isRunning) → 允许恢复 app 相机 ════")
             LensProbeStatus.shared.set("🔬 Q4 完成(ramp 到 2.5,已停)")
+            if let c = completion { DispatchQueue.main.async(execute: c) }
         }
     }
 
