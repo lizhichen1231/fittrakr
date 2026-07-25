@@ -86,6 +86,7 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
         uwOutput.setSampleBufferDelegate(self, queue: queue)
         if single.canAddOutput(uwOutput) { single.addOutput(uwOutput) }
         observe(single)
+        observePressure(uw, "uw")   // 判决卡·四:运行时压力变化事件
         single.commitConfiguration(); single.startRunning()
         plog("Q3 基线: 配置完成(ultrawide 单流),isRunning=\(single.isRunning)")
         return true
@@ -138,6 +139,7 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
         }
         uwDev = uw; mainDev = wide   // 判决卡·三:遍历重配用
         observe(s)
+        observePressure(uw, "uw"); observePressure(wide, "main")   // 判决卡·四:运行时压力变化事件(双路)
         s.commitConfiguration()
 
         // ═══ 埋点1(基点):commit 之后、startRunning 之前读一次预算——阶梯逐档的 cost 由 runRung 记 ═══
@@ -197,8 +199,15 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
                 guard let self = self, self.running else { return }
                 let dt = max(0.001, CACurrentMediaTime() - t0)
                 let f = Double(self.uwFrames) / dt, mf = Double(self.mainFrames) / dt
-                let line = String(format: "Q3 阶梯 ✔ %@: uw=%@ main=%@ hwCost=%.2f spCost=%.2f 实测FPS=%.0f(感知)/%.0f(显示) %@",
-                                  r.name, uwDesc, mainDesc, hw, sp, f, mf, pass ? "双门过" : "双门未过")
+                // 判决卡·四:档位行带测量窗末的运行时状态(thermal + 双路 systemPressureState)——静态预测之外的硬证据
+                let tn: String = { switch ProcessInfo.processInfo.thermalState {
+                    case .nominal: return "nominal"; case .fair: return "fair"
+                    case .serious: return "serious"; case .critical: return "critical"; @unknown default: return "?" } }()
+                let line = String(format: "Q3 阶梯 ✔ %@: uw=%@ main=%@ hwCost=%.2f spCost=%.2f 实测FPS=%.0f(感知)/%.0f(显示) thermal=%@ pressure=uw:%@/main:%@ %@",
+                                  r.name, uwDesc, mainDesc, hw, sp, f, mf, tn,
+                                  self.lvlName(self.uwDev?.systemPressureState.level),
+                                  self.lvlName(self.mainDev?.systemPressureState.level),
+                                  pass ? "双门过" : "双门未过")
                 plog(line)
                 self.rungResults.append(line)
                 LensProbeStatus.shared.setRun(mode: "Q3阶梯\(r.name)", firstFrame: self.uwGotFirst, fps: f)
@@ -288,6 +297,27 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
         }
     }
 
+    // ═══ 判决卡·四:运行时压力实测(静态 systemPressureCost 是配置时预测,运行时状态才是判据证据)═══
+    private var pressureObs: [NSKeyValueObservation] = []
+
+    private func lvlName(_ l: AVCaptureDevice.SystemPressureState.Level?) -> String {
+        switch l {
+        case .some(.nominal): return "nominal"; case .some(.fair): return "fair"
+        case .some(.serious): return "serious"; case .some(.critical): return "critical"
+        case .some(.shutdown): return "shutdown"; default: return "?"
+        }
+    }
+
+    /// systemPressureState 变化事件单独打行(带时间戳+因子),KVO;stop 时 invalidate
+    private func observePressure(_ dev: AVCaptureDevice, _ label: String) {
+        pressureObs.append(dev.observe(\.systemPressureState, options: [.new]) { [weak self] d, _ in
+            guard let self = self else { return }
+            let st = d.systemPressureState
+            plog(String(format: "Q3 ⚠️ systemPressure变化 t=%.3f %@=%@ factors=0x%X",
+                        CACurrentMediaTime(), label, self.lvlName(st.level), st.factors.rawValue))
+        })
+    }
+
     private var obsTokens: [NSObjectProtocol] = []
 
     /// 埋点3+修复1:中断(reason+时间戳)/RuntimeError(NSError.code)/中断结束→尝试恢复,失败自动停探针还相机。
@@ -333,6 +363,8 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
             self.timer?.cancel(); self.timer = nil
             self.obsTokens.forEach { NotificationCenter.default.removeObserver($0) }   // block token 正确移除
             self.obsTokens.removeAll()
+            self.pressureObs.forEach { $0.invalidate() }   // 判决卡·四:KVO 释放
+            self.pressureObs.removeAll()
             if self.single.isRunning { self.single.stopRunning() }
             self.single.inputs.forEach { self.single.removeInput($0) }
             self.single.outputs.forEach { self.single.removeOutput($0) }
@@ -375,10 +407,11 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
         let tn: String = { switch ProcessInfo.processInfo.thermalState {
             case .nominal: return "nominal"; case .fair: return "fair"
             case .serious: return "serious"; case .critical: return "critical"; @unknown default: return "?" } }()
-        // 帧率口径:双流两路分开报(感知/显示),与基线同口径对比
+        // 帧率口径:双流两路分开报(感知/显示),与基线同口径对比。判决卡·四:运行时 systemPressureState 与 thermal 并列
+        let pr = lvlName(uwDev?.systemPressureState.level)
         let msg = mode == "双流"
-            ? String(format: "Q3 %@ FPS=%.0f(感知)/%.0f(显示) thermal=%@ battery=%.0f%%", mode, fps, mfps, tn, UIDevice.current.batteryLevel * 100)
-            : String(format: "Q3 %@ FPS=%.0f thermal=%@ battery=%.0f%%", mode, fps, tn, UIDevice.current.batteryLevel * 100)
+            ? String(format: "Q3 %@ FPS=%.0f(感知)/%.0f(显示) thermal=%@ pressure=%@ battery=%.0f%%", mode, fps, mfps, tn, pr, UIDevice.current.batteryLevel * 100)
+            : String(format: "Q3 %@ FPS=%.0f thermal=%@ pressure=%@ battery=%.0f%%", mode, fps, tn, pr, UIDevice.current.batteryLevel * 100)
         plog(msg)
         LensProbeStatus.shared.setRun(mode: "Q3\(mode)", firstFrame: uwGotFirst, fps: fps)   // 常驻行:FPS 每 5s 刷
         LensProbeStatus.shared.set("🔬 " + msg)   // 事件行:完整采样(含 thermal/battery)
