@@ -366,11 +366,12 @@ fileprivate struct TunerSheet: View {
         NavigationView {
             Form {
                 #if DEBUG
-                // 【查勘#2 探针触发】用完即撤(probe/lens-recon)。按钮先 stop app 相机再起探针会话,读 PerfLog。
-                Section(header: Text("镜头查勘探针")) {
-                    Button("Q3 基线单流(超广角+感知,10min)") { vm.stop(); LensDualStreamProbe.shared.startBaseline() }
-                    Button("Q3 双流(超广角感知+主摄显示,10min)") { vm.stop(); LensDualStreamProbe.shared.startDual() }
-                    Button("Q4 连续性 ramp 1.5→2.5(对准静止目标)") { vm.stop(); LensContinuityProbe.shared.start() }
+                // 【查勘#2 探针触发】用完即撤(probe/lens-recon)。stopCameraForProbe 先彻底 teardown app 相机、
+                // 回调里(摄像头干净释放后)才起探针会话 → 避免两个 session 抢摄像头崩溃(FigCaptureSourceRemote -17281)。
+                Section(header: Text("🔬 镜头查勘探针")) {
+                    Button("Q3 基线单流(超广角+感知,10min)") { vm.stopCameraForProbe { LensDualStreamProbe.shared.startBaseline() } }
+                    Button("Q3 双流(超广角感知+主摄显示,10min)") { vm.stopCameraForProbe { LensDualStreamProbe.shared.startDual() } }
+                    Button("Q4 连续性 ramp 1.5→2.5(对准静止目标)") { vm.stopCameraForProbe { LensContinuityProbe.shared.start() } }
                     Button("⏹ 停探针 + 恢复相机", role: .destructive) {
                         LensDualStreamProbe.shared.stop(); LensContinuityProbe.shared.stop(); vm.start()
                     }

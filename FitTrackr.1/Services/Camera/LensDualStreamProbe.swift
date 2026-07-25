@@ -34,9 +34,9 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
     private var mainGotFirst = false
     private(set) var running = false
 
-    // 留 0.6s:按钮里 vm.stop() 异步 dispatch 到 app sessionQueue,给它时间真正 stopRunning 放开摄像头,否则探针会话被系统 interrupt → 持续 0 帧
-    func startBaseline() { queue.asyncAfter(deadline: .now() + 0.6) { self._start(dual: false) } }
-    func startDual()     { queue.asyncAfter(deadline: .now() + 0.6) { self._start(dual: true) } }
+    // 调用方(按钮)已用 vm.stopCameraForProbe 的 completion 保证 app 相机 teardown 落地才调这里;再留 0.3s 小余量兜硬件释放延迟
+    func startBaseline() { queue.asyncAfter(deadline: .now() + 0.3) { self._start(dual: false) } }
+    func startDual()     { queue.asyncAfter(deadline: .now() + 0.3) { self._start(dual: true) } }
 
     private func _start(dual: Bool) {
         guard !running else { return }

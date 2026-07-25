@@ -175,6 +175,19 @@ final class CameraViewModel: NSObject, ObservableObject {
         source.start()
     }
     func stop()  { source.stop(); stopTimer() }
+
+    #if DEBUG
+    /// 【查勘#2 探针专用·probe/lens-recon】停 app 相机,teardown 落地后回调 → 探针在回调里才开摄像头,避免争用崩溃。
+    func stopCameraForProbe(_ done: @escaping () -> Void) {
+        stopTimer()
+        if let live = source as? LiveCameraSource {
+            live.stopForProbe(done)
+        } else {
+            source.stop()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { done() }
+        }
+    }
+    #endif
     func toggleRecord() { isRecording ? stopRecord() : startRecord() }
     func toggleLock() { hardLock.toggle() }
 

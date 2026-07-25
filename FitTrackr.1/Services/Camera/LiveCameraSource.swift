@@ -27,6 +27,13 @@ final class LiveCameraSource: NSObject, FrameSource {
     func stop() {
         camera.stop()
     }
+
+    #if DEBUG
+    /// 【查勘#2 探针专用】停 app 相机并等 teardown 完成再回调(给探针一个干净释放的摄像头)。
+    func stopForProbe(_ completion: @escaping () -> Void) {
+        camera.stopForProbe(completion)
+    }
+    #endif
 }
 
 extension LiveCameraSource: CameraEngineDelegate {

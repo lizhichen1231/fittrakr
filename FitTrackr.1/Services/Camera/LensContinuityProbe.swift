@@ -18,7 +18,8 @@ final class LensContinuityProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
     private var frameN = 0
     private(set) var running = false
 
-    func start() { queue.async { self._start() } }
+    // 调用方已用 vm.stopCameraForProbe 回调保证 app 相机 teardown;留 0.3s 小余量兜硬件释放
+    func start() { queue.asyncAfter(deadline: .now() + 0.3) { self._start() } }
     private func _start() {
         guard !running else { return }
         guard let dw = AVCaptureDevice.default(.builtInDualWideCamera, for: .video, position: .back) else {

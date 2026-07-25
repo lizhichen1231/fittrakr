@@ -119,6 +119,28 @@ protocol CameraEngineDelegate: AnyObject {
         // 任务零:已删设备方向通知退订(不再订阅方向)
     }
 
+    #if DEBUG
+    /// 【查勘#2 探针专用·probe/lens-recon】彻底停采集并**移除输入释放摄像头设备**,teardown 落地后回调(主线程)。
+    /// 为什么不用普通 stop():stop() 只 stopRunning(),硬件释放有延迟且输入仍占设备 → 探针紧接着开自己的 session
+    /// 抢同一后置摄像头会撞 FigCaptureSourceRemote err=-17281 硬 assert(整个 app 被杀)。移除输入强制释放 + 用
+    /// completion 精确等到干净再放探针,替代不可靠的固定延时。configured=false → 恢复相机时 start() 会重新配置。
+    func stopForProbe(_ completion: @escaping () -> Void) {
+        sessionQueue.async {
+            if self.isMultiCamActive {
+                self.multiCamManager?.stop()
+            } else {
+                self.session.stopRunning()
+                self.session.beginConfiguration()
+                self.session.inputs.forEach { self.session.removeInput($0) }
+                self.session.outputs.forEach { self.session.removeOutput($0) }
+                self.session.commitConfiguration()
+            }
+            self.configured = false
+            DispatchQueue.main.async { completion() }
+        }
+    }
+    #endif
+
     deinit { NotificationCenter.default.removeObserver(self) }
 
     // 录制阶段切换稳定：开启 -> 更稳；关闭 -> 恢复预览低延迟
