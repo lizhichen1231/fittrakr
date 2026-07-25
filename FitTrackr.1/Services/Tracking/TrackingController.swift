@@ -671,8 +671,13 @@ final class TrackingController {
                                    lensArbiter.cooldownRemaining(at: _lensNow), zoom)
             #if DEBUG
             // 影子心跳:每 150 帧(~2.5s)落一行 zoom/镜头意图/门状态——零指令的场景也可对答案
-            // (没有它,「0 次指令」分不清是三层防抖正确拦住 还是 条件根本没到过)
-            if frameCount % 150 == 0 { PerfFileLog.shared.line("🎯 心跳 f\(frameCount) " + dbgLensShadow + " tag=\(_lensTag)") }
+            // (没有它,「0 次指令」分不清是三层防抖正确拦住 还是 条件根本没到过)。
+            // 补 c/vel:首轮对答案发现 Z=4.39 锁定 20s 零指令,须判「速度否决恒真 vs 中心在门外」——没有这两个字段断不了案
+            if frameCount % 150 == 0 {
+                let _cs = _lensCenter.map { String(format: "c=(%.3f,%.3f)", $0.x, $0.y) } ?? "c=nil"
+                PerfFileLog.shared.line(String(format: "🎯 心跳 f%d %@ %@ vel=%.3f tag=%@",
+                                               frameCount, dbgLensShadow, _cs, lensShadowVel, _lensTag))
+            }
             #endif
 
             // 日志
