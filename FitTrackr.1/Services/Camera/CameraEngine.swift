@@ -86,6 +86,25 @@ protocol CameraEngineDelegate: AnyObject {
     // forceTier0:验收开关(TunerSheet DEBUG 按钮切,重启相机生效)——本刀要求 Tier 0 可切换验证。
     static var forceTier0 = false
 
+    // 【刀1收口·zoom 钳死】刀2-4 完成前,任何路径写 device.videoZoomFactor ≠1.0 都被拦:
+    // KVO 侦测 → 断言(DEBUG 当场爆)+ log + 拦回 1.0。防在零防抖零豁免状态下触发裸物理切换。
+    // 探针交接(stopForProbe)时解除——Q4 ramp 是合法的设备 zoom 使用方;vm.start() 重新武装。
+    // 刀4(仲裁接线)落地时,本钳死改为「仅放行 debouncer 批准的写入」,而非删除。
+    private var zoomGuardObs: NSKeyValueObservation?
+    private func armZoomGuard(_ dev: AVCaptureDevice) {
+        zoomGuardObs?.invalidate()
+        zoomGuardObs = dev.observe(\.videoZoomFactor, options: [.new]) { [weak self] d, _ in
+            let z = d.videoZoomFactor
+            guard abs(z - 1.0) > 0.001 else { return }
+            let msg = "❌ 刀1钳死断言: device.videoZoomFactor 被写成 \(String(format: "%.2f", z))(刀4 前禁止物理 zoom)→ 拦回 1.0"
+            print(msg); PerfFileLog.shared.line(msg)
+            assertionFailure(msg)   // DEBUG 当场爆定位写入方;Release 只拦回
+            self?.sessionQueue.async {
+                if (try? d.lockForConfiguration()) != nil { d.videoZoomFactor = 1.0; d.unlockForConfiguration() }
+            }
+        }
+    }
+
     // 一次性 dump 实际捕获配置(session 启动后调一次,非每帧)。同时写静态量供 HUD 读。
     static var lastCaptureConfig = ""
     func dumpCaptureConfig() {
@@ -144,6 +163,8 @@ protocol CameraEngineDelegate: AnyObject {
                 self.audioOutput.setSampleBufferDelegate(nil, queue: nil)
             }
             self.configured = false
+            // 刀1收口:交接时解除 zoom 钳死——探针(Q4 ramp)是合法的设备 zoom 使用方;vm.start() 重新武装
+            self.zoomGuardObs?.invalidate(); self.zoomGuardObs = nil
             // 刀A:确认 isRunning=false 落日志——这行必须出现在探针「配置完成」之前,是有序交接的凭证
             let msg = "🔁 探针交接: app相机已停 isRunning=\(self.session.isRunning) inputs=\(self.session.inputs.count) outputs=\(self.session.outputs.count) delegate=nil → \(self.session.isRunning ? "⚠️ 仍在运行,交接失败!" : "已释放,允许探针接管")"
             print(msg); PerfFileLog.shared.line(msg)
@@ -438,6 +459,9 @@ extension CameraEngine {
         // 刀1:运行时切 Tier(强制开关翻转后 stop→start)走到这里时 session 已 configured,
         // configureSession 不会再跑 → 新设备的 1080p60 格式锁在这补(冷启动路径不变:configureSession 里那次生效)。
         if configured { _ = setPreferredFrameRate(60) }
+
+        // 刀1收口:钳死武装(格式敲定之后——格式变更会把 zoom 重置回 1.0,先钳会误报)
+        armZoomGuard(device)
 
         let gdc = device.isGeometricDistortionCorrectionSupported ? device.isGeometricDistortionCorrectionEnabled : false
         print("✅ Using: \(device.localizedName) | type=\(device.deviceType.rawValue) | zoom=\(device.videoZoomFactor) | GDC=\(gdc)")
