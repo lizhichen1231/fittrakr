@@ -27,6 +27,7 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
     private let queue = DispatchQueue(label: "probe.q3.dualstream", qos: .userInteractive)
     private let poseReq = VNDetectHumanBodyPoseRequest()
     private var uwFrames = 0
+    private var mainFrames = 0   // 帧率口径卡:显示流也计数,tick 两路分开报(产出表的实测 FPS 列)
     private var lastTick: TimeInterval = 0
     private var timer: DispatchSourceTimer?
     private var mode = ""
@@ -134,9 +135,8 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
             logMCCost(s, "降档B(主摄30fps)")
         }
         if s.hardwareCost > 1.0 {
-            setMultiCamFormat(uw, "超广角", targetW: 1280)      // 降档C:双设备 720p30
-            setMultiCamFormat(wide, "广角", targetW: 1280)
-            setFrameRate(uw, 30, "超广角"); setFrameRate(wide, 30, "主摄")
+            setMultiCamFormat(uw, "超广角", targetW: 1280, targetFPS: 30)   // 降档C:双设备 720p30(锁帧率已在 setMultiCamFormat 内)
+            setMultiCamFormat(wide, "广角", targetW: 1280, targetFPS: 30)
             logMCCost(s, "降档C(双设备720p30)")
         }
         plog(String(format: "Q3 双流·埋点1 判读: 最终 hardwareCost=%.2f → %@",
@@ -178,17 +178,38 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
         } catch { plog("Q3 双流: \(label) 锁 \(fps)fps 失败 \(error)") }
     }
 
-    /// 多摄独立设备:activeFormat 必须是 isMultiCamSupported 的,否则会话跑但无帧。选最接近 targetW 宽的一档(默认 1920;埋点1 降档传 1280)。
-    private func setMultiCamFormat(_ dev: AVCaptureDevice, _ label: String, targetW: Int = 1920) {
-        let cands = dev.formats.filter { $0.isMultiCamSupported }
+    /// 多摄独立设备:activeFormat 必须是 isMultiCamSupported 的,否则会话跑但无帧。
+    /// 帧率口径卡·二.2:优先「支持 targetFPS 且宽最接近 targetW」的多摄档,并**显式锁 targetFPS**
+    /// (旧版只按宽度过滤+主路径从不锁帧率 → 默认档 30fps = FPS=30 的成因)。
+    /// 无 targetFPS 多摄档时如实报「硬件不提供」,退回宽度最近档,锁到该档 maxFPS。
+    /// 二.1 实读:选完打印该 format 的 videoSupportedFrameRateRanges + activeVideoMin/MaxFrameDuration 实际值。
+    private func setMultiCamFormat(_ dev: AVCaptureDevice, _ label: String, targetW: Int = 1920, targetFPS: Double = 60) {
+        let mc = dev.formats.filter { $0.isMultiCamSupported }
         func w(_ f: AVCaptureDevice.Format) -> Int { Int(CMVideoFormatDescriptionGetDimensions(f.formatDescription).width) }
+        func maxFPS(_ f: AVCaptureDevice.Format) -> Double { f.videoSupportedFrameRateRanges.map { $0.maxFrameRate }.max() ?? 0 }
+        let withFPS = mc.filter { maxFPS($0) >= targetFPS }
+        if withFPS.isEmpty {
+            plog("Q3 双流: \(label) ⚠️ 硬件不提供 \(Int(targetFPS))fps 的多摄档(isMultiCamSupported 共\(mc.count)档,各档maxFPS=[\(mc.map { String(format: "%.0f", maxFPS($0)) }.joined(separator: ","))])")
+        }
+        let cands = withFPS.isEmpty ? mc : withFPS
         guard let fmt = cands.min(by: { abs(w($0) - targetW) < abs(w($1) - targetW) }) else {
             plog("Q3 双流: \(label) 无 isMultiCamSupported 格式!"); return
         }
         do {
-            try dev.lockForConfiguration(); dev.activeFormat = fmt; dev.unlockForConfiguration()
+            try dev.lockForConfiguration()
+            dev.activeFormat = fmt
+            let lockFPS = min(targetFPS, maxFPS(fmt))                 // 显式锁帧率(两路同口径)
+            let dur = CMTimeMake(value: 1, timescale: Int32(lockFPS))
+            dev.activeVideoMinFrameDuration = dur
+            dev.activeVideoMaxFrameDuration = dur
+            dev.unlockForConfiguration()
             let d = CMVideoFormatDescriptionGetDimensions(fmt.formatDescription)
-            plog("Q3 双流: \(label) 选多摄格式 \(d.width)x\(d.height)(目标宽\(targetW))")
+            let ranges = fmt.videoSupportedFrameRateRanges.map { String(format: "%.0f-%.0f", $0.minFrameRate, $0.maxFrameRate) }.joined(separator: "/")
+            func fpsOf(_ t: CMTime) -> Double { t.value > 0 ? Double(t.timescale) / Double(t.value) : 0 }
+            plog(String(format: "Q3 双流: %@ 选多摄格式 %dx%d ranges=%@ 实锁=%.0f/%.0f fps(目标 宽%d@%.0f)",
+                        label, d.width, d.height, ranges,
+                        fpsOf(dev.activeVideoMinFrameDuration), fpsOf(dev.activeVideoMaxFrameDuration),
+                        targetW, targetFPS))
         } catch {
             plog("Q3 双流: \(label) lockForConfiguration 失败 \(error)")
         }
@@ -263,18 +284,23 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
             uwFrames += 1
         } else if output === mainOutput {
             if !mainGotFirst { mainGotFirst = true; plog("Q3 ✅ 主摄显示流首帧到达") }
+            mainFrames += 1
         }
     }
 
     private func tick() {
         let now = CACurrentMediaTime()
-        let fps = Double(uwFrames) / max(0.001, now - lastTick)
-        uwFrames = 0; lastTick = now
+        let dt = max(0.001, now - lastTick)
+        let fps = Double(uwFrames) / dt
+        let mfps = Double(mainFrames) / dt
+        uwFrames = 0; mainFrames = 0; lastTick = now
         let tn: String = { switch ProcessInfo.processInfo.thermalState {
             case .nominal: return "nominal"; case .fair: return "fair"
             case .serious: return "serious"; case .critical: return "critical"; @unknown default: return "?" } }()
-        let msg = String(format: "Q3 %@ FPS=%.0f thermal=%@ battery=%.0f%%",
-                         mode, fps, tn, UIDevice.current.batteryLevel * 100)
+        // 帧率口径:双流两路分开报(感知/显示),与基线同口径对比
+        let msg = mode == "双流"
+            ? String(format: "Q3 %@ FPS=%.0f(感知)/%.0f(显示) thermal=%@ battery=%.0f%%", mode, fps, mfps, tn, UIDevice.current.batteryLevel * 100)
+            : String(format: "Q3 %@ FPS=%.0f thermal=%@ battery=%.0f%%", mode, fps, tn, UIDevice.current.batteryLevel * 100)
         plog(msg)
         LensProbeStatus.shared.set("🔬 " + msg)   // 屏上 HUD
     }
