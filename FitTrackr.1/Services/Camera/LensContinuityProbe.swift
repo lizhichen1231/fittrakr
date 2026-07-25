@@ -55,6 +55,7 @@ final class LensContinuityProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
         session.startRunning()
         rampStart = CACurrentMediaTime(); frameN = 0; running = true
         PerfFileLog.shared.line("════ Q4 连续性探针 start(dualWide,ramp 1.5→2.5 跨 S=2.0,静止目标对准)════")
+        LensProbeStatus.shared.setRun(mode: "Q4", firstFrame: false, fps: nil)   // 判决卡·四:常驻行
     }
 
     /// 判决卡·三.2:显式选 dualWide 的 format——1080p60 优先(与 Q3/基线同口径),无 60fps 档退回宽度最近档并如实报。
@@ -130,6 +131,7 @@ final class LensContinuityProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
             self.running = false
             PerfFileLog.shared.line("════ Q4 stop → 探针session已释放 isRunning=\(self.session.isRunning) → 允许恢复 app 相机 ════")
             LensProbeStatus.shared.set("🔬 Q4 完成(ramp 到 2.5,已停)")
+            LensProbeStatus.shared.clearRun()   // 常驻行熄灭 = 探针不再接管相机
             if let c = completion { DispatchQueue.main.async(execute: c) }
         }
     }
@@ -158,7 +160,10 @@ final class LensContinuityProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
         let msg = String(format: "Q4 f%d zoom=%.2f lens≈%@ buf=%dx%d poseC=(%.3f,%.3f) GDC=%@",
                          frameN, Double(z), lens, w, h, cx, cy, gdc ? "Y" : "N")
         PerfFileLog.shared.line(msg)
-        LensProbeStatus.shared.set("🔬 " + msg)   // 屏上 HUD
+        // 常驻行:首帧✅ + 累计FPS;事件行:逐帧明细(zoom/buf/poseC)
+        LensProbeStatus.shared.setRun(mode: "Q4", firstFrame: true,
+                                      fps: Double(frameN) / max(0.001, CACurrentMediaTime() - rampStart))
+        LensProbeStatus.shared.set("🔬 " + msg)
         if z >= 2.5 { stop() }
     }
 }

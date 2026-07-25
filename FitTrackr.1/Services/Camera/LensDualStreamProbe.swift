@@ -57,7 +57,7 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
         t.setEventHandler { [weak self] in self?.tick() }
         t.resume(); timer = t
         plog("════ Q3 \(mode) start(超广角感知 + \(dual ? "主摄显示流" : "无显示流"))════")
-        LensProbeStatus.shared.set("🔬 Q3 \(mode) 启动…等首帧")
+        LensProbeStatus.shared.setRun(mode: "Q3\(mode)", firstFrame: false, fps: nil)   // 判决卡·四:常驻行
     }
 
     private func setupSingle() -> Bool {
@@ -270,6 +270,7 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
             self.running = false
             plog("════ Q3 \(self.mode) stop → 探针session已释放 isRunning=\(self.single.isRunning) → 允许恢复 app 相机 ════")
             LensProbeStatus.shared.clear()
+            LensProbeStatus.shared.clearRun()   // 常驻行熄灭 = 探针不再接管相机
             if let c = completion { DispatchQueue.main.async(execute: c) }
         }
     }
@@ -278,7 +279,10 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard running else { return }
         if output === uwOutput, let pb = CMSampleBufferGetImageBuffer(sampleBuffer) {
-            if !uwGotFirst { uwGotFirst = true; plog("Q3 ✅ 超广角首帧到达") }
+            if !uwGotFirst {
+                uwGotFirst = true; plog("Q3 ✅ 超广角首帧到达")
+                LensProbeStatus.shared.setRun(mode: "Q3\(mode)", firstFrame: true, fps: nil)   // 常驻行:首帧翻✅
+            }
             let handler = VNImageRequestHandler(cvPixelBuffer: pb, orientation: .up, options: [:])
             _ = try? handler.perform([poseReq])
             uwFrames += 1
@@ -302,7 +306,8 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
             ? String(format: "Q3 %@ FPS=%.0f(感知)/%.0f(显示) thermal=%@ battery=%.0f%%", mode, fps, mfps, tn, UIDevice.current.batteryLevel * 100)
             : String(format: "Q3 %@ FPS=%.0f thermal=%@ battery=%.0f%%", mode, fps, tn, UIDevice.current.batteryLevel * 100)
         plog(msg)
-        LensProbeStatus.shared.set("🔬 " + msg)   // 屏上 HUD
+        LensProbeStatus.shared.setRun(mode: "Q3\(mode)", firstFrame: uwGotFirst, fps: fps)   // 常驻行:FPS 每 5s 刷
+        LensProbeStatus.shared.set("🔬 " + msg)   // 事件行:完整采样(含 thermal/battery)
     }
 }
 #endif
