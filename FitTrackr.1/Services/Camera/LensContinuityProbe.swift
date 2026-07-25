@@ -33,6 +33,8 @@ final class LensContinuityProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
             PerfFileLog.shared.line("Q4: dualWide 不可用,探针退出"); return
         }
         device = dw
+        // 判决卡·三.3:确认拿到的确是 dualWide 虚拟设备(而非降级单设备)——constituents + 切换点实读
+        plog("Q4: 设备=\(dw.localizedName) type=\(dw.deviceType.rawValue) isVirtual=\(dw.isVirtualDevice) constituents=\(dw.constituentDevices.map { $0.deviceType.rawValue }) switchOverZoomFactors=\(dw.virtualDeviceSwitchOverVideoZoomFactors)")
         session.beginConfiguration()
         session.sessionPreset = .inputPriority
         guard let input = try? AVCaptureDeviceInput(device: dw), session.canAddInput(input) else {
@@ -45,11 +47,39 @@ final class LensContinuityProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
         if session.canAddOutput(output) { session.addOutput(output) }
         if let conn = output.connection(with: .video) { pinConnectionPortrait(conn) }
         session.commitConfiguration()
+        // 判决卡·三.2:显式选 format(1080p60 优先),替掉「.inputPriority + 从不设 activeFormat(默认档不明)」。
+        // 注意顺序:activeFormat 变更会把 videoZoomFactor 重置回 1.0 → 必须先选 format 再设 zoom=1.5。
+        pickFormat(dw)
         try? dw.lockForConfiguration(); dw.videoZoomFactor = 1.5; dw.unlockForConfiguration()
         observe(session)   // 埋点3+修复1:中断/错误/恢复(放 startRunning 前——更早会在 bail 路径漏 token)
         session.startRunning()
         rampStart = CACurrentMediaTime(); frameN = 0; running = true
         PerfFileLog.shared.line("════ Q4 连续性探针 start(dualWide,ramp 1.5→2.5 跨 S=2.0,静止目标对准)════")
+    }
+
+    /// 判决卡·三.2:显式选 dualWide 的 format——1080p60 优先(与 Q3/基线同口径),无 60fps 档退回宽度最近档并如实报。
+    /// preset 已是 .inputPriority(:37)→ 会话尊重这里锁的 activeFormat。打印所选 format 及其帧率范围+实锁值。
+    private func pickFormat(_ dev: AVCaptureDevice) {
+        func w(_ f: AVCaptureDevice.Format) -> Int { Int(CMVideoFormatDescriptionGetDimensions(f.formatDescription).width) }
+        func maxFPS(_ f: AVCaptureDevice.Format) -> Double { f.videoSupportedFrameRateRanges.map { $0.maxFrameRate }.max() ?? 0 }
+        let with60 = dev.formats.filter { maxFPS($0) >= 60 }
+        if with60.isEmpty { plog("Q4: ⚠️ dualWide 无 60fps 档(共\(dev.formats.count)档),退回宽度最近档") }
+        let pool = with60.isEmpty ? dev.formats : with60
+        guard let fmt = pool.min(by: { abs(w($0) - 1920) < abs(w($1) - 1920) }) else { plog("Q4: 无可选 format!"); return }
+        do {
+            try dev.lockForConfiguration()
+            dev.activeFormat = fmt
+            let lockFPS = min(60, maxFPS(fmt))
+            let dur = CMTimeMake(value: 1, timescale: Int32(lockFPS))
+            dev.activeVideoMinFrameDuration = dur
+            dev.activeVideoMaxFrameDuration = dur
+            dev.unlockForConfiguration()
+            let d = CMVideoFormatDescriptionGetDimensions(fmt.formatDescription)
+            let ranges = fmt.videoSupportedFrameRateRanges.map { String(format: "%.0f-%.0f", $0.minFrameRate, $0.maxFrameRate) }.joined(separator: "/")
+            func fpsOf(_ t: CMTime) -> Double { t.value > 0 ? Double(t.timescale) / Double(t.value) : 0 }
+            plog(String(format: "Q4: 选format %dx%d ranges=%@ 实锁=%.0f/%.0f fps(1080p60 优先)",
+                        d.width, d.height, ranges, fpsOf(dev.activeVideoMinFrameDuration), fpsOf(dev.activeVideoMaxFrameDuration)))
+        } catch { plog("Q4: pickFormat lockForConfiguration 失败 \(error)") }
     }
 
     private var obsTokens: [NSObjectProtocol] = []
@@ -106,6 +136,7 @@ final class LensContinuityProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard running, let dw = device, let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        if frameN == 0 { plog("✅ Q4 首帧到达") }   // 判决卡·三.1:与 Q3 对齐的首帧标识(不再靠有无 Q4 f 行反推)
         // ramp:0.1/s,10s 从 1.5 推到 2.5
         let z = min(2.5, 1.5 + CGFloat(CACurrentMediaTime() - rampStart) * 0.1)
         try? dw.lockForConfiguration(); dw.videoZoomFactor = z; dw.unlockForConfiguration()
