@@ -75,9 +75,9 @@ final class CameraViewModel: NSObject, ObservableObject {
     @Published var deadZoneFraction: CGSize
 
     // æ‰‹åŠ¿è§¦å‘é…ç½®
-    @Published var gestureMode: GestureTriggerMode = .victory {   // 默认比耶✌️(更鲁棒/一次过门);.wave 张掌留着可回退
-        didSet { applyGestureConfig() }
-    }
+    @Published var gestureMode: GestureTriggerMode = .off {   // 手势封存(Zc 2026-07-26):算法是核心,手势分支等算法完毕再启。
+        didSet { applyGestureConfig() }                       // 用现成 .off 档休眠整条管线(process 进门即返),不注释代码=不造死路径;
+    }                                                         // 参数面板「手势触发」随时可拨回 victory/wave,完全可逆。
     @Published var gestureSampleEvery: Int = 3 {
         didSet { applyGestureConfig() }
     }
