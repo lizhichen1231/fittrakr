@@ -188,7 +188,15 @@ final class PersonIdentifier {
 
     /// 锁定最大的人
     func lockLargest(in pixelBuffer: CVPixelBuffer, sensorSize: CGSize) -> Bool {
+        // 【dt尖峰拆分·清A并刀】lockLargest 在阶段计时器之外同步跑,是 dt=106/468 尖峰真身。
+        // 三段拆:全帧检测 / 复核打印(DEBUG重复检测) / 建档(双区直方图)→ 决定优化往哪边使劲。
+        #if DEBUG
+        let _tLk0 = CACurrentMediaTime()
+        #endif
         let realBoxes = detectAllPersons(in: pixelBuffer, sensorSize: sensorSize)
+        #if DEBUG
+        let _tLk1 = CACurrentMediaTime()
+        #endif
         // 无真人:早返回(自动锁定每帧重试时不打日志/不重复检测)。D-场景(debug)需无真人也注入假人 → 不早返回。
         #if DEBUG
         let dActive = FakePersonInjector.shared.dScenario != .off
@@ -237,6 +245,7 @@ final class PersonIdentifier {
                          withConf.count, wa / frameArea, w.box.midX / sensorSize.width, w.box.midY / sensorSize.height,
                          wa >= maxA - 1 ? "YES" : "NO"))
         }
+        let _tLk2 = CACurrentMediaTime()   // 复核打印(含 DEBUG 二次全帧检测)段结束
         #endif
 
         guard let largest = realBoxes
@@ -245,6 +254,11 @@ final class PersonIdentifier {
         }
         lock(personBox: largest, in: pixelBuffer, sensorSize: sensorSize)
         #if DEBUG
+        // 【dt尖峰拆分】三段读数(print+落盘,Zc 冒烟锁定即产出;Release 无此段)
+        let _tLk3 = CACurrentMediaTime()
+        let _lkMsg = String(format: "🔒⏱ lockLargest拆分: 检测=%.0fms 复核打印(DEBUG二次检测)=%.0fms 建档=%.0fms 总=%.0fms",
+                            (_tLk1 - _tLk0) * 1000, (_tLk2 - _tLk1) * 1000, (_tLk3 - _tLk2) * 1000, (_tLk3 - _tLk0) * 1000)
+        print(_lkMsg); PerfFileLog.shared.line(_lkMsg)
         lockedBoxArea = largest.width * largest.height   // 记锁定框面积,供锁定后每帧对照
         // sticky:锁定那一刻矩形候选数 + 锁框面积比 → 折进 PROBE,不用滚回去翻 🔒LOCK触发
         dbgLockMomentCandCount = realBoxes.count
