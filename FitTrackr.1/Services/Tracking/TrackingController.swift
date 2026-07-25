@@ -315,6 +315,7 @@ final class TrackingController {
     // 【方案B·刀3】镜头仲裁影子模式状态(仅日志+HUD,不驱动设备)
     let lensArbiter = LensArbiter()
     private var lensShadowPrevCenter: CGPoint?
+    private var lensShadowPrevFrame = 0        // 刀3补3:上次有中心的帧号(断档>10帧重置速度)
     private var lensShadowVel: CGFloat = 0
     private var lensShadowLastCmdAt: TimeInterval = -1
     var dbgLensShadow = ""   // HUD 行:LENS影子 UW/Wide dz=Y/N cd=剩余 Z=当前
@@ -642,13 +643,24 @@ final class TrackingController {
             case .unlocked: _lensTag = "U"; case .locked: _lensTag = "L"
             case .searching: _lensTag = "S"; case .lost: _lensTag = "X"
             }
-            let _lensCenter: CGPoint? = _rectResult.map { CGPoint(x: $0.0.midX - 0.5, y: $0.0.midY - 0.5) }  // 归一→wide系(原点=中心)
-            if let c = _lensCenter, let p = lensShadowPrevCenter, dt > 0 {
-                // 影子速度:锁定中心帧间位移 EMA(影子模式自算;刀4 评估换预测速度估计)
-                let v = hypot(c.x - p.x, c.y - p.y) / CGFloat(dt)
-                lensShadowVel = 0.7 * lensShadowVel + 0.3 * v
+            // 锁定框中心 → wide 系【刀3补3·坐标归一修正】:检测/稳定框都在传感器像素空间(sensorW×sensorH),
+            // 必须除以尺寸再移原点(铁律③,本工程第三次栽在坐标系)。首选 stableBox(弹簧平滑,压检测噪声;
+            // 取到的是上一帧值,60fps 下一帧滞后可接受),miss 帧回退原始检测框。
+            let _lensBox: CGRect? = stableBox ?? _rectResult?.0
+            let _lensCenter: CGPoint? = _lensBox.map {
+                CGPoint(x: $0.midX / max(sensorW, 1) - 0.5, y: $0.midY / max(sensorH, 1) - 0.5)
             }
-            if _lensCenter != nil { lensShadowPrevCenter = _lensCenter }
+            if let c = _lensCenter {
+                if let p = lensShadowPrevCenter, frameCount - lensShadowPrevFrame <= 10, dt > 0 {
+                    // 影子速度:wide 系 /s(归一化后再差分)。断档 >10 帧则重置,不让陈旧速度污染门判定
+                    let v = hypot(c.x - p.x, c.y - p.y) / CGFloat(dt)
+                    lensShadowVel = 0.7 * lensShadowVel + 0.3 * v
+                } else {
+                    lensShadowVel = 0
+                }
+                lensShadowPrevCenter = c
+                lensShadowPrevFrame = frameCount
+            }
             let _lensOut = lensArbiter.decide(LensArbiterInput(
                 zoomReq: zoom, lockedCenter: _lensCenter, centerVel: lensShadowVel,
                 stateTag: _lensTag, tier1: CameraEngine.currentTier1,
