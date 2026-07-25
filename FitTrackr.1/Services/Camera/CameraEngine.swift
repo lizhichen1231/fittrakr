@@ -81,6 +81,11 @@ protocol CameraEngineDelegate: AnyObject {
         }
     }
 
+    // 【方案B·刀1 能力分层】Tier 1 = dualWide 虚拟设备(zoom 锁 1.0 → 物理恒 UW,行为冻结);
+    // Tier 0 = 无 dualWide 或强制开关 → 现状超广角+数字裁剪,一行不改。
+    // forceTier0:验收开关(TunerSheet DEBUG 按钮切,重启相机生效)——本刀要求 Tier 0 可切换验证。
+    static var forceTier0 = false
+
     // 一次性 dump 实际捕获配置(session 启动后调一次,非每帧)。同时写静态量供 HUD 读。
     static var lastCaptureConfig = ""
     func dumpCaptureConfig() {
@@ -374,17 +379,22 @@ extension CameraEngine {
         }
 
         let discovery = AVCaptureDevice.DiscoverySession(
-            deviceTypes: [.builtInUltraWideCamera, .builtInTripleCamera, .builtInDualWideCamera, .builtInWideAngleCamera],
+            deviceTypes: [.builtInDualWideCamera, .builtInUltraWideCamera, .builtInTripleCamera, .builtInWideAngleCamera],
             mediaType: .video,
             position: .back
         )
-        guard let device =
-                discovery.devices.first(where: { $0.deviceType == .builtInUltraWideCamera }) ??
-                discovery.devices.first(where: { $0.deviceType == .builtInTripleCamera || $0.deviceType == .builtInDualWideCamera }) ??
-                discovery.devices.first(where: { $0.deviceType == .builtInWideAngleCamera })
+        // 【方案B·刀1 能力分层】Tier 1:优先 dualWide 虚拟设备(物理切换后续由它托管;本刀 zoom 锁 1.0 = 恒 UW,行为冻结)。
+        // Tier 0:无 dualWide 或 forceTier0 → 现状链(超广角优先)原样。
+        let dualWide = discovery.devices.first(where: { $0.deviceType == .builtInDualWideCamera })
+        let tier1 = (dualWide != nil) && !CameraEngine.forceTier0
+        guard let device: AVCaptureDevice = tier1 ? dualWide :
+                (discovery.devices.first(where: { $0.deviceType == .builtInUltraWideCamera }) ??
+                 discovery.devices.first(where: { $0.deviceType == .builtInTripleCamera }) ??
+                 discovery.devices.first(where: { $0.deviceType == .builtInWideAngleCamera }))
         else {
             print("⚠️ 没找到后置相机"); return
         }
+        print("📷 刀1 能力分层: \(tier1 ? "Tier 1(dualWide 虚拟设备,zoom=1.0 物理恒UW)" : "Tier 0(超广角数字裁剪=现状)") forceTier0=\(CameraEngine.forceTier0) dualWide存在=\(dualWide != nil)")
 
         session.beginConfiguration()
         defer { session.commitConfiguration() }
@@ -410,7 +420,11 @@ extension CameraEngine {
                 device.isGeometricDistortionCorrectionEnabled = enable
             }
 
-            if device.deviceType == .builtInUltraWideCamera {
+            if device.deviceType == .builtInDualWideCamera {
+                // 刀1:dualWide zoom 硬锁 1.0 = 物理恒 UW(S=2.0 切换点远在上方,虚拟设备不会切镜头)。
+                // 全工程唯一动设备 zoom 的地方就是本函数(已核),数字裁剪 zoom 在下游 renderCrop,与此无关。
+                device.videoZoomFactor = 1.0
+            } else if device.deviceType == .builtInUltraWideCamera {
                 device.videoZoomFactor = max(1.0, device.minAvailableVideoZoomFactor)
             } else {
                 device.videoZoomFactor = max(0.5, device.minAvailableVideoZoomFactor)
@@ -420,6 +434,10 @@ extension CameraEngine {
         } catch {
             print("⚠️ 锁定设备失败：\(error)")
         }
+
+        // 刀1:运行时切 Tier(强制开关翻转后 stop→start)走到这里时 session 已 configured,
+        // configureSession 不会再跑 → 新设备的 1080p60 格式锁在这补(冷启动路径不变:configureSession 里那次生效)。
+        if configured { _ = setPreferredFrameRate(60) }
 
         let gdc = device.isGeometricDistortionCorrectionSupported ? device.isGeometricDistortionCorrectionEnabled : false
         print("✅ Using: \(device.localizedName) | type=\(device.deviceType.rawValue) | zoom=\(device.videoZoomFactor) | GDC=\(gdc)")

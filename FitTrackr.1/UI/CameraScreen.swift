@@ -366,11 +366,24 @@ struct CameraScreen: View {
 // MARK: - 调参抽屉（保持原有代码）
 fileprivate struct TunerSheet: View {
     @ObservedObject var vm: CameraViewModel
+    #if DEBUG
+    @State private var tier0Forced = CameraEngine.forceTier0   // 刀1 验收开关的界面态
+    #endif
 
     var body: some View {
         NavigationView {
             Form {
                 #if DEBUG
+                // 【方案B·刀1 验收开关】强制 Tier 0(超广角数字裁剪=现状)⇄ 自动(Tier 1 dualWide)。
+                // 重启相机生效;控制台看「📷 刀1 能力分层」与「✅ Using:」行确认设备切换。收口时评估撤留。
+                Section(header: Text("🔪 刀1 能力分层")) {
+                    Button(tier0Forced ? "当前:强制 Tier 0(超广角)→ 点击切回自动(dualWide)"
+                                       : "当前:自动 Tier 1(dualWide)→ 点击强制 Tier 0(超广角)") {
+                        CameraEngine.forceTier0.toggle()
+                        tier0Forced = CameraEngine.forceTier0
+                        vm.stop(); vm.start()   // 重启相机让 useUltraWideWithGDC 重选设备
+                    }
+                }
                 // 【查勘#2 探针触发】用完即撤(probe/lens-recon)。stopCameraForProbe 先彻底 teardown app 相机、
                 // 回调里(摄像头干净释放后)才起探针会话 → 避免两个 session 抢摄像头崩溃(FigCaptureSourceRemote -17281)。
                 Section(header: Text("🔬 镜头查勘探针")) {
