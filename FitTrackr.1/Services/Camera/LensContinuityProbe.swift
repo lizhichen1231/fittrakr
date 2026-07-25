@@ -56,6 +56,7 @@ final class LensContinuityProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
         rampStart = CACurrentMediaTime(); frameN = 0; running = true
         PerfFileLog.shared.line("════ Q4 连续性探针 start(dualWide,ramp 1.5→2.5 跨 S=2.0,静止目标对准)════")
         LensProbeStatus.shared.setRun(mode: "Q4", firstFrame: false, fps: nil)   // 判决卡·四:常驻行
+        LensProbeStatus.shared.setPreviewSession(session)   // 取景修:实时预览,不然对不了人(前5轮跨S全无人的根因)
     }
 
     /// 判决卡·三.2:显式选 dualWide 的 format——1080p60 优先(与 Q3/基线同口径),无 60fps 档退回宽度最近档并如实报。
@@ -129,6 +130,7 @@ final class LensContinuityProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
             self.session.outputs.forEach { self.session.removeOutput($0) }
             self.output.setSampleBufferDelegate(nil, queue: nil)   // 刀A:delegate 置 nil(下次 start 由 _start 重挂)
             self.running = false
+            LensProbeStatus.shared.setPreviewSession(nil)   // 取景修:预览随探针停
             // 判决卡·五:数据完整性自检——ramp 实记帧数落盘(60fps×10s ramp 应≈600 帧,显著少=有丢)
             plog("Q4 数据完整性: ramp 共记 \(self.frameN) 帧(逐帧 zoom/lens/buf/poseC/GDC 已落 PerfLog)")
             PerfFileLog.shared.line("════ Q4 stop → 探针session已释放 isRunning=\(self.session.isRunning) → 允许恢复 app 相机 ════")
