@@ -369,10 +369,21 @@ fileprivate struct TunerSheet: View {
                 // 【查勘#2 探针触发】用完即撤(probe/lens-recon)。stopCameraForProbe 先彻底 teardown app 相机、
                 // 回调里(摄像头干净释放后)才起探针会话 → 避免两个 session 抢摄像头崩溃(FigCaptureSourceRemote -17281)。
                 Section(header: Text("🔬 镜头查勘探针")) {
-                    Button("Q3 基线单流(超广角+感知,10min)") { vm.stopCameraForProbe { LensDualStreamProbe.shared.startBaseline() } }
-                    Button("Q3 双流(超广角感知+主摄显示,10min)") { vm.stopCameraForProbe { LensDualStreamProbe.shared.startDual() } }
+                    // 刀B 基线负载对齐:基线组 = app 本身跑典型负载(锁跟踪+录制),不停相机不建会话,只挂计量表。
+                    // 自动开录保证「录制 ON」;结束用「计量结束」钮,不要按 ⏹(那是双流/Q4 的恢复钮)。
+                    Button("Q3 基线·典型负载 计量开始(自动开录,10min)") {
+                        if !vm.isRecording { vm.toggleRecord() }
+                        LensLoadMeter.shared.start("基线(锁跟踪+录制)")
+                    }
+                    Button("Q3 基线·计量结束(停录保存)") {
+                        LensLoadMeter.shared.stop()
+                        if vm.isRecording { vm.toggleRecord() }
+                    }
+                    // 旧裸采集双流:负载未对齐,数据不作 OPEN-1 判决;留作双流通路 + 刀A 交接验证
+                    Button("Q3 双流(裸采集·仅通路验证,不作判决)") { vm.stopCameraForProbe { LensDualStreamProbe.shared.startDual() } }
                     Button("Q4 连续性 ramp 1.5→2.5(对准静止目标)") { vm.stopCameraForProbe { LensContinuityProbe.shared.start() } }
                     Button("⏹ 停探针 + 恢复相机", role: .destructive) {
+                        LensLoadMeter.shared.stop()   // 刀B:兜底停计量表(没在跑=no-op;录制不动,由「计量结束」管)
                         // 刀A 反向有序恢复:两探针各自确认 session 已释放(completion)后才 vm.start(),杜绝恢复侧 -17281
                         LensContinuityProbe.shared.stop {
                             LensDualStreamProbe.shared.stop {

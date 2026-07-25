@@ -137,6 +137,9 @@ final class CameraViewModel: NSObject, ObservableObject {
 
         // 帧/音频回调接到原来的处理逻辑上(等价于过去的 CameraEngineDelegate)
         source.onFrame = { [weak self] wide, tele, pts in
+            #if DEBUG
+            LensLoadMeter.shared.tickFrame()   // 【查勘#2 刀B】基线计量帧计数(不计量时零成本早退)·probe/lens-recon 用完即撤
+            #endif
             self?.handleFrame(wide: wide, telephoto: tele, pts: pts)
         }
         source.onAudio = { [weak self] sb in
