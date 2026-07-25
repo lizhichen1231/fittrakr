@@ -128,21 +128,19 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
         s.commitConfiguration()
 
         // ═══ 埋点1:MultiCam 配置合法性(commit 之后、startRunning 之前)═══
-        // 判读:hardwareCost >1.0 = 硬件预算超限,会话 isRunning=true 但不投帧(正是 FPS=0 无首帧症状)
+        // 双门(判决卡·二):hardwareCost >1.0 或 systemPressureCost >1.0 任一超限即降档。
+        // 教训:1080p60×2 实测 hwCost=0.70 但 spCost=3.25(超阈3倍,显示流已掉帧 45-57)——只看 hwCost 会输出假「能跑」。
         logMCCost(s, "初始配置(≈1080p60×2)")
-        if s.hardwareCost > 1.0 {
+        if !gatePass(s) {
             setFrameRate(wide, 30, "主摄")                      // 降档B:仅降主摄帧率(超广角感知保 60)
             logMCCost(s, "降档B(主摄30fps)")
         }
-        if s.hardwareCost > 1.0 {
+        if !gatePass(s) {
             setMultiCamFormat(uw, "超广角", targetW: 1280, targetFPS: 30)   // 降档C:双设备 720p30(锁帧率已在 setMultiCamFormat 内)
             setMultiCamFormat(wide, "广角", targetW: 1280, targetFPS: 30)
             logMCCost(s, "降档C(双设备720p30)")
         }
-        plog(String(format: "Q3 双流·埋点1 判读: 最终 hardwareCost=%.2f → %@",
-                    s.hardwareCost,
-                    s.hardwareCost > 1.0 ? "仍>1.0 预算超限,预期不投帧(OPEN-1 关键证据)"
-                                         : "≤1.0 预算内,本行之后的配置即「能跑的最省配置」"))
+        plog(gateLine(s, "最终"))
 
         // ═══ 埋点2:连线是否建起来(同一位置)═══
         var cds: [String] = []
@@ -157,6 +155,19 @@ final class LensDualStreamProbe: NSObject, AVCaptureVideoDataOutputSampleBufferD
         s.startRunning()
         plog("Q3 双流: startRunning 后 isRunning=\(s.isRunning) connActive=[\(s.connections.map { $0.isActive ? "Y" : "N" }.joined(separator: ","))]")
         return true
+    }
+
+    /// 双门(判决卡·二):两个预算都 ≤1.0 才算过——hwCost 管硬件带宽,spCost 管持续压力(超了=掉帧/发热不可持续)
+    private func gatePass(_ s: AVCaptureMultiCamSession) -> Bool {
+        s.hardwareCost <= 1.0 && s.systemPressureCost <= 1.0
+    }
+
+    /// 双门判读行:两个数并排,各自达标与否 + 总判
+    private func gateLine(_ s: AVCaptureMultiCamSession, _ stage: String) -> String {
+        let hw = s.hardwareCost, sp = s.systemPressureCost
+        return String(format: "Q3 双流·双门判读 %@: hardwareCost=%.2f(%@) systemPressureCost=%.2f(%@) → %@",
+                      stage, hw, hw <= 1.0 ? "达标" : "超限", sp, sp <= 1.0 ? "达标" : "超限",
+                      (hw <= 1.0 && sp <= 1.0) ? "双门通过,可持续" : "未过双门,不可持续")
     }
 
     /// 埋点1:MultiCam 预算三元组(hardwareCost/systemPressureCost/运行时 isMultiCamSupported)
