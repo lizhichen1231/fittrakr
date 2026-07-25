@@ -144,7 +144,8 @@ final class TrackingController {
     }
     var lockState: LockState = .unlocked
     let searchTimeoutSec: TimeInterval = 4.0
-    // ⑤ 找回冷却(旋转门另一半):searching→locked 后此时长内禁止再进 SEARCHING(简单计时器;StateDebouncer 仍冻结,不建)
+    // ⑤ 找回冷却(旋转门另一半):searching→locked 后此时长内禁止再进 SEARCHING(简单计时器;
+    //    StateDebouncer 已于方案B·刀2 出生(镜头切换首用),此处收编排在设计稿 §9 收编序第二位,待后续纯重构刀)
     let reacqCooldownSec: TimeInterval = 2.0
     private var reacqLockedAt: TimeInterval = -100   // 上次「找回成功」时刻;-100 = 初始不在冷却
     #if DEBUG
@@ -310,6 +311,13 @@ final class TrackingController {
 
     var dbgFakeHUD = ""   // 卡2 最简 HUD:候选人数 + 锁谁(细节看 console REPLAY/FAKE 行)
     var dbgTrkHUD = ""    // 卡3 最简 HUD:锁谁 / 状态 / 找回@(取自 PersonIdentifier.dbgTrkLine,不重算)
+
+    // 【方案B·刀3】镜头仲裁影子模式状态(仅日志+HUD,不驱动设备)
+    let lensArbiter = LensArbiter()
+    private var lensShadowPrevCenter: CGPoint?
+    private var lensShadowVel: CGFloat = 0
+    private var lensShadowLastCmdAt: TimeInterval = -1
+    var dbgLensShadow = ""   // HUD 行:LENS影子 UW/Wide dz=Y/N cd=剩余 Z=当前
 
     // 跳变取证(只抓数据,不改逻辑):pose 四点门是否过、rect 兜底框 conf、本帧锚/ratio/rect框跳变量
     var dbgPoseValid = false
@@ -623,6 +631,35 @@ final class TrackingController {
             // ===== 三态锁定状态机:唯一权威写入点(下游只读 lockState,别处不许写)=====
             // identityMatched:锁定时 detectHuman 非nil ⟺ findTarget 命中(Part2 已堵 fallback,非nil只可能是身份命中)
             advanceLockState(identityMatched: (_rectResult != nil))
+
+            // ===== 【方案B·刀3】镜头仲裁·影子模式(单一权威下游,只读 lockState)=====
+            // 每帧组装输入调 decide,仅产出 决策日志+HUD;command 不驱动设备(a3ba32d 钳死仍拦着,刀4 才放行)。
+            // decide 无 app 侧副作用 → build 后行为与刀1 逐帧等同。
+            let _lensNow = CACurrentMediaTime()
+            let _lensCenter: CGPoint? = _rectResult.map { CGPoint(x: $0.0.midX - 0.5, y: $0.0.midY - 0.5) }  // 归一→wide系(原点=中心)
+            if let c = _lensCenter, let p = lensShadowPrevCenter, dt > 0 {
+                // 影子速度:锁定中心帧间位移 EMA(影子模式自算;刀4 评估换预测速度估计)
+                let v = hypot(c.x - p.x, c.y - p.y) / CGFloat(dt)
+                lensShadowVel = 0.7 * lensShadowVel + 0.3 * v
+            }
+            if _lensCenter != nil { lensShadowPrevCenter = _lensCenter }
+            let _lensOut = lensArbiter.decide(LensArbiterInput(
+                zoomReq: zoom, lockedCenter: _lensCenter, centerVel: lensShadowVel,
+                stateTag: dbgStateTag(), tier1: CameraEngine.currentTier1,
+                deviceZoom: CameraEngine.lastSelectedDeviceZoom), at: _lensNow)
+            if _lensOut.command != .none {
+                // 影子日志(可对答案):帧号/指令/触发线/Z_total/中心/速度/状态/Tier/距上次间隔。print+落盘。
+                let gap = lensShadowLastCmdAt < 0 ? "首次" : String(format: "%.1fs", _lensNow - lensShadowLastCmdAt)
+                let cstr = _lensCenter.map { String(format: "(%.3f,%.3f)", $0.x, $0.y) } ?? "nil"
+                let msg = String(format: "🎯 LENS-SHADOW f%d cmd=%@ 因=[%@] Z=%.2f c=%@ vel=%.3f tag=%@ tier1=%@ 距上次=%@",
+                                 frameCount, "\(_lensOut.command)", _lensOut.reason, zoom, cstr,
+                                 lensShadowVel, dbgStateTag(), CameraEngine.currentTier1 ? "Y" : "N", gap)
+                print(msg); PerfFileLog.shared.line(msg)
+                lensShadowLastCmdAt = _lensNow
+            }
+            dbgLensShadow = String(format: "LENS影子 %@ dz=%@ cd=%.1f Z=%.2f",
+                                   _lensOut.lens.rawValue, _lensOut.inDeadzone ? "Y" : "N",
+                                   lensArbiter.cooldownRemaining(at: _lensNow), zoom)
 
             // 日志
             if frameCount % 30 == 0 {

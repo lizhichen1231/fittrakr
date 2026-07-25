@@ -77,9 +77,10 @@ struct LensArbiterInput {
 
 struct LensArbiterOutput: Equatable {
     var command: LensCommand      // ① 跨S指令
-    var inDeadzone: Bool          // ② zoom 是否在死区(1.9–2.2)内
+    var inDeadzone: Bool          // ② zoom 是否在死区([S, 2.2])内
     var anchor: Bool              // ③ 指令发出帧锚点(=本帧有指令;刀4 事件驱动豁免窗的起窗信号)
-    var lens: PhysicalLens        // 决策后的镜头意图(刀3 前仅内部镜像,不驱动设备)
+    var lens: PhysicalLens        // 决策后的镜头意图(刀3 影子模式仅日志/HUD,不驱动设备)
+    var reason: String = ""       // 刀3 影子日志:本帧走的是仲裁表哪条线(指令帧必非空)
 }
 
 /// 镜头仲裁(设计稿 §4 五层,高压低)+ 三层防抖(§3:空间迟滞 / 驻留+速度否决 / 冷却单边)。
@@ -124,25 +125,30 @@ final class LensArbiter {
         func cheb(_ c: CGPoint) -> CGFloat { max(abs(c.x), abs(c.y)) }
         let prev = debouncer.state
 
+        var reason = ""
         if (input.stateTag == "S" || input.stateTag == "X"),
            prev == .wide, let c = lastKnownCenter, cheb(c) > p.safeZone {
             // 仲裁1:SEARCHING/LOST 且丢失位置在安全区外 → 强制 UW 即刻(找人必须全视野);动作写冷却
             debouncer.force(.uw, at: now, cooldownAfter: p.cooldownSec)
+            reason = "仲裁1:SEARCHING/LOST 安全区外(|c|>\(p.safeZone))"
         } else if input.stateTag == "L", prev == .wide,
                   let c = input.lockedCenter, cheb(c) > p.exitLine {
             // 仲裁2:通道二 force(锁定中心越出门线)→ 切 UW 即刻;动作写冷却(§3 单边:只锁切向窄)
             debouncer.force(.uw, at: now, cooldownAfter: p.cooldownSec)
+            reason = "仲裁2:出门线force(|c|>\(p.exitLine))"
         } else if prev == .wide, input.zoomReq < p.deadzoneLo {
             // 通道一 zoom 下穿 S → 回 UW(迟滞带全在 S 上侧后,下穿即出;无驻留)。
             // 【公式修正卡】改写冷却:下界提到 S 后,zoom 轴贴 S 往返成为现实场景,
             // 第三层(冷却单边)必须把 zoom 轴振荡也封顶——写 5s,仍只锁切向窄,切向广不受限。
             debouncer.force(.uw, at: now, cooldownAfter: p.cooldownSec)
+            reason = "通道一:zoom下穿S(\(p.deadzoneLo))回UW"
         } else if input.stateTag == "L",
                   let c = input.lockedCenter, cheb(c) <= p.entryLine,
                   input.centerVel < p.velMax, input.zoomReq > p.deadzoneHi {
             // 仲裁4:通道一 request——前置门三条件(回门线内+速度+zoom 需求)同时且连续 1.5s(驻留连续制,组件管);
             // 冷却期内组件自动不生效(仲裁3);切向主摄的迁移不写冷却(单边)
             debouncer.request(.wide, at: now, cooldownAfter: 0)
+            reason = "通道一:前置门驻留成立进Wide"
         } else {
             // 仲裁5:维持现状;喂回当前值 = 驻留清零(条件中断即清零)
             debouncer.request(prev, at: now)
@@ -150,6 +156,10 @@ final class LensArbiter {
 
         let lens = debouncer.state
         let command: LensCommand = (lens == prev) ? .none : (lens == .wide ? .toWide : .toUW)
-        return LensArbiterOutput(command: command, inDeadzone: deadzone, anchor: command != .none, lens: lens)
+        return LensArbiterOutput(command: command, inDeadzone: deadzone, anchor: command != .none,
+                                 lens: lens, reason: command != .none ? reason : "")
     }
+
+    /// HUD 用:冷却剩余
+    func cooldownRemaining(at now: TimeInterval) -> TimeInterval { debouncer.cooldownRemaining(at: now) }
 }

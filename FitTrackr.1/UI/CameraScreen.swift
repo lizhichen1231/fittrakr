@@ -102,6 +102,19 @@ struct CameraScreen: View {
                         }
                         .padding(.horizontal, 16).padding(.top, 4)
                     }
+                    // 【方案B·刀3】镜头仲裁影子 HUD(cyan;影子模式,决策不驱动设备)
+                    if vm.showDebugOverlay, !vm.lensHUD.isEmpty {
+                        HStack {
+                            Text(vm.lensHUD)
+                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                .foregroundColor(.cyan)
+                                .lineLimit(1).minimumScaleFactor(0.4)
+                                .padding(.horizontal, 8).padding(.vertical, 4)
+                                .background(.black.opacity(0.6), in: Capsule())
+                            Spacer(minLength: 0)
+                        }
+                        .padding(.horizontal, 16).padding(.top, 4)
+                    }
                     #endif
 
                     // 跳变取证(调试):默认不显示,眼睛开关打开才出

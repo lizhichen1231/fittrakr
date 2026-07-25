@@ -86,6 +86,10 @@ protocol CameraEngineDelegate: AnyObject {
     // forceTier0:验收开关(TunerSheet DEBUG 按钮切,重启相机生效)——本刀要求 Tier 0 可切换验证。
     static var forceTier0 = false
 
+    // 【刀3 影子模式】仲裁输入的采集侧事实(useUltraWideWithGDC 每次选定设备后更新;只读)
+    static var currentTier1 = false                    // 本次选定是否 dualWide(Tier 1)
+    static var lastSelectedDeviceZoom: CGFloat = 1.0   // 选定时设的设备 zoom(刀4 前恒 1.0)
+
     // 【刀1收口·zoom 钳死】刀2-4 完成前,任何路径写 device.videoZoomFactor ≠1.0 都被拦:
     // KVO 侦测 → 断言(DEBUG 当场爆)+ log + 拦回 1.0。防在零防抖零豁免状态下触发裸物理切换。
     // 探针交接(stopForProbe)时解除——Q4 ramp 是合法的设备 zoom 使用方;vm.start() 重新武装。
@@ -416,6 +420,8 @@ extension CameraEngine {
             print("⚠️ 没找到后置相机"); return
         }
         print("📷 刀1 能力分层: \(tier1 ? "Tier 1(dualWide 虚拟设备,zoom=1.0 物理恒UW)" : "Tier 0(超广角数字裁剪=现状)") forceTier0=\(CameraEngine.forceTier0) dualWide存在=\(dualWide != nil)")
+        CameraEngine.currentTier1 = tier1              // 刀3:影子仲裁读
+        CameraEngine.lastSelectedDeviceZoom = 1.0      // 刀4 前恒 1.0(钳死保证)
 
         session.beginConfiguration()
         defer { session.commitConfiguration() }
