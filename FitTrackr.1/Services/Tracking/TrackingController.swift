@@ -315,6 +315,9 @@ final class TrackingController {
     // 【方案B·刀3+刀4】镜头仲裁:决策(每帧)+ 执行(shadowOnly=OFF 时)
     // shadowOnly:唯一回滚开关(机上 TunerSheet 可切,默认 ON=只决策不动设备=刀3 行为)
     static var lensShadowOnly = true
+    // 保险丝:仅实时相机源的实例允许执行(vm init 按 source 类型设)。回放(VideoFileSource)实例
+    // 即使全局开关在「执行」也不动设备——否则回放页的指令会串台去写真相机的 zoom。
+    var lensExecutionAllowed = false
     let lensArbiter = LensArbiter()
     var lensDeviceZoom: CGFloat = 1.0          // 当前设备 zoom(执行侧写;crop 除数与坐标映射读)
     private var lensShadowPrevCenter: CGPoint?
@@ -732,8 +735,8 @@ final class TrackingController {
                 lensShadowLastCmdAt = _lensNow
                 lensLastCmdName = "\(_lensOut.command)"
                 lensLastCmdFrame = frameCount
-                // 刀4 执行:仅 执行模式+Tier1 时驱动设备(空间重映射→设备写入,经白名单执行器)
-                if !TrackingController.lensShadowOnly, CameraEngine.currentTier1 {
+                // 刀4 执行:仅 执行模式+Tier1+实时源实例(保险丝)时驱动设备(空间重映射→设备写入,经白名单执行器)
+                if !TrackingController.lensShadowOnly, CameraEngine.currentTier1, lensExecutionAllowed {
                     executeLensTransition(to: _targetD, reason: "\(_lensOut.command) \(_lensOut.reason)")
                 }
             }

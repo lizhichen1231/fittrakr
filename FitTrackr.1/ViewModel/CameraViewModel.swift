@@ -155,6 +155,8 @@ final class CameraViewModel: NSObject, ObservableObject {
         // 配置实际工作的 follow 引擎
         follow.applyPreset(.fitness)
         follow.updateTunables(tunables)
+        // 刀4 保险丝:只有实时相机源允许执行镜头切换;回放/文件源实例永远影子(防串台写真相机 zoom)
+        follow.lensExecutionAllowed = (source is LiveCameraSource)
 
        
     
