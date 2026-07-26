@@ -183,6 +183,8 @@ final class CameraViewModel: NSObject, ObservableObject {
         // 会话开始重置锁(PersonIdentifier 是单例,切换视频/重开相机时清掉上一会话的锁与颜色档案)→ 本会话自动锁定新主角。
         // 这是会话生命周期,不是录制生命周期:录制开关全程不碰锁。
         PersonIdentifier.shared.unlock()
+        // 【不变量III】镜头切换态复位:设备被 useUltraWideWithGDC 归 1.0,除数/仲裁/PI 同步归位(防重启态不一致)
+        follow.resetLensToUWBase()
         source.start()
     }
     func stop()  { source.stop(); stopTimer() }

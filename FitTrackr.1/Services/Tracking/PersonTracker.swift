@@ -115,7 +115,9 @@ extension TrackingController {
         let dy = (shoulder.y - hip.y) * sensorH
         let ratio = hypot(dx, dy) / sensorH
         guard ratio > 0.01 else { return nil }                // 退化保护
-        return ratio
+        // 【测量归一化·不变量III】除以设备zoom → UW基准系:切换后光学放大 D 倍,不除会让控制律
+        // 误判「人大了一倍」→ 拉远 → Zt 衰减下穿 S → 假性回切(实测 8.4s 振荡周期)。D=1 时恒等。
+        return ratio / max(lensDeviceZoom, 1.0)
     }
 
     /// 测量预处理层：门控 → 突变拒绝（离群点）→ 小窗中值，输出写入 lastTorsoRatio。
@@ -130,6 +132,13 @@ extension TrackingController {
         dbgPoseValid = (_torsoRaw != nil)   // 取证:四点 0.5 门是否通过
         if let raw = _torsoRaw {
             torsoLostFrames = 0   // 有 torso 读数 → 清零瞬丢计数
+            // 验收3 取证:测量连续性环形缓存(原值=×D 还原 buffer 空间比;除后=UW基准系 raw)+ 切换后 5 帧续打
+            lensRatioTrace.append((frameCount, raw * max(lensDeviceZoom, 1.0), raw))
+            if lensRatioTrace.count > 5 { lensRatioTrace.removeFirst() }
+            if lensRatioTraceArm > 0 {
+                print(String(format: "📏 RATIO后 f%d 原值(buffer比)=%.4f 除后(UW基准)=%.4f", frameCount, raw * max(lensDeviceZoom, 1.0), raw))
+                lensRatioTraceArm -= 1
+            }
             // 改动1-① 标定:torsoToBoxHeight = EMA(torsoRatio / 全身框高比),仅好 torso 帧更新
             if let boxH = boxHeightRatio, boxH > 0.01 {
                 let ratioNow = raw / boxH
@@ -237,7 +246,7 @@ extension TrackingController {
     /// 从缓存的紧贴框获取高度比例（兜底方案）
     func getHeightRatioFromTightBox() -> CGFloat? {
         guard let box = lastTightBox else { return nil }
-        return box.height / sensorH
+        return box.height / sensorH / max(lensDeviceZoom, 1.0)   // 【不变量III】UW基准系(D=1 恒等)
     }
 
     // MARK: - 检测函数 - 支持身份识别

@@ -351,12 +351,35 @@ final class TrackingController {
         guard abs(newD - oldD) > 0.001 else { return }
         let k = newD / oldD
         remapBufferStateForLensSwitch(k: k)
+        // 【不变量III】PI 同步:位置状态重映射到新 buffer 空间 + 距离归一除数更新(判据恒在 UW基准系)
+        PersonIdentifier.shared.remapForLensSwitch(k: k, sensorSize: CGSize(width: sensorW, height: sensorH))
+        PersonIdentifier.shared.lensDeviceZoom = newD
         lensDeviceZoom = newD
+        // 验收3:切换帧测量连续性直接证据——先打切换前 5 帧缓存,再武装打切换后 5 帧
+        for t in lensRatioTrace { print(String(format: "📏 RATIO前 f%d 原值(buffer比)=%.4f 除后(UW基准)=%.4f", t.f, t.raw, t.norm)) }
+        lensRatioTraceArm = 5
         CameraEngine.lensZoomExecutor?(newD, reason)
     }
 
+    // 验收3 取证:环形缓存最近 5 帧躯干比(原值=buffer空间比,除后=UW基准系比);切换时前5帧+后5帧都打
+    var lensRatioTrace: [(f: Int, raw: CGFloat, norm: CGFloat)] = []
+    var lensRatioTraceArm = 0
+
+    /// 会话重启复位(vm.start 调):useUltraWideWithGDC 已把设备归 1.0,本侧除数/仲裁/PI 必须同步归位,
+    /// 否则「设备=1.0 而除数=2.0」→ 裁剪/测量全错(审计时发现的重启态不一致)。
+    func resetLensToUWBase() {
+        if lensDeviceZoom != 1.0 {
+            print(String(format: "🎯 LENS-RESET 会话重启:除数 %.1f→1.0(设备已由 useUltraWideWithGDC 归位)", lensDeviceZoom))
+        }
+        lensDeviceZoom = 1.0
+        PersonIdentifier.shared.lensDeviceZoom = 1.0
+        lensArbiter.reset()
+        lensShadowPrevCenter = nil; lensShadowVel = 0
+        lensRatioTrace.removeAll(); lensRatioTraceArm = 0
+    }
+
     /// buffer 空间几何重映射:设备 zoom D1→D2 时,所有 buffer 空间的框/弹簧绕画面中心缩放 k=D2/D1。
-    /// (wide 系量不动:_lensCenter 已除以 lensDeviceZoom,跨切换自洽)
+    /// (UW基准系量不动:_lensCenter 已除以 lensDeviceZoom,跨切换自洽)
     private func remapBufferRect(_ r: CGRect, k: CGFloat) -> CGRect {
         let cx = sensorW / 2, cy = sensorH / 2
         return CGRect(x: cx + (r.origin.x - cx) * k, y: cy + (r.origin.y - cy) * k,
@@ -639,8 +662,8 @@ final class TrackingController {
                 detFrameCount += 1
                 rectDetected = true
 
-                // 缩放始终基于矩形高度（稳定、一致）
-                lastHeightRatio = rect.height / sensorH
+                // 缩放始终基于矩形高度（稳定、一致)。【不变量III】除设备zoom → UW基准系(D=1 恒等)
+                lastHeightRatio = rect.height / sensorH / max(lensDeviceZoom, 1.0)
             }
 
             // Step B: 骨骼检测 —— 判断"人在干什么"（姿态分析 + 黄框显示）
@@ -697,7 +720,7 @@ final class TrackingController {
             case .unlocked: _lensTag = "U"; case .locked: _lensTag = "L"
             case .searching: _lensTag = "S"; case .lost: _lensTag = "X"
             }
-            // 锁定框中心 → wide 系:①像素→归一移原点(铁律③);②÷lensDeviceZoom(刀4:buffer 已被设备
+            // 锁定框中心 → UW基准系:①像素→归一移原点(铁律③);②÷lensDeviceZoom(刀4:buffer 已被设备
             // 光学放大 D,逆换算 p_wide=(p_buf−0.5)/D+0.5——卡面二.3 公式,中心化写法即 ÷D)。
             // 首选 stableBox(弹簧平滑压检测噪声,一帧滞后可接受),miss 帧回退原始检测框。
             let _lensBox: CGRect? = stableBox ?? _rectResult?.0
@@ -708,7 +731,7 @@ final class TrackingController {
             }
             if let c = _lensCenter {
                 if let p = lensShadowPrevCenter, frameCount - lensShadowPrevFrame <= 10, dt > 0 {
-                    // 速度:wide 系 /s(归一化+除D后差分,跨切换自洽)。断档 >10 帧重置,不让陈旧速度污染门判定
+                    // 速度:UW基准系 /s(归一化+除D后差分,跨切换自洽)。断档 >10 帧重置,不让陈旧速度污染门判定
                     let v = hypot(c.x - p.x, c.y - p.y) / CGFloat(dt)
                     lensShadowVel = 0.7 * lensShadowVel + 0.3 * v
                 } else {

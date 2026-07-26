@@ -73,9 +73,9 @@ enum PhysicalLens: String, Equatable { case uw = "UW", wide = "Wide" }
 enum LensCommand: Equatable { case none, toWide, toUW }
 
 struct LensArbiterInput {
-    var zoomReq: CGFloat          // 应用层目标 zoom(ZoomManager 输出,wide 系总倍率)
-    var lockedCenter: CGPoint?    // 锁定框中心,wide 系(原点=画面中心,半宽 ±0.5;§3 钉死:触发量是它,非 crop 框非 zoom)
-    var centerVel: CGFloat        // 中心速度(wide 系 /s;前置门速度否决用)
+    var zoomReq: CGFloat          // 应用层目标 zoom(ZoomManager 输出,UW基准系总倍率)
+    var lockedCenter: CGPoint?    // 锁定框中心,UW基准系(原点=画面中心,半宽 ±0.5;§3 钉死:触发量是它,非 crop 框非 zoom)
+    var centerVel: CGFloat        // 中心速度(UW基准系 /s;前置门速度否决用)
     var stateTag: String          // 三态机 "L"=locked "S"=searching "X"=lost "U"=unlocked
     var tier1: Bool               // 能力分层(刀1):false = 整套策略旁路(§0 非目标/§2 降级)
     var deviceZoom: CGFloat       // 当前 device.videoZoomFactor(刀4 前恒 1.0,透传记录用)

@@ -62,7 +62,7 @@ extension TrackingController {
     /// 仅 lastTightBoxIsFullBody 时返回值,否则 nil(不钳)。
     func bodyMaxLogZoom() -> CGFloat? {
         guard lastTightBoxIsFullBody, let box = smoothedTightBox else { return nil }
-        let h = box.height / sensorH
+        let h = box.height / sensorH / max(lensDeviceZoom, 1.0)   // 【不变量III】UW基准系(阈值 targetBodyFraction 按 UW 基准标定)
         guard h > 0.01 else { return nil }
         return log(targetBodyFraction / h)
     }

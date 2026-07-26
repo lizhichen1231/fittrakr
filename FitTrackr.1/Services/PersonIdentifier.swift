@@ -68,7 +68,10 @@ final class PersonIdentifier {
     // ===== 刀2 连续性主权:LOCKED 邻域门(转正,非DEBUG也编译)=====
     var lockedCenterHist: [(c: CGPoint, t: TimeInterval)] = []  // 近3帧「实际选中」中心(归一)+墙钟
     private let velClampPerSec: CGFloat = 0.5   // 速度幅值上限(归一/秒),防单帧坏值甩飞预测
-    let gateR0: CGFloat = 0.06           // Config:邻域门起步半径(待影子日志校准)
+    let gateR0: CGFloat = 0.06           // Config:邻域门起步半径(待影子日志校准)。阈值按 UW基准系标定
+    // 【不变量III·测量归一化】当前设备 zoom(TrackingController 切换时同步写入)。
+    // 本类所有归一化距离量(邻域门 d、找回 dFreeze)在与阈值比较前除以它 → 判据恒在 UW基准系。D=1 恒等。
+    var lensDeviceZoom: CGFloat = 1.0
     let gateVetoThreshold: Float = 0.25  // Config:颜色否决门槛(明显不是一个人才踢)
     let maxExtrapolationSec: CGFloat = 0.08  // Config:预测外推上限(防历史冻结时 pred 无限跑飞)
     var gateHits = 0, gateMissCount = 0, gateVetoCount = 0, gateDetectorMiss = 0  // 门统计(内存累加,规避每帧print)
@@ -342,6 +345,21 @@ final class PersonIdentifier {
     private let wedgeBlacklistRadius: CGFloat = 0.08
     private let wedgeBlacklistTTL: TimeInterval = 10
 
+    /// 【不变量III·切换重映射】设备 zoom D1→D2:本类 buffer 空间位置状态绕画面中心一步缩放 k=D2/D1
+    /// (lockedCenterHist/searchFrozenPoint 是归一坐标,绕 0.5 缩放;lastLockedBox 是像素矩形,绕传感器中心缩放)。
+    /// 不重映射 → 切换帧 pred 在旧空间、候选在新空间,|c|×(D−1) 的假跳变直接打爆邻域门。
+    func remapForLensSwitch(k: CGFloat, sensorSize: CGSize) {
+        func remapN(_ p: CGPoint) -> CGPoint { CGPoint(x: 0.5 + (p.x - 0.5) * k, y: 0.5 + (p.y - 0.5) * k) }
+        lockedCenterHist = lockedCenterHist.map { (remapN($0.0), $0.1) }
+        if let f = searchFrozenPoint { searchFrozenPoint = remapN(f) }
+        if let b = lastLockedBox {
+            let cx = sensorSize.width / 2, cy = sensorSize.height / 2
+            lastLockedBox = CGRect(x: cx + (b.origin.x - cx) * k, y: cy + (b.origin.y - cy) * k,
+                                   width: b.width * k, height: b.height * k)
+        }
+        print(String(format: "🎯 PI-REMAP k=%.2f(pred历史/冻结点/lastBox → 新buffer空间)", k))
+    }
+
     /// 三不管地带超时出口(TrackingController.advanceLockState 唯一调用方):记位置→连击判黑名单→解锁
     func forceUnlockWedged(at now: TimeInterval) {
         if let c = predictedCenter(at: now) {   // 卡死态下即冻结的锁定位置(归一)
@@ -530,7 +548,7 @@ final class PersonIdentifier {
         let t1c = CGPoint(x: top1.box.midX / sensorSize.width, y: top1.box.midY / sensorSize.height)
         // 位置预算:进冻结点起步 gateR0,随 searching 持续帧数线性放宽,封顶 reacqPosCap
         let posBudget = min(Float(gateR0) + reacqPosK * Float(searchingFrames), reacqPosCap)
-        let dFreeze: Float = searchFrozenPoint.map { Float(hypot(t1c.x - $0.x, t1c.y - $0.y)) } ?? 0
+        let dFreeze: Float = searchFrozenPoint.map { Float(hypot(t1c.x - $0.x, t1c.y - $0.y) / lensDeviceZoom) } ?? 0   // 【不变量III】UW基准系
 
         // 三牙(缺一不可):① 颜色≥matchThreshold ② margin(top1−top2)>reacqMargin(单候选视为满足) ③ 离冻结点≤预算
         let toothColor  = top1.color >= config.matchThreshold
@@ -790,7 +808,8 @@ final class PersonIdentifier {
         var inGateCount = 0, vetoedCount = 0
         for p in persons {
             let c = nc(p)
-            let d = hypot(c.x - refC.x, c.y - refC.y)
+            // 【不变量III】buffer 归一距离 ÷ 设备zoom → UW基准系再比 R(不除则 D=2 时门半径物理上减半)
+            let d = hypot(c.x - refC.x, c.y - refC.y) / lensDeviceZoom
             if d > R { continue }
             inGateCount += 1
             let (_, s) = isTarget(p, in: colorBuffer, sensorSize: sensorSize)  // 仅取分做否决,不选谁
