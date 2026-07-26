@@ -629,6 +629,18 @@ final class TrackingController {
         // 重映射语义 = 把「上一帧遗留值」换算到本帧空间。原先执行在检测之后 → 本帧新检测值被再乘
         // k≈1.03(恰等于缓推每帧步长,缓推模式特有、逐帧累积 30 次)→ 窗1 100% miss 回归。
         // 搬到这里:先换算遗留 → 检测随后写入的新值不再被碰。只搬位,零其他改动。
+        #if DEBUG
+        // 埋点卡:帧入口写归段标志(先于检测 → SCORE/REACQ 行的 [tag] 与当帧一致)
+        do {
+            let _t: String
+            switch lockState {
+            case .unlocked: _t = "U"; case .locked: _t = "L"
+            case .searching: _t = "S"; case .lost: _t = "X"
+            }
+            PersonIdentifier.shared.dbgPhaseTag = _t
+            PersonIdentifier.shared.dbgScoreDump = (lensSwitchTraceArm > 0) || _t == "S" || _t == "X"
+        }
+        #endif
         if let reader = CameraEngine.liveDeviceZoomReader {
             let dRead = reader()
             if abs(dRead - lensDeviceZoom) > 0.001 {

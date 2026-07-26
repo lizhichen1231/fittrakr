@@ -62,6 +62,8 @@ final class PersonIdentifier {
     var dbgCurThresh: Float = 0.5   // 本帧生效门槛(安全阀降门时=0.30)
     var dbgSrcMerged = false        // rect 是否并源(searching 时 P+R)
     var dbgBestRejectCont: Float = 0   // nil 帧最佳被拒候选延续分(搜索心跳 bestCont)
+    var dbgPhaseTag = "?"              // 埋点卡:本帧三态 tag(TC 帧入口写)——两段失败分别归因用
+    var dbgScoreDump = false           // 埋点卡:切换窗/S 期落盘分量行
     var dbgSizeRaw: Float = -1         // 刀A 自证:最近一次评分的候选面积比【原值】
     var dbgSizeNorm: Float = -1        // 刀A 自证:同帧【归一化值】(÷D²)
     var dbgSizeTrace: [(raw: Float, norm: Float)] = []   // 最近5帧(切换时打 SIZE前)
@@ -188,6 +190,14 @@ final class PersonIdentifier {
         self.gateHits = 0; self.gateMissCount = 0; self.gateVetoCount = 0; self.gateDetectorMiss = 0
         // ⑤:新一次锁定 = 装牙状态清账
         self.searchFrozenPoint = nil; self.searchingFrames = 0; self.wasSearchMode = false
+        #if DEBUG
+        // 埋点卡③:档案四项实际值落盘(直方图压缩为 16×两位整数)
+        let _hU = profile.colorHistogram.map { String(Int($0 * 99)) }.joined(separator: ",")
+        let _hL = profile.lowerBodyColorHist.map { String(Int($0 * 99)) }.joined(separator: ",")
+        PerfFileLog.shared.line(String(format: "📇 档案@lock aspect=%.2f relSize(UW基准)=%.4f center=(%.2f,%.2f) D=%.2f 上色[%@] 下色[%@]",
+            profile.aspectRatio, profile.relativeSize, profile.lastCenter.x, profile.lastCenter.y,
+            lensDeviceZoom, _hU, _hL))
+        #endif
         self.reacqFailCount = 0; self.reacqFailColor = 0; self.reacqFailMargin = 0; self.reacqFailPos = 0; self.reacqFailDetector = 0
         // 刀3:已删 VNTrackObject 起跟(startTracking)+ sequenceHandler 重置。锁定后 LOCKED 走邻域门,不再起 track。
 
@@ -423,9 +433,11 @@ final class PersonIdentifier {
             personLowerColor = extractLowerBodyColor(from: ciImage, personBox: personBox, sensorSize: sensorSize)
         }
 
+        var _simUp: Float = -1, _simLow: Float = -1   // 埋点卡:分量捕获(-1=该项跳过)
         // 1. 上半身颜色匹配
         if !target.colorHistogram.isEmpty && !personUpperColor.isEmpty {
             let sim = histogramSimilarity(target.colorHistogram, personUpperColor)
+            _simUp = sim
             totalScore += config.upperColorWeight * sim
             totalWeight += config.upperColorWeight
         }
@@ -433,6 +445,7 @@ final class PersonIdentifier {
         // 2. 下半身颜色匹配
         if !target.lowerBodyColorHist.isEmpty && !personLowerColor.isEmpty {
             let sim = histogramSimilarity(target.lowerBodyColorHist, personLowerColor)
+            _simLow = sim
             totalScore += config.lowerColorWeight * sim
             totalWeight += config.lowerColorWeight
         }
@@ -482,6 +495,17 @@ final class PersonIdentifier {
             self.target?.lastCenter = personCenter
         }
 
+        #if DEBUG
+        if dbgScoreDump {
+            PerfFileLog.shared.line(String(format: "🧮 SCORE[%@] c=(%.2f,%.2f) 上色=%@ 下色=%@ 体型=%.2f×%.2f(asp %.2f/档%.2f size %.4f/档%.4f) 位=%.2f×%.2f 总=%.2f 门=%.2f 差=%+.2f",
+                dbgPhaseTag, personCenter.x, personCenter.y,
+                _simUp < 0 ? "跳过" : String(format: "%.2f×%.2f", _simUp, config.upperColorWeight),
+                _simLow < 0 ? "跳过" : String(format: "%.2f×%.2f", _simLow, config.lowerColorWeight),
+                shapeSim, config.shapeWeight, personAspect, target.aspectRatio, personSize, target.relativeSize,
+                posSim, config.positionWeight,
+                finalScore, config.matchThreshold, finalScore - config.matchThreshold))
+        }
+        #endif
         return (isMatch, finalScore)
     }
 
@@ -579,6 +603,9 @@ final class PersonIdentifier {
             coastFrames = 0
             // 刀2:找回后重种预测历史 → 回 LOCKED 门从找回位置起(不吃丢失前陈旧速度)
             lockedCenterHist = [(t1c, CACurrentMediaTime())]
+            #if DEBUG
+            PerfFileLog.shared.line(String(format: "🦷 REACQ-OK[%@] 色=%.2f margin=%.2f pos=%.3f/预算%.3f", dbgPhaseTag, top1.color, top1.color - top2c, dFreeze, posBudget))
+            #endif
             return (top1.box, top1.color)
         }
 
@@ -596,6 +623,12 @@ final class PersonIdentifier {
         if !toothPos { reason += "偏冻结>预算 " }
         DebugLog.frame(String(format: "🔍 REACQ-FAIL top1=%.2f top2=%.2f margin=%.2f dFreeze=%.3f/预算%.3f reason=%@",
                      top1.color, top2c, top1.color - top2c, dFreeze, posBudget, reason.isEmpty ? "?" : reason))
+        // 埋点卡②:分牙逐帧落盘(现内存计数改落盘;[tag] 区分常规匹配段 vs SEARCHING 找回段)
+        PerfFileLog.shared.line(String(format: "🦷 REACQ[%@] 色=%.2f(门%.2f,%@) margin=%.2f(门%.2f,%@) pos=%.3f(预算%.3f,%@) 累计拒=%d(色%d/m%d/pos%d)",
+            dbgPhaseTag, top1.color, config.matchThreshold, toothColor ? "过" : "败",
+            top1.color - top2c, reacqMargin, toothMargin ? "过" : "败",
+            dFreeze, posBudget, toothPos ? "过" : "败",
+            reacqFailCount, reacqFailColor, reacqFailMargin, reacqFailPos))
         #endif
         return nil
     }

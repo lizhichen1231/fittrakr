@@ -67,6 +67,8 @@ protocol CameraEngineDelegate: AnyObject {
 
     func start() {
         #if DEBUG
+        // 埋点卡三:形态标注首行——避免与缓推时代窗1/窗2 数据混比。★改切换机制时同步改此行。
+        PerfFileLog.shared.line("🏷 形态=瞬切(直写执行器) 基线commit≈d96eb25+")
         LensReconProbe.dumpDualWide()   // 【查勘#2 Q2 探针】用完即撤(probe/lens-recon)
         #endif
         // 任务零:全应用锁死竖屏——已删设备方向通知订阅(采集层 connection 一次性设死 .portrait,不再跟随旋转)
