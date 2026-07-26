@@ -154,6 +154,7 @@ final class TrackingController {
     static let wedgeTimeoutSec: TimeInterval = 2.0
     private var wedgeNoMatchSince: TimeInterval = -1  // 进入三不管态的时刻;-1=不在此态
     #if DEBUG
+    static var dbgLostCount = 0   // 三牙回放台:LOST 次数(测试读/清)
     var dbgStateEvent = ""     // 最近一次事件缩写(保持 3s)
     var dbgStateEventUntil: TimeInterval = 0
     var dbgSearchCandSeen = 0  // 本轮 searching 累计看过的候选数(lost 日志 totalCandidatesSeen)
@@ -1080,6 +1081,9 @@ final class TrackingController {
 
     /// LOST 一次性转移(1.4):① 清空(=原 :600 组)→ 无人分支接管回全景;② unlock → unlocked → 下帧 auto-lock 重锁(lock() 重建颜色模板)
     private func performLostTransition() {
+        #if DEBUG
+        TrackingController.dbgLostCount += 1   // 三牙回放台判据:LOST 次数
+        #endif
         rawBox = nil
         lastHeightRatio = nil
         lastTorsoRatio = nil

@@ -87,6 +87,15 @@ final class PersonIdentifier {
     let reacqPosK: Float = 0.002         // ③ 位置预算随 searching 持续帧数线性放宽斜率
     let reacqPosCap: Float = 0.30        // ③ 位置预算上限
     private var searchFrozenPoint: CGPoint?   // 进入 searching 那刻的丢失位置(归一),③ 的基准点
+    // 【三牙刀2】主修:冻结点速度外推——修「参照点错了」,非放宽容忍度。预算增速(0.12/s)结构性
+    // 慢于实测步速(0.2-0.4/s)追不上 2-3 倍;外推让参照点跟着人走,带衰减+位移上限防转向/停步跑偏。
+    var reacqExtrapolationEnabled = true              // 回放台贡献拆分开关
+    var reacqPosStart: Float = 0.12                   // 辅修:预算起步 0.06→0.12(覆盖进S延迟内的步行位移);cap 0.30 不动
+    private var searchFrozenVel: CGPoint = .zero      // 冻结瞬间速度(归一/s,velClamp 同款钳)
+    private var searchFrozenDispl: CGFloat = 0        // 外推累计位移(上限 frozenDisplCap)
+    private var lastSearchTickAt: TimeInterval = 0
+    private let frozenVelDecayTau: TimeInterval = 0.8 // 外推速度 ~0.8s 衰减到 1/e
+    private let frozenDisplCap: CGFloat = 0.25        // 外推总位移上限(< posCap 0.30,不放大安全半径)
     private var searchingFrames = 0           // 本轮 searching 已持续帧数(③ 预算放宽用)
     private var wasSearchMode = false         // 上一帧是否 searchMode(检测「刚进 searching」那刻)
     var reacqFailCount = 0, reacqFailColor = 0, reacqFailMargin = 0, reacqFailPos = 0, reacqFailDetector = 0
@@ -397,6 +406,7 @@ final class PersonIdentifier {
         lastLockedBox = nil; coastFrames = 0
         lockedCenterHist.removeAll()   // 刀2:清预测历史
         searchFrozenPoint = nil; searchingFrames = 0; wasSearchMode = false   // ⑤:清装牙状态
+        searchFrozenVel = .zero; searchFrozenDispl = 0                          // 刀2:清外推态
         #if DEBUG
         dbgLockWho = "无"; dbgTrkState = "未锁定"; dbgRefindNX = -1; dbgRefindNY = -1; lockedBoxArea = -1; dbgReselectLine = ""
         dbgLockMomentCandCount = -1; dbgLockMomentAreaFrac = -1; dbgLockMomentCenter = .zero; dbgDriftLine = ""
@@ -528,11 +538,34 @@ final class PersonIdentifier {
 
         // ⑤ SEARCHING 计时 + 冻结点(装牙用):进入 searching 那刻记丢失位置,之后按帧放宽位置预算
         if searchMode {
+            let _nowS = CACurrentMediaTime()
             if !wasSearchMode {
                 searchFrozenPoint = lastLockedBox.map { CGPoint(x: $0.midX / sensorSize.width, y: $0.midY / sensorSize.height) }
                 searchingFrames = 0
+                // 刀2主修:冻结瞬间从 pred 历史末两点取速度(velClamp 同款钳);外推状态清账
+                searchFrozenVel = .zero; searchFrozenDispl = 0
+                if reacqExtrapolationEnabled, lockedCenterHist.count >= 2 {
+                    let a = lockedCenterHist[lockedCenterHist.count - 2], b = lockedCenterHist[lockedCenterHist.count - 1]
+                    let dtv = CGFloat(max(b.t - a.t, 0.008))
+                    var vx = (b.c.x - a.c.x) / dtv, vy = (b.c.y - a.c.y) / dtv
+                    let sp = hypot(vx, vy)
+                    if sp > velClampPerSec { let k = velClampPerSec / sp; vx *= k; vy *= k }
+                    searchFrozenVel = CGPoint(x: vx, y: vy)
+                }
+            } else if reacqExtrapolationEnabled, let f = searchFrozenPoint, searchFrozenVel != .zero {
+                // 刀2主修:参照点按冻结速度外推(带衰减 τ=0.8s + 位移上限 0.25)
+                let dtS = CGFloat(min(max(_nowS - lastSearchTickAt, 0.0), 0.1))
+                let step = CGPoint(x: searchFrozenVel.x * dtS, y: searchFrozenVel.y * dtS)
+                let stepLen = hypot(step.x, step.y)
+                if stepLen > 0, searchFrozenDispl + stepLen <= frozenDisplCap {
+                    searchFrozenPoint = CGPoint(x: f.x + step.x, y: f.y + step.y)
+                    searchFrozenDispl += stepLen
+                }
+                let decay = CGFloat(exp(-Double(dtS) / frozenVelDecayTau))
+                searchFrozenVel = CGPoint(x: searchFrozenVel.x * decay, y: searchFrozenVel.y * decay)
             }
             searchingFrames += 1
+            lastSearchTickAt = _nowS
         }
         wasSearchMode = searchMode
 
@@ -598,7 +631,7 @@ final class PersonIdentifier {
         let top2c: Float = scoredC.count > 1 ? scoredC[1].color : 0
         let t1c = CGPoint(x: top1.box.midX / sensorSize.width, y: top1.box.midY / sensorSize.height)
         // 位置预算:进冻结点起步 gateR0,随 searching 持续帧数线性放宽,封顶 reacqPosCap
-        let posBudget = min(Float(gateR0) + reacqPosK * Float(searchingFrames), reacqPosCap)
+        let posBudget = min(reacqPosStart + reacqPosK * Float(searchingFrames), reacqPosCap)   // 刀2辅修:起步 0.06→0.12(cap 不动)
         let dFreeze: Float = searchFrozenPoint.map { Float(hypot(t1c.x - $0.x, t1c.y - $0.y) / lensDeviceZoom) } ?? 0   // 【不变量III】UW基准系
 
         // 三牙(缺一不可):① 颜色≥matchThreshold ② margin(top1−top2)>reacqMargin(单候选视为满足) ③ 离冻结点≤预算
