@@ -377,6 +377,26 @@ final class TrackingController {
     var lensRatioTraceArm = 0
     var lensSwitchTraceArm = 0   // 【抖动取证】切换观测窗:指令后 120 帧逐帧落盘(d/Zt/eff/框/crop/比率)
 
+    /// 【刀B·不变量III】TC 侧持久 buffer 空间量的逐帧重映射(d 每变一步调一次,与 PI 微重映射同节奏)。
+    /// 病灶:rawBox(miss/S 帧冻结保旧值)、stableBox/smoothedTightBox/lastTightBox(弹簧/EMA 状态)、
+    /// pose 锚(coast 期冻结)——det=Y 时下一帧检测会覆盖(重映射只是消一帧偏差),det=N/coast 冻结时
+    /// 不重映射就在旧 d 空间腐烂(窗2 det=N 64% 的 TC 侧半边)。绕画面中心缩放 k,几何换算非运动。
+    private func remapFrozenBufferState(k: CGFloat) {
+        func rp(_ r: CGRect) -> CGRect {
+            let cx = sensorW / 2, cy = sensorH / 2
+            return CGRect(x: cx + (r.origin.x - cx) * k, y: cy + (r.origin.y - cy) * k,
+                          width: r.width * k, height: r.height * k)
+        }
+        if let b = rawBox           { rawBox = rp(b) }
+        if let b = stableBox        { stableBox = rp(b) }
+        if let b = smoothedTightBox { smoothedTightBox = rp(b) }
+        if let b = lastTightBox     { lastTightBox = rp(b) }
+        if poseAnchorValid {
+            lastPoseAnchorX = sensorW / 2 + (lastPoseAnchorX - sensorW / 2) * k
+            lastPoseAnchorY = sensorH / 2 + (lastPoseAnchorY - sensorH / 2) * k
+        }
+    }
+
     /// 会话重启复位(vm.start 调):useUltraWideWithGDC 已把设备归 1.0,本侧除数/仲裁/PI 必须同步归位,
     /// 否则「设备=1.0 而除数=2.0」→ 裁剪/测量全错(审计时发现的重启态不一致)。
     func resetLensToUWBase() {
@@ -715,10 +735,12 @@ final class TrackingController {
             if let reader = CameraEngine.liveDeviceZoomReader {
                 let dRead = reader()
                 if abs(dRead - lensDeviceZoom) > 0.001 {
+                    let _kStep = dRead / max(lensDeviceZoom, 0.01)
                     // 【抖动修】d 变一步,PI 持久位置种子微重映射一步(k≈1.03/帧,平滑;详见 PI 注释)
                     PersonIdentifier.shared.remapPositionsForDeviceZoomStep(
-                        k: dRead / max(lensDeviceZoom, 0.01),
-                        sensorSize: CGSize(width: sensorW, height: sensorH))
+                        k: _kStep, sensorSize: CGSize(width: sensorW, height: sensorH))
+                    // 【刀B】TC 侧冻结态量同节奏重映射(rawBox 族 + pose 锚)
+                    remapFrozenBufferState(k: _kStep)
                     lensDeviceZoom = dRead
                     PersonIdentifier.shared.lensDeviceZoom = dRead
                 }
