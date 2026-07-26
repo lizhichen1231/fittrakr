@@ -287,6 +287,14 @@ final class TrackingController {
     // 改动A:软锁定(原地重阻尼,不冻死)——实现方式:dtEff = dt / stiffness 喂控制器
     //         (等价 tau_eff = tau×stiffness、rateCap_eff = maxLogZoomRate/stiffness,不改 ZoomController)
     let disableInPlaceLock = true              // 禁用整条 in-place lock:任何时候都走正常 pose 跟随。置 false 即恢复。
+
+    #if DEBUG
+    // 【方案A·步四】关联基线 trace(回放台专用,只采不馈):applyKalmanSmoothing 逐帧落一行
+    struct AssocTraceRow { let f: Int; let box: CGRect; let iou: CGFloat; let blend: CGFloat; let conf: CGFloat; let cands: Int }
+    static var assocTraceEnabled = false
+    static var assocTrace: [AssocTraceRow] = []
+    static var dbgAssocCandCount = 0           // detectHumanRectCandidate 本帧候选数
+    #endif
     let lockStiffness: CGFloat = 4.0           // 原地刚度倍数(起手 4.0)
     let lockRampTime: CGFloat = 0.3            // 刚度渐入渐出时间(秒),避免 engage/release 速度突变
     var lockStiffnessCurrent: CGFloat = 1.0    // 当前刚度(渐变)

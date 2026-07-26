@@ -214,8 +214,16 @@ final class PersonIdentifier {
         print("🔒 目标已锁定 | 上衣颜色bins: \(profile.colorHistogram.count) | 下装颜色bins: \(profile.lowerBodyColorHist.count)\(baseEmpty ? "  ★★基准空!色彩verify失效→易漂(就是这次锁定的问题)" : "")")
     }
 
+    #if DEBUG
+    /// 【方案A·步四】回放台压自动锁:纯关联基线(零身份)专用;步一退役 lock 时随整套删除
+    static var autoLockSuppressed = false
+    #endif
+
     /// 锁定最大的人
     func lockLargest(in pixelBuffer: CVPixelBuffer, sensorSize: CGSize) -> Bool {
+        #if DEBUG
+        if Self.autoLockSuppressed { return false }
+        #endif
         // 【dt尖峰拆分·清A并刀】lockLargest 在阶段计时器之外同步跑,是 dt=106/468 尖峰真身。
         // 三段拆:全帧检测 / 复核打印(DEBUG重复检测) / 建档(双区直方图)→ 决定优化往哪边使劲。
         #if DEBUG

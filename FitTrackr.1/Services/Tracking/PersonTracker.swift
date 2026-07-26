@@ -346,6 +346,9 @@ extension TrackingController {
             }
 
             let candidates: [(CGRect, CGFloat)] = list.map { (toSensor($0.boundingBox), CGFloat($0.confidence)) }
+            #if DEBUG
+            TrackingController.dbgAssocCandCount = candidates.count
+            #endif
 
             let selected: (CGRect, CGFloat)
             if let lastBox = rawBox {
@@ -380,8 +383,15 @@ extension TrackingController {
         if kalmanX == nil { setupKalmanFilters() }
 
         let smoothedRect: CGRect
+        #if DEBUG
+        var _trIoU: CGFloat = -1        // -1 = 无前框(链起点),trace 用
+        var _trBlend: CGFloat = -1      // -1 = 未走软混合分支
+        #endif
         if let lastBox = rawBox {
             let iou = iouRect(rawRect, lastBox)
+            #if DEBUG
+            _trIoU = iou
+            #endif
             if iou > 0.05 {
                 let smoothX = kalmanX!.update(measurement: rawRect.midX)
                 let smoothY = kalmanY!.update(measurement: rawRect.midY)
@@ -396,6 +406,9 @@ extension TrackingController {
                 )
             } else {
                 let blendRatio: CGFloat = max(0.05, min(0.2, iou * 4))
+                #if DEBUG
+                _trBlend = blendRatio
+                #endif
 
                 kalmanX?.softReset(value: rawRect.midX, blendRatio: blendRatio)
                 kalmanY?.softReset(value: rawRect.midY, blendRatio: blendRatio)
@@ -417,6 +430,13 @@ extension TrackingController {
             smoothedRect = rawRect
         }
 
+        #if DEBUG
+        if TrackingController.assocTraceEnabled {
+            TrackingController.assocTrace.append(TrackingController.AssocTraceRow(
+                f: frameCount, box: smoothedRect, iou: _trIoU, blend: _trBlend,
+                conf: conf, cands: TrackingController.dbgAssocCandCount))
+        }
+        #endif
         return (smoothedRect, conf)
     }
 
