@@ -53,11 +53,10 @@ final class ReacqReplayTests: XCTestCase {
         guard clipURL("clip_5_sameshirt_dancetrack0034") != nil else {
             throw XCTSkip("clip_5 不在测试宿主 bundle(Debug Copy Replay Clips 未跑)")
         }
-        var report = "\n═══ 贡献拆分 clip_5 ═══\n"
+        var report = "\n═══ 复现拆分 clip_2(挂单三)═══\n"
         for (label, ex, ps) in [("A 仅外推(起步0.06)", true, Float(0.06)),
-                                ("B 仅重标定(起步0.12)", false, Float(0.12)),
-                                ("C 双开(交付配置)", true, Float(0.12))] {
-            guard let r = runClip("clip_5_sameshirt_dancetrack0034", seconds: 40, extrap: ex, posStart: ps) else { continue }
+                                ("B 仅重标定(起步0.12)", false, Float(0.12))] {
+            guard let r = runClip("clip_2_sameshirt_dancetrack0004", seconds: 40, extrap: ex, posStart: ps) else { continue }
             report += "  \(label): \(r.desc)\n"
         }
         print(report)
