@@ -62,6 +62,9 @@ final class PersonIdentifier {
     var dbgCurThresh: Float = 0.5   // 本帧生效门槛(安全阀降门时=0.30)
     var dbgSrcMerged = false        // rect 是否并源(searching 时 P+R)
     var dbgBestRejectCont: Float = 0   // nil 帧最佳被拒候选延续分(搜索心跳 bestCont)
+    var dbgSizeRaw: Float = -1         // 刀A 自证:最近一次评分的候选面积比【原值】
+    var dbgSizeNorm: Float = -1        // 刀A 自证:同帧【归一化值】(÷D²)
+    var dbgSizeTrace: [(raw: Float, norm: Float)] = []   // 最近5帧(切换时打 SIZE前)
     var dbgBestRejectColor: Float = 0  // nil 帧最佳被拒候选颜色分(搜索心跳 bestColor)
     #endif
 
@@ -162,8 +165,11 @@ final class PersonIdentifier {
 
         // 3. 体型特征
         profile.aspectRatio = Float(personBox.height / max(personBox.width, 1))
+        // 【刀A·不变量III】面积是二次量:÷D²(非 D!D=2 时面积×4)。档案恒存 UW 基准 →
+        // 在任意镜头档位锁定/重锁,跨档匹配都同空间。D=1 恒等。
         profile.relativeSize = Float((personBox.width * personBox.height) /
                                       (sensorSize.width * sensorSize.height))
+                             / Float(lensDeviceZoom * lensDeviceZoom)
 
         // 4. 位置
         profile.lastCenter = CGPoint(
@@ -353,6 +359,7 @@ final class PersonIdentifier {
         func remapN(_ p: CGPoint) -> CGPoint { CGPoint(x: 0.5 + (p.x - 0.5) * k, y: 0.5 + (p.y - 0.5) * k) }
         lockedCenterHist = lockedCenterHist.map { (remapN($0.0), $0.1) }
         if let f = searchFrozenPoint { searchFrozenPoint = remapN(f) }
+        if target != nil { target!.lastCenter = remapN(target!.lastCenter) }   // 刀A:档案位置同步(回执①点名)
         if let b = lastLockedBox {
             let cx = sensorSize.width / 2, cy = sensorSize.height / 2
             lastLockedBox = CGRect(x: cx + (b.origin.x - cx) * k, y: cy + (b.origin.y - cy) * k,
@@ -432,8 +439,15 @@ final class PersonIdentifier {
 
         // 3. 体型匹配
         let personAspect = Float(personBox.height / max(personBox.width, 1))
-        let personSize = Float((personBox.width * personBox.height) /
-                               (sensorSize.width * sensorSize.height))
+        // 【刀A·不变量III】候选面积比同样 ÷D²(两边同归 UW 基准;archive 侧见 lock())
+        let _sizeRaw = Float((personBox.width * personBox.height) /
+                             (sensorSize.width * sensorSize.height))
+        let personSize = _sizeRaw / Float(lensDeviceZoom * lensDeviceZoom)
+        #if DEBUG
+        dbgSizeRaw = _sizeRaw; dbgSizeNorm = personSize                      // 刀A 自证:切换窗逐帧读
+        dbgSizeTrace.append((_sizeRaw, personSize))
+        if dbgSizeTrace.count > 5 { dbgSizeTrace.removeFirst() }
+        #endif
 
         let aspectDiff = abs(personAspect - target.aspectRatio) / max(target.aspectRatio, 0.1)
         let sizeDiff = abs(personSize - target.relativeSize) / max(target.relativeSize, 0.01)

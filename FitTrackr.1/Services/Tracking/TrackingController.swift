@@ -363,6 +363,12 @@ final class TrackingController {
         }
         lensRatioTraceArm = 5
         lensSwitchTraceArm = 120   // 【抖动取证】开 2s 逐帧观测窗
+        #if DEBUG
+        // 刀A 自证:切换前 5 帧的候选面积比 原值/归一化值(归一化值应跨切换连续)
+        for t in PersonIdentifier.shared.dbgSizeTrace {
+            PerfFileLog.shared.line(String(format: "📐 SIZE前 原值=%.4f 归一(÷D²)=%.4f", t.raw, t.norm))
+        }
+        #endif
         CameraEngine.lensZoomExecutor?(newD, reason)
     }
 
@@ -724,9 +730,10 @@ final class TrackingController {
                 let _rb = rawBox.map { String(format: "raw=(%.0f,%.0f)", $0.midX, $0.midY) } ?? "raw=nil"
                 let _sb = stableBox.map { String(format: "stb=(%.0f,%.0f)", $0.midX, $0.midY) } ?? "stb=nil"
                 let _cr = lastCropRect.map { String(format: "crop=(%.0f,%.0f,w%.0f)", $0.midX, $0.midY, $0.width) } ?? "crop=nil"
-                PerfFileLog.shared.line(String(format: "🔬 切换窗 f%d d=%.3f Zt=%.2f eff=%.2f det=%@ %@ %@ %@ ratio=%.4f",
+                PerfFileLog.shared.line(String(format: "🔬 切换窗 f%d d=%.3f Zt=%.2f eff=%.2f det=%@ %@ %@ %@ ratio=%.4f size=%.4f/%.4f",
                     frameCount, lensDeviceZoom, zoom, max(1.0, zoom / max(lensDeviceZoom, 1.0)),
-                    (_rectResult != nil) ? "Y" : "N", _rb, _sb, _cr, lastTorsoRatio ?? -1))
+                    (_rectResult != nil) ? "Y" : "N", _rb, _sb, _cr, lastTorsoRatio ?? -1,
+                    PersonIdentifier.shared.dbgSizeRaw, PersonIdentifier.shared.dbgSizeNorm))
             }
             #endif
             let _lensNow = CACurrentMediaTime()
