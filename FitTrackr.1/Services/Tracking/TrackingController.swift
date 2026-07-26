@@ -312,13 +312,61 @@ final class TrackingController {
     var dbgFakeHUD = ""   // 卡2 最简 HUD:候选人数 + 锁谁(细节看 console REPLAY/FAKE 行)
     var dbgTrkHUD = ""    // 卡3 最简 HUD:锁谁 / 状态 / 找回@(取自 PersonIdentifier.dbgTrkLine,不重算)
 
-    // 【方案B·刀3】镜头仲裁影子模式状态(仅日志+HUD,不驱动设备)
+    // 【方案B·刀3+刀4】镜头仲裁:决策(每帧)+ 执行(shadowOnly=OFF 时)
+    // shadowOnly:唯一回滚开关(机上 TunerSheet 可切,默认 ON=只决策不动设备=刀3 行为)
+    static var lensShadowOnly = true
     let lensArbiter = LensArbiter()
+    var lensDeviceZoom: CGFloat = 1.0          // 当前设备 zoom(执行侧写;crop 除数与坐标映射读)
     private var lensShadowPrevCenter: CGPoint?
     private var lensShadowPrevFrame = 0        // 刀3补3:上次有中心的帧号(断档>10帧重置速度)
     private var lensShadowVel: CGFloat = 0
     private var lensShadowLastCmdAt: TimeInterval = -1
-    var dbgLensShadow = ""   // HUD 行:LENS影子 UW/Wide dz=Y/N cd=剩余 Z=当前
+    private var lensLastCmdName = "—"          // HUD:最近指令
+    private var lensLastCmdFrame = -1
+    var dbgLensShadow = ""   // 常驻 HUD 行:Tier/模式/三Z/最近指令/锁定态(全部实读)
+
+    /// 刀4:影子开关(TunerSheet 经 vm 调)。拨回 ON = 回滚:设备回 1.0、空间映射回 1、仲裁清态。
+    func setLensShadowOnly(_ on: Bool) {
+        TrackingController.lensShadowOnly = on
+        print("🎯 LENS-MODE → \(on ? "影子(只决策不动设备)" : "执行(指令驱动设备zoom)") 当前Zdev=\(String(format: "%.1f", lensDeviceZoom))")
+        if on, lensDeviceZoom != 1.0 {
+            executeLensTransition(to: 1.0, reason: "shadowOnly=ON 回滚")
+        }
+        if on { lensArbiter.reset() }
+    }
+
+    /// 刀4:执行一次物理档位迁移——先把 buffer 空间状态一步几何重映射(k=新D/旧D),再驱动设备。
+    /// 卡面不变量:不改 Z_total、不动 crop 框(显示构图)——zoom 轴靠「弹簧在 Z_total 域+除法在弹簧后」同帧互补,
+    /// 中心轴靠本重映射(几何换算,非运动,一步到位不过弹簧)。
+    private func executeLensTransition(to newD: CGFloat, reason: String) {
+        let oldD = lensDeviceZoom
+        guard abs(newD - oldD) > 0.001 else { return }
+        let k = newD / oldD
+        remapBufferStateForLensSwitch(k: k)
+        lensDeviceZoom = newD
+        CameraEngine.lensZoomExecutor?(newD, reason)
+    }
+
+    /// buffer 空间几何重映射:设备 zoom D1→D2 时,所有 buffer 空间的框/弹簧绕画面中心缩放 k=D2/D1。
+    /// (wide 系量不动:_lensCenter 已除以 lensDeviceZoom,跨切换自洽)
+    private func remapBufferRect(_ r: CGRect, k: CGFloat) -> CGRect {
+        let cx = sensorW / 2, cy = sensorH / 2
+        return CGRect(x: cx + (r.origin.x - cx) * k, y: cy + (r.origin.y - cy) * k,
+                      width: r.width * k, height: r.height * k)
+    }
+    private func remapBufferStateForLensSwitch(k: CGFloat) {
+        if let b = stableBox        { stableBox = remapBufferRect(b, k: k) }
+        if let b = rawBox           { rawBox = remapBufferRect(b, k: k) }
+        if let b = smoothedTightBox { smoothedTightBox = remapBufferRect(b, k: k) }
+        if let b = lastTightBox     { lastTightBox = remapBufferRect(b, k: k) }
+        if let c = lastCropRect     { lastCropRect = remapBufferRect(c, k: k) }
+        // crop 中心弹簧一步重播种到映射后位置(几何换算非运动,不许过弹簧滑过去);zoom 弹簧在 Z_total 域跨切换连续,不动
+        if cropSpringValid, let c = lastCropRect {
+            cropCenterSpring.reset(to: CGPoint(x: c.midX, y: c.midY))
+        }
+        centerHistory.removeAll(); hipHistory.removeAll()   // 原地检测历史跨空间无意义,清零重积累
+        print(String(format: "🎯 LENS-REMAP k=%.2f(buffer空间框/弹簧一步缩放,crop框显示位置不变)", k))
+    }
 
     // 跳变取证(只抓数据,不改逻辑):pose 四点门是否过、rect 兜底框 conf、本帧锚/ratio/rect框跳变量
     var dbgPoseValid = false
@@ -633,26 +681,26 @@ final class TrackingController {
             // identityMatched:锁定时 detectHuman 非nil ⟺ findTarget 命中(Part2 已堵 fallback,非nil只可能是身份命中)
             advanceLockState(identityMatched: (_rectResult != nil))
 
-            // ===== 【方案B·刀3】镜头仲裁·影子模式(单一权威下游,只读 lockState)=====
-            // 每帧组装输入调 decide,仅产出 决策日志+HUD;command 不驱动设备(a3ba32d 钳死仍拦着,刀4 才放行)。
-            // decide 无 app 侧副作用 → build 后行为与刀1 逐帧等同。
+            // ===== 【方案B·刀3+刀4】镜头仲裁:每帧决策;shadowOnly=OFF 时指令驱动设备(单一权威下游,只读 lockState)=====
             let _lensNow = CACurrentMediaTime()
-            // 状态 tag 就地映射(dbgStateTag() 是 DEBUG-only,影子层是正式代码不能依赖它;lockState 只读)
+            // 状态 tag 就地映射(dbgStateTag() 是 DEBUG-only,本层是正式代码不能依赖它;lockState 只读)
             let _lensTag: String
             switch lockState {
             case .unlocked: _lensTag = "U"; case .locked: _lensTag = "L"
             case .searching: _lensTag = "S"; case .lost: _lensTag = "X"
             }
-            // 锁定框中心 → wide 系【刀3补3·坐标归一修正】:检测/稳定框都在传感器像素空间(sensorW×sensorH),
-            // 必须除以尺寸再移原点(铁律③,本工程第三次栽在坐标系)。首选 stableBox(弹簧平滑,压检测噪声;
-            // 取到的是上一帧值,60fps 下一帧滞后可接受),miss 帧回退原始检测框。
+            // 锁定框中心 → wide 系:①像素→归一移原点(铁律③);②÷lensDeviceZoom(刀4:buffer 已被设备
+            // 光学放大 D,逆换算 p_wide=(p_buf−0.5)/D+0.5——卡面二.3 公式,中心化写法即 ÷D)。
+            // 首选 stableBox(弹簧平滑压检测噪声,一帧滞后可接受),miss 帧回退原始检测框。
             let _lensBox: CGRect? = stableBox ?? _rectResult?.0
+            let _lensD = max(lensDeviceZoom, 1.0)
             let _lensCenter: CGPoint? = _lensBox.map {
-                CGPoint(x: $0.midX / max(sensorW, 1) - 0.5, y: $0.midY / max(sensorH, 1) - 0.5)
+                CGPoint(x: ($0.midX / max(sensorW, 1) - 0.5) / _lensD,
+                        y: ($0.midY / max(sensorH, 1) - 0.5) / _lensD)
             }
             if let c = _lensCenter {
                 if let p = lensShadowPrevCenter, frameCount - lensShadowPrevFrame <= 10, dt > 0 {
-                    // 影子速度:wide 系 /s(归一化后再差分)。断档 >10 帧则重置,不让陈旧速度污染门判定
+                    // 速度:wide 系 /s(归一化+除D后差分,跨切换自洽)。断档 >10 帧重置,不让陈旧速度污染门判定
                     let v = hypot(c.x - p.x, c.y - p.y) / CGFloat(dt)
                     lensShadowVel = 0.7 * lensShadowVel + 0.3 * v
                 } else {
@@ -664,31 +712,47 @@ final class TrackingController {
             let _lensOut = lensArbiter.decide(LensArbiterInput(
                 zoomReq: zoom, lockedCenter: _lensCenter, centerVel: lensShadowVel,
                 stateTag: _lensTag, tier1: CameraEngine.currentTier1,
-                deviceZoom: CameraEngine.lastSelectedDeviceZoom), at: _lensNow)
+                deviceZoom: lensDeviceZoom), at: _lensNow)
             if _lensOut.command != .none {
-                // 影子日志(可对答案):帧号/指令/触发线/Z_total/中心/速度/状态/Tier/距上次间隔。print+落盘。
+                let _mode = TrackingController.lensShadowOnly ? "影子" : "执行"
+                let _targetD: CGFloat = (_lensOut.command == .toWide) ? lensArbiter.p.S : 1.0
+                // 指令日志:全部实读值(帧号/模式/三Z/中心/速度/触发线/PI锁/三态/Tier/距上次)——禁止写死文案
                 let gap = lensShadowLastCmdAt < 0 ? "首次" : String(format: "%.1fs", _lensNow - lensShadowLastCmdAt)
                 let cstr = _lensCenter.map { String(format: "(%.3f,%.3f)", $0.x, $0.y) } ?? "nil"
-                let msg = String(format: "🎯 LENS-SHADOW f%d cmd=%@ 因=[%@] Z=%.2f c=%@ vel=%.3f tag=%@ tier1=%@ 距上次=%@",
-                                 frameCount, "\(_lensOut.command)", _lensOut.reason, zoom, cstr,
-                                 lensShadowVel, _lensTag, CameraEngine.currentTier1 ? "Y" : "N", gap)
+                let msg = String(format: "🎯 LENS-CMD f%d mode=%@ cmd=%@ 因=[%@] Ztot=%.2f Zdev=%.1f→%.1f c=%@ vel=%.3f PI锁=%@ 三态=%@ tier1=%@ 距上次=%@",
+                                 frameCount, _mode, "\(_lensOut.command)", _lensOut.reason, zoom,
+                                 lensDeviceZoom, TrackingController.lensShadowOnly ? lensDeviceZoom : _targetD,
+                                 cstr, lensShadowVel,
+                                 PersonIdentifier.shared.isLocked ? "Y" : "N", _lensTag,
+                                 CameraEngine.currentTier1 ? "Y" : "N", gap)
                 print(msg)
                 #if DEBUG
                 PerfFileLog.shared.line(msg)   // PerfFileLog 是 DEBUG-only 类,裸调会破 Release 构建
                 #endif
                 lensShadowLastCmdAt = _lensNow
+                lensLastCmdName = "\(_lensOut.command)"
+                lensLastCmdFrame = frameCount
+                // 刀4 执行:仅 执行模式+Tier1 时驱动设备(空间重映射→设备写入,经白名单执行器)
+                if !TrackingController.lensShadowOnly, CameraEngine.currentTier1 {
+                    executeLensTransition(to: _targetD, reason: "\(_lensOut.command) \(_lensOut.reason)")
+                }
             }
-            dbgLensShadow = String(format: "LENS影子 %@ dz=%@ cd=%.1f Z=%.2f",
-                                   _lensOut.lens.rawValue, _lensOut.inDeadzone ? "Y" : "N",
-                                   lensArbiter.cooldownRemaining(at: _lensNow), zoom)
+            // 常驻 HUD 行(卡面三):Tier/模式/Z_total/Z_device/Z_digital/最近指令+距今帧数/锁定态(全实读)
+            let _zDig = max(1.0, zoom / _lensD)
+            let _cmdInfo = lensLastCmdFrame < 0 ? "—" : "\(lensLastCmdName)(\(frameCount - lensLastCmdFrame)f前)"
+            dbgLensShadow = String(format: "LENS %@ %@ Zt=%.2f Zd=%.1f Zg=%.2f 指=%@ PI=%@ 态=%@ dz=%@ cd=%.1f",
+                                   CameraEngine.currentTier1 ? "T1" : "T0",
+                                   TrackingController.lensShadowOnly ? "影子" : "执行",
+                                   zoom, lensDeviceZoom, _zDig, _cmdInfo,
+                                   PersonIdentifier.shared.isLocked ? "Y" : "N", _lensTag,
+                                   _lensOut.inDeadzone ? "Y" : "N",
+                                   lensArbiter.cooldownRemaining(at: _lensNow))
             #if DEBUG
-            // 影子心跳:每 150 帧(~2.5s)落一行 zoom/镜头意图/门状态——零指令的场景也可对答案
-            // (没有它,「0 次指令」分不清是三层防抖正确拦住 还是 条件根本没到过)。
-            // 补 c/vel:首轮对答案发现 Z=4.39 锁定 20s 零指令,须判「速度否决恒真 vs 中心在门外」——没有这两个字段断不了案
+            // 心跳:每 150 帧落一行完整状态(零指令场景也可对答案)
             if frameCount % 150 == 0 {
                 let _cs = _lensCenter.map { String(format: "c=(%.3f,%.3f)", $0.x, $0.y) } ?? "c=nil"
-                PerfFileLog.shared.line(String(format: "🎯 心跳 f%d %@ %@ vel=%.3f tag=%@",
-                                               frameCount, dbgLensShadow, _cs, lensShadowVel, _lensTag))
+                PerfFileLog.shared.line(String(format: "🎯 心跳 f%d %@ %@ vel=%.3f",
+                                               frameCount, dbgLensShadow, _cs, lensShadowVel))
             }
             #endif
 

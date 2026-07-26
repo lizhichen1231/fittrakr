@@ -396,8 +396,14 @@ extension TrackingController {
         let center = CGRect(x: _sc.x - center.width / 2, y: _sc.y - center.height / 2,
                             width: center.width, height: center.height)
 
+        // 【刀4 兑换】数字裁剪只承担设备 zoom 之外的余量:Z_digital = Z_total / Z_device。
+        // 除法必须在弹簧【后】:弹簧全程跑 Z_total 域(跨切换连续),切换帧 D 跳变与 buffer 光学跳变
+        // 同帧互补 → 显示构图数值连续(不变量 I)。除法在弹簧前会让弹簧把跳变滑 0.45s = 可见拉风箱。
+        // lensDeviceZoom=1(影子模式/Tier0/多摄长焦路径)时本行恒等,行为冻结。
+        let effZoom = max(1.0, currentZoom / max(lensDeviceZoom, 1.0))
+
         // 使用当前 zoom 计算裁切尺寸
-        var cropW = sensorW / currentZoom
+        var cropW = sensorW / effZoom
         var cropH = cropW * ar
         if cropH > sensorH { cropH = sensorH; cropW = cropH / ar }
 

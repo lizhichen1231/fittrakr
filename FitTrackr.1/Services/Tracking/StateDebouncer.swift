@@ -49,6 +49,12 @@ final class StateDebouncer<State: Equatable> {
 
     func cooldownRemaining(at now: TimeInterval) -> TimeInterval { max(0, cooldownUntil - now) }
 
+    /// 硬复位(刀4:影子开关回拨 ON 时回滚用)——状态/驻留/冷却全清,回到指定初态
+    func hardReset(to s: State) {
+        print("⏲ DEBOUNCE \(name) hardReset → \(s)")
+        state = s; dwellTarget = nil; cooldownUntil = -.infinity
+    }
+
     private func transition(to target: State, at now: TimeInterval, via: String, cooldownAfter: TimeInterval?) {
         let cd = cooldownAfter ?? defaultCooldownSec
         print("⏲ DEBOUNCE \(name) \(state)→\(target) via=\(via) cd=\(String(format: "%.1f", cd))")
@@ -162,4 +168,7 @@ final class LensArbiter {
 
     /// HUD 用:冷却剩余
     func cooldownRemaining(at now: TimeInterval) -> TimeInterval { debouncer.cooldownRemaining(at: now) }
+
+    /// 刀4:影子开关回拨 ON 的回滚——镜头意图回 UW,防抖状态全清
+    func reset() { debouncer.hardReset(to: .uw); lastKnownCenter = nil }
 }

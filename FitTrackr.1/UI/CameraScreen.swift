@@ -102,8 +102,8 @@ struct CameraScreen: View {
                         }
                         .padding(.horizontal, 16).padding(.top, 4)
                     }
-                    // 【方案B·刀3】镜头仲裁影子 HUD(cyan;影子模式,决策不驱动设备)
-                    if vm.showDebugOverlay, !vm.lensHUD.isEmpty {
+                    // 【方案B·刀3+刀4】镜头仲裁 HUD:常驻(卡面三——Zc 不看 Xcode 也能判模式/三Z/指令/锁定态)
+                    if !vm.lensHUD.isEmpty {
                         HStack {
                             Text(vm.lensHUD)
                                 .font(.system(size: 11, weight: .bold, design: .monospaced))
@@ -386,6 +386,14 @@ fileprivate struct TunerSheet: View {
     var body: some View {
         NavigationView {
             Form {
+                // 【方案B·刀4】影子/执行开关(运行时可切,不需重 build——唯一回滚手段)。
+                // ON=影子:只决策+日志+HUD,不动设备(=刀3 行为);OFF=执行:仲裁指令驱动设备 zoom 跨 S。
+                Section(header: Text("🎯 镜头切换(刀4)")) {
+                    Toggle(vm.lensShadowOnlyUI ? "影子模式(决策不执行)——拨开=放行执行"
+                                               : "⚡ 执行中(指令驱动设备zoom)——拨回=回滚到影子",
+                           isOn: $vm.lensShadowOnlyUI)
+                }
+
                 #if DEBUG
                 // 【方案B·刀1 验收开关】强制 Tier 0(超广角数字裁剪=现状)⇄ 自动(Tier 1 dualWide)。
                 // 重启相机生效;控制台看「📷 刀1 能力分层」与「✅ Using:」行确认设备切换。收口时评估撤留。

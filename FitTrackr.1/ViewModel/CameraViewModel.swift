@@ -54,8 +54,12 @@ final class CameraViewModel: NSObject, ObservableObject {
     // 三态锁定状态机 HUD:badge/cont/thr/候选/事件,来自 follow.dbgStateLine();stateTag 驱动颜色
     @Published var stateHUD = ""
     @Published var stateTag = "U"
-    // 【方案B·刀3】镜头仲裁影子 HUD:LENS影子 UW/Wide dz cd Z,来自 follow.dbgLensShadow
+    // 【方案B·刀3+刀4】镜头仲裁常驻 HUD(Tier/模式/三Z/最近指令/锁定态),来自 follow.dbgLensShadow
     @Published var lensHUD = ""
+    // 刀4:影子开关(默认 ON=只决策不动设备;OFF=放行执行)。机上 TunerSheet 可切,唯一回滚手段。
+    @Published var lensShadowOnlyUI = true {
+        didSet { follow.setLensShadowOnly(lensShadowOnlyUI) }
+    }
     // 跳变取证:冻结"最近一次显著跳变那一帧"的整行数据(poseValid/srcUsed/rectConf/各Δ)
     @Published var probeHUD = ""
     let probeJumpThreshold: CGFloat = 0.03   // anchorΔ 或 rectBoxΔ 超此(占画面宽 3%)算一次跳,刷新冻结行
@@ -509,13 +513,13 @@ extension CameraViewModel {
             if self.fakeHUD != self.follow.dbgFakeHUD { self.fakeHUD = self.follow.dbgFakeHUD }
             if self.trkHUD != self.follow.dbgTrkHUD { self.trkHUD = self.follow.dbgTrkHUD }
             #if DEBUG
+            // 【刀4·卡面三】镜头仲裁 HUD 改常驻(不看 Xcode 也能判模式/三Z/指令/锁定态)——不再挂眼睛开关
+            if self.lensHUD != self.follow.dbgLensShadow { self.lensHUD = self.follow.dbgLensShadow }
             if self.showDebugOverlay {   // 状态机 HUD:关时不更新,省 @Published churn(SEARCHING 秒数每帧变)
                 let _sl = self.follow.dbgStateLine()
                 if self.stateHUD != _sl { self.stateHUD = _sl }
                 let _st = self.follow.dbgStateTag()
                 if self.stateTag != _st { self.stateTag = _st }
-                // 【方案B·刀3】镜头仲裁影子 HUD(cd 秒数常变,同样只在开眼时更新)
-                if self.lensHUD != self.follow.dbgLensShadow { self.lensHUD = self.follow.dbgLensShadow }
             }
             #endif
             if self.showDebugOverlay { self.dbgCropHUD = self.follow.dbgCropLine }   // 关时不更新,省 @Published churn

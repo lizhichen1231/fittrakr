@@ -88,26 +88,55 @@ protocol CameraEngineDelegate: AnyObject {
 
     // 【刀3 影子模式】仲裁输入的采集侧事实(useUltraWideWithGDC 每次选定设备后更新;只读)
     static var currentTier1 = false                    // 本次选定是否 dualWide(Tier 1)
-    static var lastSelectedDeviceZoom: CGFloat = 1.0   // 选定时设的设备 zoom(刀4 前恒 1.0)
+    static var lastSelectedDeviceZoom: CGFloat = 1.0   // 当前设备 zoom(执行器写入时同步更新)
 
-    // 【刀1收口·zoom 钳死】刀2-4 完成前,任何路径写 device.videoZoomFactor ≠1.0 都被拦:
-    // KVO 侦测 → 断言(DEBUG 当场爆)+ log + 拦回 1.0。防在零防抖零豁免状态下触发裸物理切换。
-    // 探针交接(stopForProbe)时解除——Q4 ramp 是合法的设备 zoom 使用方;vm.start() 重新武装。
-    // 刀4(仲裁接线)落地时,本钳死改为「仅放行 debouncer 批准的写入」,而非删除。
+    // 【刀4 执行放行】仲裁指令 → 设备 zoom 的唯一合法通道。
+    // TrackingController 经此静态钩子调 setLensDeviceZoom(useUltraWideWithGDC 装配)。
+    static var lensZoomExecutor: ((CGFloat, String) -> Void)?
+    private var activeVideoDevice: AVCaptureDevice?    // useUltraWideWithGDC 选定的设备
+    private var sanctionedDeviceZoom: CGFloat = 1.0    // 白名单目标:守卫只放行等于它的写入
+
+    /// 刀4:唯一合法设备 zoom 写入口(仲裁指令专用)。写前更新白名单 → KVO 守卫放行;其余写入照拦。
+    func setLensDeviceZoom(_ z: CGFloat, reason: String) {
+        sessionQueue.async {
+            guard let dev = self.activeVideoDevice else {
+                print("🎯 LENS-EXEC 失败: 无活跃设备(reason=\(reason))"); return
+            }
+            self.sanctionedDeviceZoom = z
+            do {
+                try dev.lockForConfiguration()
+                dev.videoZoomFactor = z
+                dev.unlockForConfiguration()
+            } catch {
+                print("🎯 LENS-EXEC 失败: lockForConfiguration \(error)(reason=\(reason))"); return
+            }
+            CameraEngine.lastSelectedDeviceZoom = dev.videoZoomFactor   // 实读回写(真实状态,不写死)
+            let msg = "🎯 LENS-EXEC 设备zoom→\(String(format: "%.2f", z)) 实读=\(String(format: "%.2f", dev.videoZoomFactor)) reason=\(reason)"
+            print(msg)
+            #if DEBUG
+            PerfFileLog.shared.line(msg)
+            #endif
+        }
+    }
+
+    // 【刀1收口→刀4 白名单化】KVO 守卫:只放行「等于 sanctionedDeviceZoom(setLensDeviceZoom 刚批准的值)」
+    // 的写入;其余任何来源写设备 zoom → 断言(DEBUG 爆)+ log + 拦回白名单值。旁路写入依旧无路可走。
+    // 探针交接(stopForProbe)时解除;vm.start() 重新武装。
     private var zoomGuardObs: NSKeyValueObservation?
     private func armZoomGuard(_ dev: AVCaptureDevice) {
         zoomGuardObs?.invalidate()
         zoomGuardObs = dev.observe(\.videoZoomFactor, options: [.new]) { [weak self] d, _ in
             let z = d.videoZoomFactor
-            guard abs(z - 1.0) > 0.001 else { return }
-            let msg = "❌ 刀1钳死断言: device.videoZoomFactor 被写成 \(String(format: "%.2f", z))(刀4 前禁止物理 zoom)→ 拦回 1.0"
+            let allowed = self?.sanctionedDeviceZoom ?? 1.0
+            guard abs(z - allowed) > 0.001 else { return }
+            let msg = "❌ zoom守卫断言: device.videoZoomFactor 被写成 \(String(format: "%.2f", z)),白名单=\(String(format: "%.2f", allowed))(仅 setLensDeviceZoom 合法)→ 拦回"
             print(msg)
             #if DEBUG
             PerfFileLog.shared.line(msg)   // PerfFileLog 是 DEBUG-only 类,裸调会破 Release 构建
             #endif
             assertionFailure(msg)   // DEBUG 当场爆定位写入方;Release 只拦回
             self?.sessionQueue.async {
-                if (try? d.lockForConfiguration()) != nil { d.videoZoomFactor = 1.0; d.unlockForConfiguration() }
+                if (try? d.lockForConfiguration()) != nil { d.videoZoomFactor = allowed; d.unlockForConfiguration() }
             }
         }
     }
@@ -172,6 +201,10 @@ protocol CameraEngineDelegate: AnyObject {
             self.configured = false
             // 刀1收口:交接时解除 zoom 钳死——探针(Q4 ramp)是合法的设备 zoom 使用方;vm.start() 重新武装
             self.zoomGuardObs?.invalidate(); self.zoomGuardObs = nil
+            // 刀4:执行通道随交接下线(防探针期间误执行);vm.start() 重装配
+            CameraEngine.lensZoomExecutor = nil
+            self.activeVideoDevice = nil
+            self.sanctionedDeviceZoom = 1.0
             // 刀A:确认 isRunning=false 落日志——这行必须出现在探针「配置完成」之前,是有序交接的凭证
             let msg = "🔁 探针交接: app相机已停 isRunning=\(self.session.isRunning) inputs=\(self.session.inputs.count) outputs=\(self.session.outputs.count) delegate=nil → \(self.session.isRunning ? "⚠️ 仍在运行,交接失败!" : "已释放,允许探针接管")"
             print(msg); PerfFileLog.shared.line(msg)
@@ -424,7 +457,11 @@ extension CameraEngine {
         }
         print("📷 刀1 能力分层: \(tier1 ? "Tier 1(dualWide 虚拟设备,zoom=1.0 物理恒UW)" : "Tier 0(超广角数字裁剪=现状)") forceTier0=\(CameraEngine.forceTier0) dualWide存在=\(dualWide != nil)")
         CameraEngine.currentTier1 = tier1              // 刀3:影子仲裁读
-        CameraEngine.lastSelectedDeviceZoom = 1.0      // 刀4 前恒 1.0(钳死保证)
+        CameraEngine.lastSelectedDeviceZoom = 1.0      // 起始 1.0(执行器写入时更新)
+        // 刀4:装配执行通道 + 白名单归位(设备重选=回到 1.0 基态)
+        activeVideoDevice = device
+        sanctionedDeviceZoom = 1.0
+        CameraEngine.lensZoomExecutor = { [weak self] z, r in self?.setLensDeviceZoom(z, reason: r) }
 
         session.beginConfiguration()
         defer { session.commitConfiguration() }
