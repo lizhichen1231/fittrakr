@@ -302,7 +302,7 @@ extension TrackingController {
             // 返回 nil → 状态机 locked→searching(冻结) 或 searching 超时→lost(回全景)。下游只认 lockState。
             #if DEBUG
             // 👻 iou高+候选1 = 后门在救场(该被 SOLO-PASS 接住);iou低/候选≥2 = 在抓替身(正是要堵的)
-            if frameCount % 15 == 0, let shadow = detectHumanRectFallback(pb: pb) {
+            if frameCount % 15 == 0, let shadow = detectHumanRectCandidate(pb: pb) {
                 let fa = sensorSize.width * sensorSize.height
                 print(String(format: "👻 SHADOW-FALLBACK box=(%.2f,%.2f,a%.3f) iouWithLast=%.2f candidates=%d → 已拦截(return nil, %@)",
                              shadow.0.midX / sensorSize.width, shadow.0.midY / sensorSize.height,
@@ -323,6 +323,13 @@ extension TrackingController {
 
     // 纯矩形检测兜底（骨骼检测失败时使用，不重复跑骨骼检测）
     func detectHumanRectFallback(pb: CVPixelBuffer) -> (CGRect, CGFloat)? {
+        guard let selected = detectHumanRectCandidate(pb: pb) else { return nil }
+        return applyKalmanSmoothing(rawRect: selected.0, conf: selected.1)
+    }
+
+    /// 关联选框(检测 + 最近邻/最大面积),不进 Kalman。
+    /// 影子诊断必须走这里:applyKalmanSmoothing 有真实状态写入(滤波器/softReset),诊断路径零写入。
+    func detectHumanRectCandidate(pb: CVPixelBuffer) -> (CGRect, CGFloat)? {
         let handler = VNImageRequestHandler(cvPixelBuffer: pb, orientation: .up, options: [:])
 
         do {
@@ -353,7 +360,7 @@ extension TrackingController {
                 } ?? candidates[0]
             }
 
-            return applyKalmanSmoothing(rawRect: selected.0, conf: selected.1)
+            return selected
 
         } catch {
             return nil
