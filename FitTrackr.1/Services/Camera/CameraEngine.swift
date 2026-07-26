@@ -96,6 +96,13 @@ protocol CameraEngineDelegate: AnyObject {
     private var activeVideoDevice: AVCaptureDevice?    // useUltraWideWithGDC 选定的设备
     private var sanctionedDeviceZoom: CGFloat = 1.0    // 白名单目标:守卫只放行等于它的写入
 
+    /// 【闪动修】缓推速率:powers-of-2 每秒。2.0 → 1↔2 档位迁移用时 0.5s。
+    /// 瞬跳(一步写 videoZoomFactor)= 闪动根源①:光学一帧跳 2×,任何补偿都难以逐帧对齐;
+    /// Q4 探针丝滑正是因为 ramp。除数逐帧跟随实读(闪动根源② 的修法)见 liveDeviceZoomReader。
+    static let lensRampRate: Float = 2.0
+    /// 除数/测量归一的每帧实读通道(useUltraWideWithGDC 装配;TrackingController 每帧读)
+    static var liveDeviceZoomReader: (() -> CGFloat)?
+
     /// 刀4:唯一合法设备 zoom 写入口(仲裁指令专用)。写前更新白名单 → KVO 守卫放行;其余写入照拦。
     func setLensDeviceZoom(_ z: CGFloat, reason: String) {
         sessionQueue.async {
@@ -105,13 +112,12 @@ protocol CameraEngineDelegate: AnyObject {
             self.sanctionedDeviceZoom = z
             do {
                 try dev.lockForConfiguration()
-                dev.videoZoomFactor = z
+                dev.ramp(toVideoZoomFactor: z, withRate: CameraEngine.lensRampRate)   // 缓推,非瞬跳(闪动修)
                 dev.unlockForConfiguration()
             } catch {
                 print("🎯 LENS-EXEC 失败: lockForConfiguration \(error)(reason=\(reason))"); return
             }
-            CameraEngine.lastSelectedDeviceZoom = dev.videoZoomFactor   // 实读回写(真实状态,不写死)
-            let msg = "🎯 LENS-EXEC 设备zoom→\(String(format: "%.2f", z)) 实读=\(String(format: "%.2f", dev.videoZoomFactor)) reason=\(reason)"
+            let msg = "🎯 LENS-EXEC 缓推→\(String(format: "%.2f", z)) rate=\(CameraEngine.lensRampRate)/s 起点实读=\(String(format: "%.2f", dev.videoZoomFactor)) reason=\(reason)"
             print(msg)
             #if DEBUG
             PerfFileLog.shared.line(msg)
@@ -128,6 +134,7 @@ protocol CameraEngineDelegate: AnyObject {
         zoomGuardObs = dev.observe(\.videoZoomFactor, options: [.new]) { [weak self] d, _ in
             let z = d.videoZoomFactor
             let allowed = self?.sanctionedDeviceZoom ?? 1.0
+            guard !d.isRampingVideoZoom else { return }   // 【闪动修】缓推中间值 = 合法过程量,放行
             guard abs(z - allowed) > 0.001 else { return }
             let msg = "❌ zoom守卫断言: device.videoZoomFactor 被写成 \(String(format: "%.2f", z)),白名单=\(String(format: "%.2f", allowed))(仅 setLensDeviceZoom 合法)→ 拦回"
             print(msg)
@@ -203,6 +210,7 @@ protocol CameraEngineDelegate: AnyObject {
             self.zoomGuardObs?.invalidate(); self.zoomGuardObs = nil
             // 刀4:执行通道随交接下线(防探针期间误执行);vm.start() 重装配
             CameraEngine.lensZoomExecutor = nil
+            CameraEngine.liveDeviceZoomReader = nil
             self.activeVideoDevice = nil
             self.sanctionedDeviceZoom = 1.0
             // 刀A:确认 isRunning=false 落日志——这行必须出现在探针「配置完成」之前,是有序交接的凭证
@@ -462,6 +470,8 @@ extension CameraEngine {
         activeVideoDevice = device
         sanctionedDeviceZoom = 1.0
         CameraEngine.lensZoomExecutor = { [weak self] z, r in self?.setLensDeviceZoom(z, reason: r) }
+        // 【闪动修】除数逐帧实读通道:缓推期间裁剪/测量归一必须贴着光学实际值走,不能用目标值
+        CameraEngine.liveDeviceZoomReader = { [weak device] in device?.videoZoomFactor ?? 1.0 }
 
         session.beginConfiguration()
         defer { session.commitConfiguration() }

@@ -345,20 +345,7 @@ final class PersonIdentifier {
     private let wedgeBlacklistRadius: CGFloat = 0.08
     private let wedgeBlacklistTTL: TimeInterval = 10
 
-    /// 【不变量III·切换重映射】设备 zoom D1→D2:本类 buffer 空间位置状态绕画面中心一步缩放 k=D2/D1
-    /// (lockedCenterHist/searchFrozenPoint 是归一坐标,绕 0.5 缩放;lastLockedBox 是像素矩形,绕传感器中心缩放)。
-    /// 不重映射 → 切换帧 pred 在旧空间、候选在新空间,|c|×(D−1) 的假跳变直接打爆邻域门。
-    func remapForLensSwitch(k: CGFloat, sensorSize: CGSize) {
-        func remapN(_ p: CGPoint) -> CGPoint { CGPoint(x: 0.5 + (p.x - 0.5) * k, y: 0.5 + (p.y - 0.5) * k) }
-        lockedCenterHist = lockedCenterHist.map { (remapN($0.0), $0.1) }
-        if let f = searchFrozenPoint { searchFrozenPoint = remapN(f) }
-        if let b = lastLockedBox {
-            let cx = sensorSize.width / 2, cy = sensorSize.height / 2
-            lastLockedBox = CGRect(x: cx + (b.origin.x - cx) * k, y: cy + (b.origin.y - cy) * k,
-                                   width: b.width * k, height: b.height * k)
-        }
-        print(String(format: "🎯 PI-REMAP k=%.2f(pred历史/冻结点/lastBox → 新buffer空间)", k))
-    }
+    // 【闪动修】remapForLensSwitch 已删除:瞬跳配套件,改缓推后位置状态逐帧自然跟踪,一步缩放作废。
 
     /// 三不管地带超时出口(TrackingController.advanceLockState 唯一调用方):记位置→连击判黑名单→解锁
     func forceUnlockWedged(at now: TimeInterval) {

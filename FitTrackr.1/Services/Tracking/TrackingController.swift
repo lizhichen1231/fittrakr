@@ -337,25 +337,23 @@ final class TrackingController {
     func setLensShadowOnly(_ on: Bool) {
         TrackingController.lensShadowOnly = on
         print("🎯 LENS-MODE → \(on ? "影子(只决策不动设备)" : "执行(指令驱动设备zoom)") 当前Zdev=\(String(format: "%.1f", lensDeviceZoom))")
-        if on, lensDeviceZoom != 1.0 {
+        if on, lensDeviceTarget != 1.0 {   // 【闪动修】对着目标值判(lensDeviceZoom 现为缓推过程量)
             executeLensTransition(to: 1.0, reason: "shadowOnly=ON 回滚")
         }
         if on { lensArbiter.reset() }
     }
 
-    /// 刀4:执行一次物理档位迁移——先把 buffer 空间状态一步几何重映射(k=新D/旧D),再驱动设备。
-    /// 卡面不变量:不改 Z_total、不动 crop 框(显示构图)——zoom 轴靠「弹簧在 Z_total 域+除法在弹簧后」同帧互补,
-    /// 中心轴靠本重映射(几何换算,非运动,一步到位不过弹簧)。
+    // 【闪动修】档位迁移目标(去重用):除数改为逐帧实读后,lensDeviceZoom 在缓推中是过程量,
+    // 重复指令判定要对着目标值而非过程值。
+    private var lensDeviceTarget: CGFloat = 1.0
+
+    /// 刀4:执行一次物理档位迁移。【闪动修】改缓推:设备 ramp(0.5s)连续过渡,除数/测量归一
+    /// 逐帧跟随实读(帧循环顶部)→ 光学与补偿全程贴合,无一步跳变 → 一步式空间重映射作废删除
+    /// (框/弹簧/PI pred 随缓推逐帧自然跟踪,与 Q4 探针缓推同一物理形态——探针当时就是丝滑的)。
     private func executeLensTransition(to newD: CGFloat, reason: String) {
-        let oldD = lensDeviceZoom
-        guard abs(newD - oldD) > 0.001 else { return }
-        let k = newD / oldD
-        remapBufferStateForLensSwitch(k: k)
-        // 【不变量III】PI 同步:位置状态重映射到新 buffer 空间 + 距离归一除数更新(判据恒在 UW基准系)
-        PersonIdentifier.shared.remapForLensSwitch(k: k, sensorSize: CGSize(width: sensorW, height: sensorH))
-        PersonIdentifier.shared.lensDeviceZoom = newD
-        lensDeviceZoom = newD
-        // 验收3:切换帧测量连续性直接证据——先打切换前 5 帧缓存,再武装打切换后 5 帧
+        guard abs(newD - lensDeviceTarget) > 0.001 else { return }
+        lensDeviceTarget = newD
+        // 验收3:切换测量连续性直接证据——先打切换前 5 帧缓存,再武装打切换后 5 帧
         for t in lensRatioTrace { print(String(format: "📏 RATIO前 f%d 原值(buffer比)=%.4f 除后(UW基准)=%.4f", t.f, t.raw, t.norm)) }
         lensRatioTraceArm = 5
         CameraEngine.lensZoomExecutor?(newD, reason)
@@ -372,32 +370,16 @@ final class TrackingController {
             print(String(format: "🎯 LENS-RESET 会话重启:除数 %.1f→1.0(设备已由 useUltraWideWithGDC 归位)", lensDeviceZoom))
         }
         lensDeviceZoom = 1.0
+        lensDeviceTarget = 1.0
         PersonIdentifier.shared.lensDeviceZoom = 1.0
         lensArbiter.reset()
         lensShadowPrevCenter = nil; lensShadowVel = 0
         lensRatioTrace.removeAll(); lensRatioTraceArm = 0
     }
 
-    /// buffer 空间几何重映射:设备 zoom D1→D2 时,所有 buffer 空间的框/弹簧绕画面中心缩放 k=D2/D1。
-    /// (UW基准系量不动:_lensCenter 已除以 lensDeviceZoom,跨切换自洽)
-    private func remapBufferRect(_ r: CGRect, k: CGFloat) -> CGRect {
-        let cx = sensorW / 2, cy = sensorH / 2
-        return CGRect(x: cx + (r.origin.x - cx) * k, y: cy + (r.origin.y - cy) * k,
-                      width: r.width * k, height: r.height * k)
-    }
-    private func remapBufferStateForLensSwitch(k: CGFloat) {
-        if let b = stableBox        { stableBox = remapBufferRect(b, k: k) }
-        if let b = rawBox           { rawBox = remapBufferRect(b, k: k) }
-        if let b = smoothedTightBox { smoothedTightBox = remapBufferRect(b, k: k) }
-        if let b = lastTightBox     { lastTightBox = remapBufferRect(b, k: k) }
-        if let c = lastCropRect     { lastCropRect = remapBufferRect(c, k: k) }
-        // crop 中心弹簧一步重播种到映射后位置(几何换算非运动,不许过弹簧滑过去);zoom 弹簧在 Z_total 域跨切换连续,不动
-        if cropSpringValid, let c = lastCropRect {
-            cropCenterSpring.reset(to: CGPoint(x: c.midX, y: c.midY))
-        }
-        centerHistory.removeAll(); hipHistory.removeAll()   // 原地检测历史跨空间无意义,清零重积累
-        print(String(format: "🎯 LENS-REMAP k=%.2f(buffer空间框/弹簧一步缩放,crop框显示位置不变)", k))
-    }
+    // 【闪动修】一步式空间重映射(remapBufferStateForLensSwitch/remapBufferRect)已删除——
+    // 它是为「瞬跳切换」设计的;改缓推后光学连续变化,框/弹簧/pred 逐帧自然跟踪(Q4 探针同形态),
+    // 一步缩放反而会在缓推起点制造它本要消除的跳变。PI.remapForLensSwitch 同理删除。
 
     // 跳变取证(只抓数据,不改逻辑):pose 四点门是否过、rect 兜底框 conf、本帧锚/ratio/rect框跳变量
     var dbgPoseValid = false
@@ -713,6 +695,16 @@ final class TrackingController {
             advanceLockState(identityMatched: (_rectResult != nil))
 
             // ===== 【方案B·刀3+刀4】镜头仲裁:每帧决策;shadowOnly=OFF 时指令驱动设备(单一权威下游,只读 lockState)=====
+            // 【闪动修】除数逐帧跟随设备 zoom 实读:缓推(ramp)期间光学连续变,裁剪补偿/测量归一必须贴着
+            // 实际光学值走——用目标值会造成「补偿已生效、光学未到位」的 1-2 帧错位 = 切换闪动的根源②。
+            // (取值来源自此修订:目标值→实读;残余误差=采集到处理的 1-2 帧固有延迟,连续且有界)
+            if let reader = CameraEngine.liveDeviceZoomReader {
+                let dRead = reader()
+                if abs(dRead - lensDeviceZoom) > 0.001 {
+                    lensDeviceZoom = dRead
+                    PersonIdentifier.shared.lensDeviceZoom = dRead
+                }
+            }
             let _lensNow = CACurrentMediaTime()
             // 状态 tag 就地映射(dbgStateTag() 是 DEBUG-only,本层是正式代码不能依赖它;lockState 只读)
             let _lensTag: String
