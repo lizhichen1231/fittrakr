@@ -376,6 +376,11 @@ final class TrackingController {
     var lensRatioTrace: [(f: Int, raw: CGFloat, norm: CGFloat)] = []
     var lensRatioTraceArm = 0
     var lensSwitchTraceArm = 0   // 【抖动取证】切换观测窗:指令后 120 帧逐帧落盘(d/Zt/eff/框/crop/比率)
+    #if DEBUG
+    var dbgSeqLeftoverPre: CGFloat = -1   // 帧序证:本帧入口重映射前的遗留 rawBox.midX
+    var dbgSeqLeftoverPost: CGFloat = -1  // 帧序证:换算后的遗留值(检测将覆盖它)
+    var dbgSeqK: CGFloat = 1.0            // 本帧重映射步长(1.0=本帧无重映射)
+    #endif
 
     /// 【刀B·不变量III】TC 侧持久 buffer 空间量的逐帧重映射(d 每变一步调一次,与 PI 微重映射同节奏)。
     /// 病灶:rawBox(miss/S 帧冻结保旧值)、stableBox/smoothedTightBox/lastTightBox(弹簧/EMA 状态)、
@@ -620,6 +625,33 @@ final class TrackingController {
         sensorW = CGFloat(CVPixelBufferGetWidth(wideFrame))
         sensorH = CGFloat(CVPixelBufferGetHeight(wideFrame))
 
+        // ═══【帧序修正·终审刀】d 同步 + 重映射搬到帧入口(检测之前)═══
+        // 重映射语义 = 把「上一帧遗留值」换算到本帧空间。原先执行在检测之后 → 本帧新检测值被再乘
+        // k≈1.03(恰等于缓推每帧步长,缓推模式特有、逐帧累积 30 次)→ 窗1 100% miss 回归。
+        // 搬到这里:先换算遗留 → 检测随后写入的新值不再被碰。只搬位,零其他改动。
+        if let reader = CameraEngine.liveDeviceZoomReader {
+            let dRead = reader()
+            if abs(dRead - lensDeviceZoom) > 0.001 {
+                let _kStep = dRead / max(lensDeviceZoom, 0.01)
+                #if DEBUG
+                dbgSeqLeftoverPre = rawBox?.midX ?? -1   // 附:帧序证——重映射前的遗留值
+                #endif
+                PersonIdentifier.shared.remapPositionsForDeviceZoomStep(
+                    k: _kStep, sensorSize: CGSize(width: sensorW, height: sensorH))
+                remapFrozenBufferState(k: _kStep)
+                #if DEBUG
+                dbgSeqLeftoverPost = rawBox?.midX ?? -1  // 附:帧序证——换算后的遗留值
+                dbgSeqK = _kStep
+                #endif
+                lensDeviceZoom = dRead
+                PersonIdentifier.shared.lensDeviceZoom = dRead
+            } else {
+                #if DEBUG
+                dbgSeqK = 1.0
+                #endif
+            }
+        }
+
         let now = Date()
         // 改动4:稳住 dt —— 上下钳 + 短 EMA(不加新滤波层,只平滑这一个值;live/回放共用)
         let rawDt = now.timeIntervalSince(lastTime)
@@ -729,22 +761,6 @@ final class TrackingController {
             advanceLockState(identityMatched: (_rectResult != nil))
 
             // ===== 【方案B·刀3+刀4】镜头仲裁:每帧决策;shadowOnly=OFF 时指令驱动设备(单一权威下游,只读 lockState)=====
-            // 【闪动修】除数逐帧跟随设备 zoom 实读:缓推(ramp)期间光学连续变,裁剪补偿/测量归一必须贴着
-            // 实际光学值走——用目标值会造成「补偿已生效、光学未到位」的 1-2 帧错位 = 切换闪动的根源②。
-            // (取值来源自此修订:目标值→实读;残余误差=采集到处理的 1-2 帧固有延迟,连续且有界)
-            if let reader = CameraEngine.liveDeviceZoomReader {
-                let dRead = reader()
-                if abs(dRead - lensDeviceZoom) > 0.001 {
-                    let _kStep = dRead / max(lensDeviceZoom, 0.01)
-                    // 【抖动修】d 变一步,PI 持久位置种子微重映射一步(k≈1.03/帧,平滑;详见 PI 注释)
-                    PersonIdentifier.shared.remapPositionsForDeviceZoomStep(
-                        k: _kStep, sensorSize: CGSize(width: sensorW, height: sensorH))
-                    // 【刀B】TC 侧冻结态量同节奏重映射(rawBox 族 + pose 锚)
-                    remapFrozenBufferState(k: _kStep)
-                    lensDeviceZoom = dRead
-                    PersonIdentifier.shared.lensDeviceZoom = dRead
-                }
-            }
             #if DEBUG
             // 【抖动取证】切换观测窗:逐帧落盘,定位振荡源(d/Zt/eff/检测命中/框位置/crop位置宽/躯干比)
             if lensSwitchTraceArm > 0 {
@@ -752,10 +768,12 @@ final class TrackingController {
                 let _rb = rawBox.map { String(format: "raw=(%.0f,%.0f)", $0.midX, $0.midY) } ?? "raw=nil"
                 let _sb = stableBox.map { String(format: "stb=(%.0f,%.0f)", $0.midX, $0.midY) } ?? "stb=nil"
                 let _cr = lastCropRect.map { String(format: "crop=(%.0f,%.0f,w%.0f)", $0.midX, $0.midY, $0.width) } ?? "crop=nil"
-                PerfFileLog.shared.line(String(format: "🔬 切换窗 f%d d=%.3f Zt=%.2f eff=%.2f det=%@ %@ %@ %@ ratio=%.4f size=%.4f/%.4f",
+                // 附·帧序证:遗留(换算前→后)+ 检测后现值——det=Y 帧现值=新检测(未再乘k)的直接证据
+                PerfFileLog.shared.line(String(format: "🔬 切换窗 f%d d=%.3f Zt=%.2f eff=%.2f det=%@ %@ %@ %@ ratio=%.4f size=%.4f/%.4f 序证:k=%.3f 遗留%.0f→%.0f 检后=%.0f",
                     frameCount, lensDeviceZoom, zoom, max(1.0, zoom / max(lensDeviceZoom, 1.0)),
                     (_rectResult != nil) ? "Y" : "N", _rb, _sb, _cr, lastTorsoRatio ?? -1,
-                    PersonIdentifier.shared.dbgSizeRaw, PersonIdentifier.shared.dbgSizeNorm))
+                    PersonIdentifier.shared.dbgSizeRaw, PersonIdentifier.shared.dbgSizeNorm,
+                    dbgSeqK, dbgSeqLeftoverPre, dbgSeqLeftoverPost, rawBox?.midX ?? -1))
             }
             #endif
             let _lensNow = CACurrentMediaTime()
