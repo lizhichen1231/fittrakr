@@ -96,11 +96,9 @@ protocol CameraEngineDelegate: AnyObject {
     private var activeVideoDevice: AVCaptureDevice?    // useUltraWideWithGDC 选定的设备
     private var sanctionedDeviceZoom: CGFloat = 1.0    // 白名单目标:守卫只放行等于它的写入
 
-    /// 【闪动修】缓推速率:powers-of-2 每秒。2.0 → 1↔2 档位迁移用时 0.5s。
-    /// 瞬跳(一步写 videoZoomFactor)= 闪动根源①:光学一帧跳 2×,任何补偿都难以逐帧对齐;
-    /// Q4 探针丝滑正是因为 ramp。除数逐帧跟随实读(闪动根源② 的修法)见 liveDeviceZoomReader。
-    static let lensRampRate: Float = 2.0
-    /// 除数/测量归一的每帧实读通道(useUltraWideWithGDC 装配;TrackingController 每帧读)
+    /// 除数/测量归一的每帧实读通道(useUltraWideWithGDC 装配;TrackingController 每帧读)。
+    /// 【终审回落】缓推机制已撤(lensRampRate 一并删,不留死常量);瞬切下本通道在跳变检出帧
+    /// 读到阶跃 → 帧入口重映射自动退化为一步式(k=2 单次),正是回落条款要的形态。
     static var liveDeviceZoomReader: (() -> CGFloat)?
 
     /// 刀4:唯一合法设备 zoom 写入口(仲裁指令专用)。写前更新白名单 → KVO 守卫放行;其余写入照拦。
@@ -112,12 +110,15 @@ protocol CameraEngineDelegate: AnyObject {
             self.sanctionedDeviceZoom = z
             do {
                 try dev.lockForConfiguration()
-                dev.ramp(toVideoZoomFactor: z, withRate: CameraEngine.lensRampRate)   // 缓推,非瞬跳(闪动修)
+                // 【终审回落】缓推→瞬切:窗2 det=N 77.5% 终审未达,按预注册条款回落。
+                // 帧入口 readback+重映射架构在瞬切下自动退化为「跳变检出帧做一次 k=2 重映射」= 一步式;
+                // 接受 1-2 帧除数/光学错位闪动(采集→处理时延,已知代价)。
+                dev.videoZoomFactor = z
                 dev.unlockForConfiguration()
             } catch {
                 print("🎯 LENS-EXEC 失败: lockForConfiguration \(error)(reason=\(reason))"); return
             }
-            let msg = "🎯 LENS-EXEC 缓推→\(String(format: "%.2f", z)) rate=\(CameraEngine.lensRampRate)/s 起点实读=\(String(format: "%.2f", dev.videoZoomFactor)) reason=\(reason)"
+            let msg = "🎯 LENS-EXEC 瞬切→\(String(format: "%.2f", z)) 实读=\(String(format: "%.2f", dev.videoZoomFactor)) reason=\(reason)"
             print(msg)
             #if DEBUG
             PerfFileLog.shared.line(msg)
@@ -134,7 +135,6 @@ protocol CameraEngineDelegate: AnyObject {
         zoomGuardObs = dev.observe(\.videoZoomFactor, options: [.new]) { [weak self] d, _ in
             let z = d.videoZoomFactor
             let allowed = self?.sanctionedDeviceZoom ?? 1.0
-            guard !d.isRampingVideoZoom else { return }   // 【闪动修】缓推中间值 = 合法过程量,放行
             guard abs(z - allowed) > 0.001 else { return }
             let msg = "❌ zoom守卫断言: device.videoZoomFactor 被写成 \(String(format: "%.2f", z)),白名单=\(String(format: "%.2f", allowed))(仅 setLensDeviceZoom 合法)→ 拦回"
             print(msg)
