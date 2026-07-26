@@ -709,6 +709,10 @@ final class TrackingController {
             if let reader = CameraEngine.liveDeviceZoomReader {
                 let dRead = reader()
                 if abs(dRead - lensDeviceZoom) > 0.001 {
+                    // 【抖动修】d 变一步,PI 持久位置种子微重映射一步(k≈1.03/帧,平滑;详见 PI 注释)
+                    PersonIdentifier.shared.remapPositionsForDeviceZoomStep(
+                        k: dRead / max(lensDeviceZoom, 0.01),
+                        sensorSize: CGSize(width: sensorW, height: sensorH))
                     lensDeviceZoom = dRead
                     PersonIdentifier.shared.lensDeviceZoom = dRead
                 }

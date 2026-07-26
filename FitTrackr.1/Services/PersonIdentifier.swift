@@ -345,7 +345,20 @@ final class PersonIdentifier {
     private let wedgeBlacklistRadius: CGFloat = 0.08
     private let wedgeBlacklistTTL: TimeInterval = 10
 
-    // 【闪动修】remapForLensSwitch 已删除:瞬跳配套件,改缓推后位置状态逐帧自然跟踪,一步缩放作废。
+    /// 【抖动修·逐帧微重映射】缓推期间 d 每变一步(≈1.03/帧),本类**持久**位置种子绕中心缩放同一步。
+    /// 教训:删一步式重映射时误判「逐帧自然跟踪」——对检测刷新的量成立,对事件驱动的持久种子
+    /// (searchFrozenPoint 进S那刻记、lockedCenterHist、lastLockedBox)不成立:d 变了它们不变 →
+    /// 跨空间比较 → 三牙 dFreeze 永假 → det=N 64%(实测窗2)= rawBox 冻结↔刷新横跳 = 疯狂抖动。
+    func remapPositionsForDeviceZoomStep(k: CGFloat, sensorSize: CGSize) {
+        func remapN(_ p: CGPoint) -> CGPoint { CGPoint(x: 0.5 + (p.x - 0.5) * k, y: 0.5 + (p.y - 0.5) * k) }
+        lockedCenterHist = lockedCenterHist.map { (remapN($0.0), $0.1) }
+        if let f = searchFrozenPoint { searchFrozenPoint = remapN(f) }
+        if let b = lastLockedBox {
+            let cx = sensorSize.width / 2, cy = sensorSize.height / 2
+            lastLockedBox = CGRect(x: cx + (b.origin.x - cx) * k, y: cy + (b.origin.y - cy) * k,
+                                   width: b.width * k, height: b.height * k)
+        }
+    }
 
     /// 三不管地带超时出口(TrackingController.advanceLockState 唯一调用方):记位置→连击判黑名单→解锁
     func forceUnlockWedged(at now: TimeInterval) {
