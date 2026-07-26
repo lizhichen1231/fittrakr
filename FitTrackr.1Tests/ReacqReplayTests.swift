@@ -8,10 +8,10 @@ import AVFoundation
 final class ReacqReplayTests: XCTestCase {
 
     struct ReplayResult {
-        var rejected = 0, color = 0, margin = 0, pos = 0, lost = 0
+        var rejected = 0, color = 0, margin = 0, pos = 0, lost = 0, dupMerged = 0
         var desc: String {
             let d = max(rejected, 1)
-            return "拒\(rejected) 色\(color)(\(100*color/d)%) margin\(margin)(\(100*margin/d)%) pos\(pos)(\(100*pos/d)%) LOST=\(lost)"
+            return "拒\(rejected) 色\(color)(\(100*color/d)%) margin\(margin)(\(100*margin/d)%) pos\(pos)(\(100*pos/d)%) 同人去重=\(dupMerged) LOST=\(lost)"
         }
     }
 
@@ -22,15 +22,12 @@ final class ReacqReplayTests: XCTestCase {
     }
 
     /// 跑一条片子(非实时=尽快解码,管线同步消费=天然背压),回分牙数字
-    private func runClip(_ name: String, seconds: TimeInterval,
-                         extrap: Bool, posStart: Float) -> ReplayResult? {
+    private func runClip(_ name: String, seconds: TimeInterval) -> ReplayResult? {
         guard let url = clipURL(name) else { return nil }
         let pi = PersonIdentifier.shared
         pi.unlock()
-        pi.reacqExtrapolationEnabled = extrap
-        pi.reacqPosStart = posStart
         pi.reacqFailCount = 0; pi.reacqFailColor = 0; pi.reacqFailMargin = 0
-        pi.reacqFailPos = 0; pi.reacqFailDetector = 0
+        pi.reacqFailPos = 0; pi.reacqFailDetector = 0; pi.reacqDupMerged = 0
         TrackingController.dbgLostCount = 0
 
         let vm = CameraViewModel(source: VideoFileSource(url: url, realtime: false, loop: false))
@@ -44,22 +41,22 @@ final class ReacqReplayTests: XCTestCase {
         var r = ReplayResult()
         r.rejected = pi.reacqFailCount; r.color = pi.reacqFailColor
         r.margin = pi.reacqFailMargin; r.pos = pi.reacqFailPos
+        r.dupMerged = pi.reacqDupMerged
         r.lost = TrackingController.dbgLostCount
         return r
     }
 
-    /// 贡献拆分(判据1/3 + 刀2 单开/双开)—— clip_5 运动夹具
-    func testContributionSplit_clip5() throws {
+    /// 交付配置回归 —— clip_5 运动/找回夹具(判据1 近似 + 判据3)
+    func testDeliveryConfig_clip5() throws {
         guard clipURL("clip_5_sameshirt_dancetrack0034") != nil else {
             throw XCTSkip("clip_5 不在测试宿主 bundle(Debug Copy Replay Clips 未跑)")
         }
-        var report = "\n═══ 复现拆分 clip_2(挂单三)═══\n"
-        for (label, ex, ps) in [("A 仅外推(起步0.06)", true, Float(0.06)),
-                                ("B 仅重标定(起步0.12)", false, Float(0.12))] {
-            guard let r = runClip("clip_2_sameshirt_dancetrack0004", seconds: 40, extrap: ex, posStart: ps) else { continue }
-            report += "  \(label): \(r.desc)\n"
+        guard let r = runClip("clip_5_sameshirt_dancetrack0034", seconds: 40) else {
+            XCTFail("clip_5 跑失败"); return
         }
-        print(report)
+        print("\n═══ clip_5 交付配置(A 仅外推·起步0.06)═══\n  \(r.desc)\n")
+        // 交付配置基线:A 拆分轮 拒9/pos0/LOST0(单轮方差告警下的量级锚)
+        XCTAssertEqual(r.lost, 0, "clip_5 交付配置不应出现 LOST")
     }
 
     /// 判据2/4 —— clip_1 双人同色夹具:margin 败率 + 反例保护(margin 仍在拦真双人)
@@ -67,7 +64,7 @@ final class ReacqReplayTests: XCTestCase {
         guard clipURL("clip_1_sameshirt_dancetrack0097") != nil else {
             throw XCTSkip("clip_1 不在测试宿主 bundle")
         }
-        guard let r = runClip("clip_1_sameshirt_dancetrack0097", seconds: 40, extrap: true, posStart: 0.12) else {
+        guard let r = runClip("clip_1_sameshirt_dancetrack0097", seconds: 40) else {
             XCTFail("clip_1 跑失败"); return
         }
         print("\n═══ clip_1 双人同色 ═══\n  交付配置: \(r.desc)\n")
