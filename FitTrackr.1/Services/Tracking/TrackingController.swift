@@ -353,15 +353,23 @@ final class TrackingController {
     private func executeLensTransition(to newD: CGFloat, reason: String) {
         guard abs(newD - lensDeviceTarget) > 0.001 else { return }
         lensDeviceTarget = newD
-        // 验收3:切换测量连续性直接证据——先打切换前 5 帧缓存,再武装打切换后 5 帧
-        for t in lensRatioTrace { print(String(format: "📏 RATIO前 f%d 原值(buffer比)=%.4f 除后(UW基准)=%.4f", t.f, t.raw, t.norm)) }
+        // 验收3:切换测量连续性直接证据——先打切换前 5 帧缓存,再武装打切换后 5 帧(print+落盘)
+        for t in lensRatioTrace {
+            let m = String(format: "📏 RATIO前 f%d 原值(buffer比)=%.4f 除后(UW基准)=%.4f", t.f, t.raw, t.norm)
+            print(m)
+            #if DEBUG
+            PerfFileLog.shared.line(m)
+            #endif
+        }
         lensRatioTraceArm = 5
+        lensSwitchTraceArm = 120   // 【抖动取证】开 2s 逐帧观测窗
         CameraEngine.lensZoomExecutor?(newD, reason)
     }
 
     // 验收3 取证:环形缓存最近 5 帧躯干比(原值=buffer空间比,除后=UW基准系比);切换时前5帧+后5帧都打
     var lensRatioTrace: [(f: Int, raw: CGFloat, norm: CGFloat)] = []
     var lensRatioTraceArm = 0
+    var lensSwitchTraceArm = 0   // 【抖动取证】切换观测窗:指令后 120 帧逐帧落盘(d/Zt/eff/框/crop/比率)
 
     /// 会话重启复位(vm.start 调):useUltraWideWithGDC 已把设备归 1.0,本侧除数/仲裁/PI 必须同步归位,
     /// 否则「设备=1.0 而除数=2.0」→ 裁剪/测量全错(审计时发现的重启态不一致)。
@@ -705,6 +713,18 @@ final class TrackingController {
                     PersonIdentifier.shared.lensDeviceZoom = dRead
                 }
             }
+            #if DEBUG
+            // 【抖动取证】切换观测窗:逐帧落盘,定位振荡源(d/Zt/eff/检测命中/框位置/crop位置宽/躯干比)
+            if lensSwitchTraceArm > 0 {
+                lensSwitchTraceArm -= 1
+                let _rb = rawBox.map { String(format: "raw=(%.0f,%.0f)", $0.midX, $0.midY) } ?? "raw=nil"
+                let _sb = stableBox.map { String(format: "stb=(%.0f,%.0f)", $0.midX, $0.midY) } ?? "stb=nil"
+                let _cr = lastCropRect.map { String(format: "crop=(%.0f,%.0f,w%.0f)", $0.midX, $0.midY, $0.width) } ?? "crop=nil"
+                PerfFileLog.shared.line(String(format: "🔬 切换窗 f%d d=%.3f Zt=%.2f eff=%.2f det=%@ %@ %@ %@ ratio=%.4f",
+                    frameCount, lensDeviceZoom, zoom, max(1.0, zoom / max(lensDeviceZoom, 1.0)),
+                    (_rectResult != nil) ? "Y" : "N", _rb, _sb, _cr, lastTorsoRatio ?? -1))
+            }
+            #endif
             let _lensNow = CACurrentMediaTime()
             // 状态 tag 就地映射(dbgStateTag() 是 DEBUG-only,本层是正式代码不能依赖它;lockState 只读)
             let _lensTag: String
