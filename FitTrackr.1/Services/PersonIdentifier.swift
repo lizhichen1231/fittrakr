@@ -553,7 +553,20 @@ final class PersonIdentifier {
         #endif
         if searchMode {
             let rects = detectAllRects(in: detectBuffer, sensorSize: sensorSize)
-            let extra = rects.filter { rc in !persons.contains { iou($0, rc) > 0.5 } }
+            // 【三牙刀1】跨源去重弃 IoU 改「包含关系+中心距离」:pose 紧贴框 vs rect 松框 IoU 常<0.5
+            // (交并比对跨检测器框形失效)→ 同人双候选、颜色同为0.9量级 → margin≈0.06 永败(实测 T1 98%)。
+            // 判同人 = 交集/较小框面积 ≥0.6(紧框大体落在松框内)或 中心距 ≤0.5×较小框高。
+            // 合并保留 pose 框(与常规匹配同源 → 找回帧无框源跳变);margin 阈 0.15 不动(拦真双人本职不变);
+            // 两个真人都被 pose 检出时互不合并(去重只滤 rect 对 pose,pose-pose 不比)→ 反例保护结构成立。
+            func sameSubject(_ a: CGRect, _ b: CGRect) -> Bool {
+                let inter = a.intersection(b)
+                if !inter.isNull, inter.width > 0 {
+                    let contain = (inter.width * inter.height) / max(min(a.width * a.height, b.width * b.height), 1)
+                    if contain >= 0.6 { return true }
+                }
+                return hypot(a.midX - b.midX, a.midY - b.midY) <= 0.5 * min(a.height, b.height)
+            }
+            let extra = rects.filter { rc in !persons.contains { sameSubject($0, rc) } }
             if !extra.isEmpty {
                 persons.append(contentsOf: extra)
                 #if DEBUG
