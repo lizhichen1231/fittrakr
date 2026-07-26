@@ -148,6 +148,11 @@ final class TrackingController {
     //    StateDebouncer 已于方案B·刀2 出生(镜头切换首用),此处收编排在设计稿 §9 收编序第二位,待后续纯重构刀)
     let reacqCooldownSec: TimeInterval = 2.0
     private var reacqLockedAt: TimeInterval = -100   // 上次「找回成功」时刻;-100 = 初始不在冷却
+    // 【三态机补丁刀】三不管地带超时:PI已锁+unlocked+持续无匹配 N 秒 → 强制解锁重找。
+    // N=2s 依据:健康首匹配在下一帧量级(帧级),卡死=∞(实测48s零匹配)——2s 离两峰都远;
+    // 与 reacqCooldownSec 同量级;误触代价=一次良性重锁,宁短勿长。真人遮挡走 locked→searching 既有路径,不经此门。
+    static let wedgeTimeoutSec: TimeInterval = 2.0
+    private var wedgeNoMatchSince: TimeInterval = -1  // 进入三不管态的时刻;-1=不在此态
     #if DEBUG
     var dbgStateEvent = ""     // 最近一次事件缩写(保持 3s)
     var dbgStateEventUntil: TimeInterval = 0
@@ -889,9 +894,11 @@ final class TrackingController {
     private func advanceLockState(identityMatched: Bool) {
         let now = CACurrentMediaTime()
         guard PersonIdentifier.shared.isLocked else {
+            wedgeNoMatchSince = -1                    // 补丁刀:未锁 = 不在三不管态
             if lockState != .unlocked { lockState = .unlocked }
             return
         }
+        if identityMatched { wedgeNoMatchSince = -1 }  // 补丁刀:任何一帧匹配即清零(连续制)
         if identityMatched {
             var elapsed: TimeInterval = 0
             if case .searching(let since) = lockState { elapsed = now - since }
@@ -952,6 +959,21 @@ final class TrackingController {
                 print("🔒 STATE locked→searching @f\(frameCount) (findTarget nil, candidates=\(PersonIdentifier.shared.lastCandidateCount))")
                 setStateEvent("SEARCH", now)
                 #endif
+            case .unlocked:
+                // 【三态机补丁刀】三不管地带超时出口:PI已锁 + unlocked + 持续无匹配——
+                // 此前无任何转移路径(不在 searching→4s超时不生效;PI已锁→auto-lock 不重试)= 永久卡死
+                // (实测:PI=Y+态=U 并存 48s,c 冻结,刀4 验收被拦)。超时 → 强制解锁,回干净未锁,
+                // auto-lock 下帧重试;防重锁循环(连续两次同位置超时 → 短期黑名单)在 PersonIdentifier 侧。
+                if wedgeNoMatchSince < 0 { wedgeNoMatchSince = now }
+                if now - wedgeNoMatchSince >= TrackingController.wedgeTimeoutSec {
+                    let held = now - wedgeNoMatchSince
+                    print(String(format: "🔓 STATE wedge-timeout @f%d(PI已锁+unlocked 无匹配 %.1fs≥%.0fs)→ 强制解锁重找", frameCount, held, TrackingController.wedgeTimeoutSec))
+                    #if DEBUG
+                    setStateEvent("WEDGE-UNLOCK", now)
+                    #endif
+                    PersonIdentifier.shared.forceUnlockWedged(at: now)
+                    wedgeNoMatchSince = -1
+                }
             default:
                 break
             }

@@ -248,7 +248,14 @@ final class PersonIdentifier {
         let _tLk2 = CACurrentMediaTime()   // 复核打印(含 DEBUG 二次全帧检测)段结束
         #endif
 
-        guard let largest = realBoxes
+        // 【三态机补丁刀】短期黑名单过滤:连续两次超时解锁的位置 10s 内不作自动锁定候选(防重锁循环)
+        let _blNow = CACurrentMediaTime()
+        lockBlacklist = lockBlacklist.filter { $0.until > _blNow }
+        let lockCandidates = lockBlacklist.isEmpty ? realBoxes : realBoxes.filter { box in
+            let c = CGPoint(x: box.midX / sensorSize.width, y: box.midY / sensorSize.height)
+            return !lockBlacklist.contains { hypot($0.center.x - c.x, $0.center.y - c.y) < wedgeBlacklistRadius }
+        }
+        guard let largest = lockCandidates
                 .max(by: { $0.width * $0.height < $1.width * $1.height }) else {
             return false
         }
@@ -326,6 +333,29 @@ final class PersonIdentifier {
     #endif
 
     /// 解除锁定
+    // 【三态机补丁刀·防重锁循环】超时解锁的目标位置记忆(归一中心)。
+    // 连续第 2 次在同位置(半径 0.08)超时解锁 → 进短期黑名单(10s),auto-lock 期间跳过该处候选——
+    // 掐断「锁静物→2s→解锁→立刻重锁同一静物」的永久循环。选黑名单而非退 searching:
+    // 三牙找回用的是被锁目标自己的颜色档案,锁的是静物时会把静物精准找回=把卡死洗白成稳定错锁。
+    private var wedgeUnlockHistory: [(center: CGPoint, at: TimeInterval)] = []
+    private var lockBlacklist: [(center: CGPoint, until: TimeInterval)] = []
+    private let wedgeBlacklistRadius: CGFloat = 0.08
+    private let wedgeBlacklistTTL: TimeInterval = 10
+
+    /// 三不管地带超时出口(TrackingController.advanceLockState 唯一调用方):记位置→连击判黑名单→解锁
+    func forceUnlockWedged(at now: TimeInterval) {
+        if let c = predictedCenter(at: now) {   // 卡死态下即冻结的锁定位置(归一)
+            wedgeUnlockHistory = wedgeUnlockHistory.filter { now - $0.at < 30 }
+            let repeatHit = wedgeUnlockHistory.contains { hypot($0.center.x - c.x, $0.center.y - c.y) < wedgeBlacklistRadius }
+            wedgeUnlockHistory.append((c, now))
+            if repeatHit {
+                lockBlacklist.append((c, now + wedgeBlacklistTTL))
+                print(String(format: "⛔ LOCK黑名单: (%.2f,%.2f) 连续两次超时解锁 → %0.fs 内不作候选", c.x, c.y, wedgeBlacklistTTL))
+            }
+        }
+        unlock()
+    }
+
     func unlock() {
         isLocked = false
         target = nil
