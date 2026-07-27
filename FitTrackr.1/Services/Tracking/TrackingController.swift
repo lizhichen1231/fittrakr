@@ -359,12 +359,16 @@ final class TrackingController {
     private func staticSceneMetrics(_ pb: CVPixelBuffer) {
         CVPixelBufferLockBaseAddress(pb, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
-        guard CVPixelBufferGetPlaneCount(pb) > 0,
-              let base = CVPixelBufferGetBaseAddressOfPlane(pb, 0) else {
+        // 本管线 videoOutput=32BGRA(单平面,CameraEngine:347);兼容双平面 420(回放/其他源)取 Y。
+        let planar = CVPixelBufferGetPlaneCount(pb) > 0
+        let w = planar ? CVPixelBufferGetWidthOfPlane(pb, 0) : CVPixelBufferGetWidth(pb)
+        let h = planar ? CVPixelBufferGetHeightOfPlane(pb, 0) : CVPixelBufferGetHeight(pb)
+        let rowB = planar ? CVPixelBufferGetBytesPerRowOfPlane(pb, 0) : CVPixelBufferGetBytesPerRow(pb)
+        let px = planar ? 1 : 4          // BGRA 步进 4 字节
+        let off = planar ? 0 : 1         // BGRA 取 G 通道作亮度代理
+        guard let base = planar ? CVPixelBufferGetBaseAddressOfPlane(pb, 0) : CVPixelBufferGetBaseAddress(pb) else {
             dbgSSDCrop = -1; dbgSSDRaw = -1; return
         }
-        let w = CVPixelBufferGetWidthOfPlane(pb, 0), h = CVPixelBufferGetHeightOfPlane(pb, 0)
-        let rowB = CVPixelBufferGetBytesPerRowOfPlane(pb, 0)
         let p = base.assumingMemoryBound(to: UInt8.self)
         func grid(_ rect: CGRect) -> [Float] {
             var v = [Float](); v.reserveCapacity(16 * 28)
@@ -372,7 +376,7 @@ final class TrackingController {
                 for gx in 0..<16 {
                     let x = min(w - 1, max(0, Int(rect.minX + rect.width * (CGFloat(gx) + 0.5) / 16)))
                     let y = min(h - 1, max(0, Int(rect.minY + rect.height * (CGFloat(gy) + 0.5) / 28)))
-                    v.append(Float(p[y * rowB + x]))
+                    v.append(Float(p[y * rowB + x * px + off]))
                 }
             }
             return v
