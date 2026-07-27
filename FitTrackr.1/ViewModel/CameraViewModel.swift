@@ -180,6 +180,13 @@ final class CameraViewModel: NSObject, ObservableObject {
 
     // MARK: - æŽ§åˆ¶
     func start() {
+        // 【单人收口卡·五 台架修复】XCTest 进程内不起实时相机:宿主 app 的实时管线与回放 TC 并跑
+        // 会双写测量(assocTrace 帧号交错实证);锁屏跑测试时 FigCaptureSourceRemote -17281 起动即崩同根。
+        // 只拦 LiveCameraSource——测试自建的回放 vm(VideoFileSource)不受影响。
+        if source is LiveCameraSource, NSClassFromString("XCTestCase") != nil {
+            print("🧪 测试进程:实时相机不启动(回放源不受影响)")
+            return
+        }
         // 会话开始重置锁(PersonIdentifier 是单例,切换视频/重开相机时清掉上一会话的锁与颜色档案)→ 本会话自动锁定新主角。
         // 这是会话生命周期,不是录制生命周期:录制开关全程不碰锁。
         PersonIdentifier.shared.unlock()
