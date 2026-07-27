@@ -67,8 +67,8 @@ protocol CameraEngineDelegate: AnyObject {
 
     func start() {
         #if DEBUG
-        // 埋点卡三:形态标注首行——避免与缓推时代窗1/窗2 数据混比。★改切换机制时同步改此行。
-        PerfFileLog.shared.line("🏷 形态=瞬切(直写执行器) 基线commit≈d96eb25+")
+        // 埋点卡三:形态标注首行——从执行器常量实导,避免不同形态数据混比(文案不写死)。
+        PerfFileLog.shared.line("🏷 形态=\(lensRampRate > 0 ? String(format: "缓推(rate %.1f/s,瞬切后备)", lensRampRate) : "瞬切(直写执行器)") 执行器=setLensDeviceZoom白名单")
         LensReconProbe.dumpDualWide()   // 【查勘#2 Q2 探针】用完即撤(probe/lens-recon)
         #endif
         // 任务零:全应用锁死竖屏——已删设备方向通知订阅(采集层 connection 一次性设死 .portrait,不再跟随旋转)
@@ -104,6 +104,10 @@ protocol CameraEngineDelegate: AnyObject {
     static var liveDeviceZoomReader: (() -> CGFloat)?
 
     /// 刀4:唯一合法设备 zoom 写入口(仲裁指令专用)。写前更新白名单 → KVO 守卫放行;其余写入照拦。
+    // 【单人收口卡·一】回缓推:闪回双向出现,归因除数时延——瞬切下错位=全步长(2×,必可见);
+    // 缓推下每帧 k≈1.03,帧入口 readback+逐帧微重映射(帧序修正后)吸收到不可见量级。
+    let lensRampRate: Float = 2.0   // 缓推速率(factors/s);0 = 瞬切(后备形态,直写)
+
     func setLensDeviceZoom(_ z: CGFloat, reason: String) {
         sessionQueue.async {
             guard let dev = self.activeVideoDevice else {
@@ -112,15 +116,17 @@ protocol CameraEngineDelegate: AnyObject {
             self.sanctionedDeviceZoom = z
             do {
                 try dev.lockForConfiguration()
-                // 【终审回落】缓推→瞬切:窗2 det=N 77.5% 终审未达,按预注册条款回落。
-                // 帧入口 readback+重映射架构在瞬切下自动退化为「跳变检出帧做一次 k=2 重映射」= 一步式;
-                // 接受 1-2 帧除数/光学错位闪动(采集→处理时延,已知代价)。
-                dev.videoZoomFactor = z
+                if self.lensRampRate > 0 {
+                    dev.ramp(toVideoZoomFactor: z, withRate: self.lensRampRate)
+                } else {
+                    dev.videoZoomFactor = z
+                }
                 dev.unlockForConfiguration()
             } catch {
                 print("🎯 LENS-EXEC 失败: lockForConfiguration \(error)(reason=\(reason))"); return
             }
-            let msg = "🎯 LENS-EXEC 瞬切→\(String(format: "%.2f", z)) 实读=\(String(format: "%.2f", dev.videoZoomFactor)) reason=\(reason)"
+            let form = self.lensRampRate > 0 ? String(format: "缓推(rate %.1f/s)", self.lensRampRate) : "瞬切"
+            let msg = "🎯 LENS-EXEC \(form)→\(String(format: "%.2f", z)) 实读起点=\(String(format: "%.2f", dev.videoZoomFactor)) reason=\(reason)"
             print(msg)
             #if DEBUG
             PerfFileLog.shared.line(msg)
@@ -138,6 +144,9 @@ protocol CameraEngineDelegate: AnyObject {
             let z = d.videoZoomFactor
             let allowed = self?.sanctionedDeviceZoom ?? 1.0
             guard abs(z - allowed) > 0.001 else { return }
+            // 缓推兼容:ramp 期间中间值放行(系统在朝白名单目标插值);终值仍受精确校验——
+            // 野 ramp 到非白名单目标,ramp 结束后首个事件/写入即被拦回。
+            if d.isRampingVideoZoom { return }
             let msg = "❌ zoom守卫断言: device.videoZoomFactor 被写成 \(String(format: "%.2f", z)),白名单=\(String(format: "%.2f", allowed))(仅 setLensDeviceZoom 合法)→ 拦回"
             print(msg)
             #if DEBUG
