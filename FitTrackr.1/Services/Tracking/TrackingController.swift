@@ -344,6 +344,8 @@ final class TrackingController {
     var dbgSpringDt: CGFloat = 0         // 喂弹簧的 dt(smoothedDt)
     var dbgEffActual: CGFloat = 0        // 弹簧后 eff(=sprung/d)
     var dbgDNow: CGFloat = 1.0           // 【PTS对齐卡】本帧设备实读(处理时刻);d采≠d现 = 对齐在纠偏
+    var dbgCapLagMs: Double = 0          // 【δ收窄卡】自证:处理−采集(ms,≈L_eff)
+    var dbgLookupLagMs: Double = 0       // 【δ收窄卡】自证:处理−查表(ms,≈L_total,应≈16.7)
 
     // 【静景腿卡·二】不依赖人体检测的全帧指标:Y 平面固定网格采样,相邻帧 SSD。
     // ssd裁(crop 内固定网格=尺度归一,显示侧代理):静景+对齐完美 → 应恒定,波动=光学/裁剪错配(δ 信号);
@@ -398,6 +400,10 @@ final class TrackingController {
         }
     }
     #endif
+
+    /// 【δ收窄卡·三】读回相对真光学的滞后(秒)。静景腿实测:停端点 δ=1.60±0.5 帧 @60fps。
+    /// 平台常数(附录H);若换机/系统大版本,静景腿复测。
+    static let readbackLagSec: Double = 1.6 / 60.0
 
     // 【PTS对齐卡·三】除数按采集时刻取值:环形缓冲 (host秒, d实读),帧入口先记样本再按 PTS 查表。
     // ramp 期两样本间 d 为平滑指数轨 → 线性插值误差 ≪ 单帧步长;查不到回落当前实读+警告(不许静默)。
@@ -765,9 +771,15 @@ final class TrackingController {
             } else {
                 _tCap = _tNow              // 回放/交接期:帧即时合成,采集=现在(d 恒 1,查表恒等)
             }
-            let dRead = lookupCaptureD(at: _tCap, fallback: dNow)
+            // 【δ收窄卡·三】读回滞后真光学 δ=1.6帧(静景腿停端点两测互差0.00,±0.5):
+            // 帧内容光学 = optics(t采) = 读回(t采+δ) → 查表时刻 = 采集 + δ。
+            // ★符号:回看量 L_total = L_eff−δ ≈ 2.6−1.6 = 1.0 帧(是减——此前假设 δ=0 已反过一次)。
+            let _tLookup = _tCap + TrackingController.readbackLagSec
+            let dRead = lookupCaptureD(at: _tLookup, fallback: dNow)
             #if DEBUG
             dbgDNow = dNow
+            dbgCapLagMs = (_tNow - _tCap) * 1000
+            dbgLookupLagMs = (_tNow - _tLookup) * 1000
             #endif
             if abs(dRead - lensDeviceZoom) > 0.001 {
                 let _kStep = dRead / max(lensDeviceZoom, 0.01)
@@ -925,13 +937,13 @@ final class TrackingController {
             // Zt瞬(settle后) vs Zt簧(crop实际用) 并列 = 三选一判据;slew/hold/dt簧 = 三候选机制直读。
             // 注:computeFinalCropRect 在本块之后跑,簧值为上一帧,恒定 1 帧位差,判读时对齐。
             if lensSwitchTraceArm > 0 || frameCount % 15 == 0 {
-                PerfFileLog.shared.line(String(format: "🌀 尺度链 f%d Zt瞬=%.3f Zt簧=%.3f 簧目标=%.3f dt簧=%.4f d采=%.3f d现=%.3f effReq=%.3f eff实=%.3f cropW=%.0f 理想W=%.0f slew=%@(步%.4f/帽%.4f) hold=%@(gap%.4f) ssd裁=%.1f ssd原=%.1f",
+                PerfFileLog.shared.line(String(format: "🌀 尺度链 f%d Zt瞬=%.3f Zt簧=%.3f 簧目标=%.3f dt簧=%.4f d采=%.3f d现=%.3f effReq=%.3f eff实=%.3f cropW=%.0f 理想W=%.0f slew=%@(步%.4f/帽%.4f) hold=%@(gap%.4f) ssd裁=%.1f ssd原=%.1f L采=%.1fms L查=%.1fms",
                     frameCount, zoom, dbgSprungZt, dbgSpringTargetZt, dbgSpringDt, lensDeviceZoom, dbgDNow,
                     max(1.0, zoom / max(lensDeviceZoom, 1.0)), dbgEffActual,
                     lastCropRect?.width ?? -1, sensorW / max(1.0, zoom / max(lensDeviceZoom, 1.0)),
                     zoomController.dbgSlewHit ? "HIT" : "-", zoomController.dbgLpStepLog, zoomController.dbgMaxStepLog,
                     zoomController.isHolding ? "Y" : "N", zoomController.dbgHoldGapLog,
-                    dbgSSDCrop, dbgSSDRaw))
+                    dbgSSDCrop, dbgSSDRaw, dbgCapLagMs, dbgLookupLagMs))
             }
             #endif
             let _lensNow = CACurrentMediaTime()
