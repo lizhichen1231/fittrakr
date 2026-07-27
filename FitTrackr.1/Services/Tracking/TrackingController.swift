@@ -344,6 +344,55 @@ final class TrackingController {
     var dbgSpringDt: CGFloat = 0         // 喂弹簧的 dt(smoothedDt)
     var dbgEffActual: CGFloat = 0        // 弹簧后 eff(=sprung/d)
     var dbgDNow: CGFloat = 1.0           // 【PTS对齐卡】本帧设备实读(处理时刻);d采≠d现 = 对齐在纠偏
+
+    // 【静景腿卡·二】不依赖人体检测的全帧指标:Y 平面固定网格采样,相邻帧 SSD。
+    // ssd裁(crop 内固定网格=尺度归一,显示侧代理):静景+对齐完美 → 应恒定,波动=光学/裁剪错配(δ 信号);
+    // ssd原(整帧):光学活动包络(ramp 期必然波动,用于给 δ 定时序)。两者可打出不同值(附录G 自查:
+    // 场景动/错配 → 裁涨;光学动 → 原涨;全静+对齐好 → 双低)。
+    private var ssdPrevCrop: [Float] = []
+    private var ssdPrevRaw: [Float] = []
+    var dbgSSDCrop: Float = -1
+    var dbgSSDRaw: Float = -1
+    // 滚动预缓冲:常驻攒最近 30 帧,EXEC 武装瞬间倾倒为 🧱基线 行(解决"窗前基线 n=0")
+    private var lensPreTrace: [(f: Int, dCap: CGFloat, dNow: CGFloat, zt: CGFloat, zg: CGFloat, ssdC: Float, ssdR: Float)] = []
+
+    private func staticSceneMetrics(_ pb: CVPixelBuffer) {
+        CVPixelBufferLockBaseAddress(pb, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+        guard CVPixelBufferGetPlaneCount(pb) > 0,
+              let base = CVPixelBufferGetBaseAddressOfPlane(pb, 0) else {
+            dbgSSDCrop = -1; dbgSSDRaw = -1; return
+        }
+        let w = CVPixelBufferGetWidthOfPlane(pb, 0), h = CVPixelBufferGetHeightOfPlane(pb, 0)
+        let rowB = CVPixelBufferGetBytesPerRowOfPlane(pb, 0)
+        let p = base.assumingMemoryBound(to: UInt8.self)
+        func grid(_ rect: CGRect) -> [Float] {
+            var v = [Float](); v.reserveCapacity(16 * 28)
+            for gy in 0..<28 {
+                for gx in 0..<16 {
+                    let x = min(w - 1, max(0, Int(rect.minX + rect.width * (CGFloat(gx) + 0.5) / 16)))
+                    let y = min(h - 1, max(0, Int(rect.minY + rect.height * (CGFloat(gy) + 0.5) / 28)))
+                    v.append(Float(p[y * rowB + x]))
+                }
+            }
+            return v
+        }
+        func ssd(_ a: [Float], _ b: [Float]) -> Float {
+            guard a.count == b.count, !a.isEmpty else { return -1 }
+            var s: Float = 0
+            for i in 0..<a.count { let d = a[i] - b[i]; s += d * d }
+            return s / Float(a.count)
+        }
+        let rawV = grid(CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h)))
+        dbgSSDRaw = ssd(rawV, ssdPrevRaw); ssdPrevRaw = rawV
+        if let cr = lastCropRect {
+            let sx = CGFloat(w) / max(sensorW, 1), sy = CGFloat(h) / max(sensorH, 1)
+            let cv = grid(CGRect(x: cr.minX * sx, y: cr.minY * sy, width: cr.width * sx, height: cr.height * sy))
+            dbgSSDCrop = ssd(cv, ssdPrevCrop); ssdPrevCrop = cv
+        } else {
+            dbgSSDCrop = -1; ssdPrevCrop = []
+        }
+    }
     #endif
 
     // 【PTS对齐卡·三】除数按采集时刻取值:环形缓冲 (host秒, d实读),帧入口先记样本再按 PTS 查表。
@@ -415,6 +464,13 @@ final class TrackingController {
         }
         lensRatioTraceArm = 5
         lensSwitchTraceArm = 120   // 【抖动取证】开 2s 逐帧观测窗
+        #if DEBUG
+        // 【静景腿卡·二】倾倒滚动预缓冲 → 指令前 ≥30 帧基线(解决"窗前 n=0")
+        for t in lensPreTrace {
+            PerfFileLog.shared.line(String(format: "🧱 基线 f%d d采=%.3f d现=%.3f Zt=%.3f Zg=%.3f ssd裁=%.1f ssd原=%.1f",
+                                           t.f, t.dCap, t.dNow, t.zt, t.zg, t.ssdC, t.ssdR))
+        }
+        #endif
         #if DEBUG
         // 刀A 自证:切换前 5 帧的候选面积比 原值/归一化值(归一化值应跨切换连续)
         for t in PersonIdentifier.shared.dbgSizeTrace {
@@ -842,6 +898,12 @@ final class TrackingController {
 
             // ===== 【方案B·刀3+刀4】镜头仲裁:每帧决策;shadowOnly=OFF 时指令驱动设备(单一权威下游,只读 lockState)=====
             #if DEBUG
+            // 【静景腿卡·二】全帧指标逐帧算 + 滚动预缓冲(30帧,EXEC 时倾倒成 🧱基线)
+            staticSceneMetrics(wideFrame)
+            lensPreTrace.append((f: frameCount, dCap: lensDeviceZoom, dNow: dbgDNow, zt: zoom,
+                                 zg: max(1.0, zoom / max(lensDeviceZoom, 1.0)),
+                                 ssdC: dbgSSDCrop, ssdR: dbgSSDRaw))
+            if lensPreTrace.count > 30 { lensPreTrace.removeFirst(lensPreTrace.count - 30) }
             // 【抖动取证】切换观测窗:逐帧落盘,定位振荡源(d/Zt/eff/检测命中/框位置/crop位置宽/躯干比)
             if lensSwitchTraceArm > 0 {
                 lensSwitchTraceArm -= 1
@@ -859,12 +921,13 @@ final class TrackingController {
             // Zt瞬(settle后) vs Zt簧(crop实际用) 并列 = 三选一判据;slew/hold/dt簧 = 三候选机制直读。
             // 注:computeFinalCropRect 在本块之后跑,簧值为上一帧,恒定 1 帧位差,判读时对齐。
             if lensSwitchTraceArm > 0 || frameCount % 15 == 0 {
-                PerfFileLog.shared.line(String(format: "🌀 尺度链 f%d Zt瞬=%.3f Zt簧=%.3f 簧目标=%.3f dt簧=%.4f d采=%.3f d现=%.3f effReq=%.3f eff实=%.3f cropW=%.0f 理想W=%.0f slew=%@(步%.4f/帽%.4f) hold=%@(gap%.4f)",
+                PerfFileLog.shared.line(String(format: "🌀 尺度链 f%d Zt瞬=%.3f Zt簧=%.3f 簧目标=%.3f dt簧=%.4f d采=%.3f d现=%.3f effReq=%.3f eff实=%.3f cropW=%.0f 理想W=%.0f slew=%@(步%.4f/帽%.4f) hold=%@(gap%.4f) ssd裁=%.1f ssd原=%.1f",
                     frameCount, zoom, dbgSprungZt, dbgSpringTargetZt, dbgSpringDt, lensDeviceZoom, dbgDNow,
                     max(1.0, zoom / max(lensDeviceZoom, 1.0)), dbgEffActual,
                     lastCropRect?.width ?? -1, sensorW / max(1.0, zoom / max(lensDeviceZoom, 1.0)),
                     zoomController.dbgSlewHit ? "HIT" : "-", zoomController.dbgLpStepLog, zoomController.dbgMaxStepLog,
-                    zoomController.isHolding ? "Y" : "N", zoomController.dbgHoldGapLog))
+                    zoomController.isHolding ? "Y" : "N", zoomController.dbgHoldGapLog,
+                    dbgSSDCrop, dbgSSDRaw))
             }
             #endif
             let _lensNow = CACurrentMediaTime()
