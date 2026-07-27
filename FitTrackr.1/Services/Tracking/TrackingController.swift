@@ -333,6 +333,9 @@ final class TrackingController {
     // 即使全局开关在「执行」也不动设备——否则回放页的指令会串台去写真相机的 zoom。
     var lensExecutionAllowed = false
     let lensArbiter = LensArbiter()
+    // 【单人收口卡·三】前置门第四条喂数:关联链连续未断帧数(检测命中+1,miss 清零)。
+    // ★仅单人有效——多人下几何信号检测不了换人(clip_3 实测,附录E),届时须换含外观信号的判据。
+    var assocChainFrames = 0
     var lensDeviceZoom: CGFloat = 1.0          // 当前设备 zoom(执行侧写;crop 除数与坐标映射读)
     private var lensShadowPrevCenter: CGPoint?
     private var lensShadowPrevFrame = 0        // 刀3补3:上次有中心的帧号(断档>10帧重置速度)
@@ -780,6 +783,8 @@ final class TrackingController {
             // ===== 三态锁定状态机:唯一权威写入点(下游只读 lockState,别处不许写)=====
             // identityMatched:锁定时 detectHuman 非nil ⟺ findTarget 命中(Part2 已堵 fallback,非nil只可能是身份命中)
             advanceLockState(identityMatched: (_rectResult != nil))
+            // 【单人收口卡·三】关联链计数:检测命中+1,miss 清零(前置门第四条喂数;仅单人有效,附录E)
+            assocChainFrames = (_rectResult != nil) ? assocChainFrames + 1 : 0
 
             // ===== 【方案B·刀3+刀4】镜头仲裁:每帧决策;shadowOnly=OFF 时指令驱动设备(单一权威下游,只读 lockState)=====
             #if DEBUG
@@ -826,7 +831,8 @@ final class TrackingController {
             }
             let _lensOut = lensArbiter.decide(LensArbiterInput(
                 zoomReq: zoom, lockedCenter: _lensCenter, centerVel: lensShadowVel,
-                stateTag: _lensTag, tier1: CameraEngine.currentTier1,
+                stateTag: _lensTag, chainFrames: assocChainFrames,
+                tier1: CameraEngine.currentTier1,
                 deviceZoom: lensDeviceZoom), at: _lensNow)
             if _lensOut.command != .none {
                 let _mode = TrackingController.lensShadowOnly ? "影子" : "执行"
@@ -834,11 +840,11 @@ final class TrackingController {
                 // 指令日志:全部实读值(帧号/模式/三Z/中心/速度/触发线/PI锁/三态/Tier/距上次)——禁止写死文案
                 let gap = lensShadowLastCmdAt < 0 ? "首次" : String(format: "%.1fs", _lensNow - lensShadowLastCmdAt)
                 let cstr = _lensCenter.map { String(format: "(%.3f,%.3f)", $0.x, $0.y) } ?? "nil"
-                let msg = String(format: "🎯 LENS-CMD f%d mode=%@ cmd=%@ 因=[%@] Ztot=%.2f Zdev=%.1f→%.1f c=%@ vel=%.3f PI锁=%@ 三态=%@ tier1=%@ 距上次=%@",
+                let msg = String(format: "🎯 LENS-CMD f%d mode=%@ cmd=%@ 因=[%@] Ztot=%.2f Zdev=%.1f→%.1f c=%@ vel=%.3f PI锁=%@ 三态=%@ 链=%d tier1=%@ 距上次=%@",
                                  frameCount, _mode, "\(_lensOut.command)", _lensOut.reason, zoom,
                                  lensDeviceZoom, TrackingController.lensShadowOnly ? lensDeviceZoom : _targetD,
                                  cstr, lensShadowVel,
-                                 PersonIdentifier.shared.isLocked ? "Y" : "N", _lensTag,
+                                 PersonIdentifier.shared.isLocked ? "Y" : "N", _lensTag, assocChainFrames,
                                  CameraEngine.currentTier1 ? "Y" : "N", gap)
                 print(msg)
                 #if DEBUG

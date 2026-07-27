@@ -76,7 +76,8 @@ struct LensArbiterInput {
     var zoomReq: CGFloat          // 应用层目标 zoom(ZoomManager 输出,UW基准系总倍率)
     var lockedCenter: CGPoint?    // 锁定框中心,UW基准系(原点=画面中心,半宽 ±0.5;§3 钉死:触发量是它,非 crop 框非 zoom)
     var centerVel: CGFloat        // 中心速度(UW基准系 /s;前置门速度否决用)
-    var stateTag: String          // 三态机 "L"=locked "S"=searching "X"=lost "U"=unlocked
+    var stateTag: String          // 三态机 "L"=locked "S"=searching "X"=lost "U"=unlocked(仲裁1/2 保护通道仍用)
+    var chainFrames: Int          // 关联链连续未断帧数(检测命中+1,miss 清零;前置门第四条【单人收口卡·三】)
     var tier1: Bool               // 能力分层(刀1):false = 整套策略旁路(§0 非目标/§2 降级)
     var deviceZoom: CGFloat       // 当前 device.videoZoomFactor(刀4 前恒 1.0,透传记录用)
 }
@@ -107,6 +108,11 @@ final class LensArbiter {
         var dwellSec: TimeInterval = 1.5   // 驻留(连续制)
         var cooldownSec: TimeInterval = 5.0 // 冷却(单边:仅写在切向 UW 的 force 上)※
         var safeZone: CGFloat = 0.20       // 仲裁1「丢失位置在安全区外」阈值(OPEN-2:=出门线)
+        // 【单人收口卡·三】前置门第四条:三态=L → 关联链连续未断 ≥N 帧。N=90 依据:
+        // ① 90帧@60fps=1.5s=驻留同宽,第四门不弱于驻留层;② =clip_3 最长断链(8帧)的 11 倍,
+        // 断链噪声无法假通过;③ clip_3 典型未断段 ~250 帧 ≫ 90,单人正常跟随下门常开。
+        // ★仅单人有效:多人下无法检测换人(ID switch 无几何签名,clip_3 实测)——设计稿附录E。
+        var chainMinFrames: Int = 90
     }
     let p: Params
     private let debouncer: StateDebouncer<PhysicalLens>
@@ -148,10 +154,10 @@ final class LensArbiter {
             // 第三层(冷却单边)必须把 zoom 轴振荡也封顶——写 5s,仍只锁切向窄,切向广不受限。
             debouncer.force(.uw, at: now, cooldownAfter: p.cooldownSec)
             reason = "通道一:zoom下穿S(\(p.deadzoneLo))回UW"
-        } else if input.stateTag == "L",
+        } else if input.chainFrames >= p.chainMinFrames,
                   let c = input.lockedCenter, cheb(c) <= p.entryLine,
                   input.centerVel < p.velMax, input.zoomReq > p.deadzoneHi {
-            // 仲裁4:通道一 request——前置门三条件(回门线内+速度+zoom 需求)同时且连续 1.5s(驻留连续制,组件管);
+            // 仲裁4:通道一 request——前置门四条件(链长≥N+回门线内+速度+zoom 需求)同时且连续 1.5s(驻留连续制,组件管);
             // 冷却期内组件自动不生效(仲裁3);切向主摄的迁移不写冷却(单边)
             debouncer.request(.wide, at: now, cooldownAfter: 0)
             reason = "通道一:前置门驻留成立进Wide"
