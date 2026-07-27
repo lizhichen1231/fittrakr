@@ -391,8 +391,15 @@ extension TrackingController {
             cropZoomSpring.reset(to: log(max(currentZoom, 0.01)))
             cropSpringValid = true
         }
+        #if DEBUG
+        dbgSpringTargetZt = currentZoom   // 弹簧目标 = settle 后 Zt(本帧入参,遮蔽前捕获)
+        dbgSpringDt = _dtc                // 喂弹簧的 dt(smoothedDt——冻结嫌疑人之一)
+        #endif
         let _sc = cropCenterSpring.update(target: CGPoint(x: center.midX, y: center.midY), dt: _dtc)
         let currentZoom = exp(cropZoomSpring.update(target: log(max(currentZoom, 0.01)), dt: _dtc))
+        #if DEBUG
+        dbgSprungZt = currentZoom         // 弹簧输出(Zt 域)——crop 实际用的量
+        #endif
         let center = CGRect(x: _sc.x - center.width / 2, y: _sc.y - center.height / 2,
                             width: center.width, height: center.height)
 
@@ -401,6 +408,9 @@ extension TrackingController {
         // 同帧互补 → 显示构图数值连续(不变量 I)。除法在弹簧前会让弹簧把跳变滑 0.45s = 可见拉风箱。
         // lensDeviceZoom=1(影子模式/Tier0/多摄长焦路径)时本行恒等,行为冻结。
         let effZoom = max(1.0, currentZoom / max(lensDeviceZoom, 1.0))
+        #if DEBUG
+        dbgEffActual = effZoom            // 实际 eff(弹簧后/d);🔬 的 eff 是请求侧(瞬时Zt/d)
+        #endif
 
         // 使用当前 zoom 计算裁切尺寸
         var cropW = sensorW / effZoom

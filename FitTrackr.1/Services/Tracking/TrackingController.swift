@@ -336,6 +336,14 @@ final class TrackingController {
     // 【单人收口卡·三】前置门第四条喂数:关联链连续未断帧数(检测命中+1,miss 清零)。
     // ★仅单人有效——多人下几何信号检测不了换人(clip_3 实测,附录E),届时须换含外观信号的判据。
     var assocChainFrames = 0
+
+    #if DEBUG
+    // 【平滑度收口卡·一】尺度链埋点(computeFinalCropRect 写,🌀 行读;只采不馈)
+    var dbgSpringTargetZt: CGFloat = 0   // 本帧弹簧目标(=settle 后瞬时 Zt)
+    var dbgSprungZt: CGFloat = 0         // cropZoomSpring 输出——crop 实际用的 Zt
+    var dbgSpringDt: CGFloat = 0         // 喂弹簧的 dt(smoothedDt)
+    var dbgEffActual: CGFloat = 0        // 弹簧后 eff(=sprung/d)
+    #endif
     var lensDeviceZoom: CGFloat = 1.0          // 当前设备 zoom(执行侧写;crop 除数与坐标映射读)
     private var lensShadowPrevCenter: CGPoint?
     private var lensShadowPrevFrame = 0        // 刀3补3:上次有中心的帧号(断档>10帧重置速度)
@@ -800,6 +808,17 @@ final class TrackingController {
                     (_rectResult != nil) ? "Y" : "N", _rb, _sb, _cr, lastTorsoRatio ?? -1,
                     PersonIdentifier.shared.dbgSizeRaw, PersonIdentifier.shared.dbgSizeNorm,
                     dbgSeqK, dbgSeqLeftoverPre, dbgSeqLeftoverPost, rawBox?.midX ?? -1))
+            }
+            // 【平滑度收口卡·一】🌀 尺度链逐帧(切换窗内)+ 每15帧心跳(窗外——残差基线起源要看窗前):
+            // Zt瞬(settle后) vs Zt簧(crop实际用) 并列 = 三选一判据;slew/hold/dt簧 = 三候选机制直读。
+            // 注:computeFinalCropRect 在本块之后跑,簧值为上一帧,恒定 1 帧位差,判读时对齐。
+            if lensSwitchTraceArm > 0 || frameCount % 15 == 0 {
+                PerfFileLog.shared.line(String(format: "🌀 尺度链 f%d Zt瞬=%.3f Zt簧=%.3f 簧目标=%.3f dt簧=%.4f d=%.3f effReq=%.3f eff实=%.3f cropW=%.0f 理想W=%.0f slew=%@(步%.4f/帽%.4f) hold=%@(gap%.4f)",
+                    frameCount, zoom, dbgSprungZt, dbgSpringTargetZt, dbgSpringDt, lensDeviceZoom,
+                    max(1.0, zoom / max(lensDeviceZoom, 1.0)), dbgEffActual,
+                    lastCropRect?.width ?? -1, sensorW / max(1.0, zoom / max(lensDeviceZoom, 1.0)),
+                    zoomController.dbgSlewHit ? "HIT" : "-", zoomController.dbgLpStepLog, zoomController.dbgMaxStepLog,
+                    zoomController.isHolding ? "Y" : "N", zoomController.dbgHoldGapLog))
             }
             #endif
             let _lensNow = CACurrentMediaTime()

@@ -54,6 +54,14 @@ final class ZoomController {
     /// 是否处于迟滞锁定（调试/状态展示用）
     var isHolding: Bool { holding }
 
+    #if DEBUG
+    // 【平滑度收口卡·一】尺度链埋点(只采不馈,TC 🌀 行逐帧读)
+    var dbgSlewHit = false            // 本帧速率帽是否真削步
+    var dbgLpStepLog: CGFloat = 0     // 限速前低通一步(log)
+    var dbgMaxStepLog: CGFloat = 0    // 帽值(log)
+    var dbgHoldGapLog: CGFloat = 0    // 迟滞判据 |target−current|(log,进/出死区的那个 d)
+    #endif
+
     init(config: ZoomConfig = ZoomConfig()) {
         self.config = config
     }
@@ -82,6 +90,9 @@ final class ZoomController {
 
         // 3) 迟滞：进 ±enter 锁住，超 ±exit 才解锁跟随
         let d = abs(rawTargetLog - currentLogZoom)
+        #if DEBUG
+        dbgHoldGapLog = d
+        #endif
         let goalLog: CGFloat
         if holding {
             if d >= config.exitDeadband {
@@ -134,7 +145,9 @@ final class ZoomController {
         let maxStep = config.maxLogZoomRate * dtc
         #if DEBUG
         let lpStep = next - currentLogZoom
-        if abs(lpStep) > maxStep + 1e-9 {   // 速率帽真正削到 zoom
+        dbgLpStepLog = lpStep; dbgMaxStepLog = maxStep
+        dbgSlewHit = abs(lpStep) > maxStep + 1e-9
+        if dbgSlewHit {   // 速率帽真正削到 zoom
             print(String(format: "🚦 SLEW HIT zoom Δlog=%.4f maxStep=%.4f", lpStep, maxStep))
         }
         #endif
