@@ -103,6 +103,10 @@ protocol CameraEngineDelegate: AnyObject {
     /// 读到阶跃 → 帧入口重映射自动退化为一步式(k=2 单次),正是回落条款要的形态。
     static var liveDeviceZoomReader: (() -> CGFloat)?
 
+    /// 【PTS对齐卡·三】PTS→host 钟换算(采集时刻查除数用)。会话带音频 → synchronizationClock
+    /// 不能假设与 host 同源,CMSyncConvertTime 做 API 级精确映射(零经验标定)。nil=交接期/非实时源。
+    static var captureTimeConverter: ((CMTime) -> Double)?
+
     /// 刀4:唯一合法设备 zoom 写入口(仲裁指令专用)。写前更新白名单 → KVO 守卫放行;其余写入照拦。
     // 【单人收口卡·一】回缓推:闪回双向出现,归因除数时延——瞬切下错位=全步长(2×,必可见);
     // 缓推下每帧 k≈1.03,帧入口 readback+逐帧微重映射(帧序修正后)吸收到不可见量级。
@@ -221,6 +225,7 @@ protocol CameraEngineDelegate: AnyObject {
             self.zoomGuardObs?.invalidate(); self.zoomGuardObs = nil
             // 刀4:执行通道随交接下线(防探针期间误执行);vm.start() 重装配
             CameraEngine.lensZoomExecutor = nil
+            CameraEngine.captureTimeConverter = nil
             CameraEngine.liveDeviceZoomReader = nil
             self.activeVideoDevice = nil
             self.sanctionedDeviceZoom = 1.0
@@ -483,6 +488,13 @@ extension CameraEngine {
         CameraEngine.lensZoomExecutor = { [weak self] z, r in self?.setLensDeviceZoom(z, reason: r) }
         // 【闪动修】除数逐帧实读通道:缓推期间裁剪/测量归一必须贴着光学实际值走,不能用目标值
         CameraEngine.liveDeviceZoomReader = { [weak device] in device?.videoZoomFactor ?? 1.0 }
+        // 【PTS对齐卡·三】采集时刻换算器:帧 PTS(会话同步钟)→ host 秒(CACurrentMediaTime 同源)
+        CameraEngine.captureTimeConverter = { [weak self] pts in
+            guard let s = self?.session, let sync = s.synchronizationClock else {
+                return CACurrentMediaTime()   // 无同步钟(异常):回落"现在" = 旧行为
+            }
+            return CMTimeGetSeconds(CMSyncConvertTime(pts, from: sync, to: CMClockGetHostTimeClock()))
+        }
 
         session.beginConfiguration()
         defer { session.commitConfiguration() }

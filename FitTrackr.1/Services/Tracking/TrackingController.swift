@@ -343,7 +343,39 @@ final class TrackingController {
     var dbgSprungZt: CGFloat = 0         // cropZoomSpring 输出——crop 实际用的 Zt
     var dbgSpringDt: CGFloat = 0         // 喂弹簧的 dt(smoothedDt)
     var dbgEffActual: CGFloat = 0        // 弹簧后 eff(=sprung/d)
+    var dbgDNow: CGFloat = 1.0           // 【PTS对齐卡】本帧设备实读(处理时刻);d采≠d现 = 对齐在纠偏
     #endif
+
+    // 【PTS对齐卡·三】除数按采集时刻取值:环形缓冲 (host秒, d实读),帧入口先记样本再按 PTS 查表。
+    // ramp 期两样本间 d 为平滑指数轨 → 线性插值误差 ≪ 单帧步长;查不到回落当前实读+警告(不许静默)。
+    private var dRing: [(t: Double, d: CGFloat)] = []
+    private var dRingMissCount = 0
+    private func lookupCaptureD(at t: Double, fallback: CGFloat) -> CGFloat {
+        guard let first = dRing.first, let last = dRing.last else { return fallback }
+        if t >= last.t { return last.d }              // 采集≥最新样本(零时延/时钟贴边):用最新
+        if t <= first.t {
+            if dRing.count >= 64 {                    // 缓冲满(≈1s)仍在最老样本前 = 真未覆盖
+                dRingMissCount += 1
+                if dRingMissCount == 1 || dRingMissCount % 60 == 0 {
+                    let m = String(format: "⚠️ PTS查表未覆盖 tCap落后%.3fs 累计=%d → 回落实读", first.t - t, dRingMissCount)
+                    print(m)
+                    #if DEBUG
+                    PerfFileLog.shared.line(m)
+                    #endif
+                }
+                return fallback
+            }
+            return first.d                            // 启动初期缓冲未满:最老样本(等价旧行为)
+        }
+        for i in stride(from: dRing.count - 1, through: 1, by: -1) {
+            let a = dRing[i-1], b = dRing[i]
+            if t >= a.t, t <= b.t {
+                let f = CGFloat((t - a.t) / max(b.t - a.t, 1e-6))
+                return a.d + (b.d - a.d) * f
+            }
+        }
+        return fallback
+    }
     var lensDeviceZoom: CGFloat = 1.0          // 当前设备 zoom(执行侧写;crop 除数与坐标映射读)
     private var lensShadowPrevCenter: CGPoint?
     private var lensShadowPrevFrame = 0        // 刀3补3:上次有中心的帧号(断档>10帧重置速度)
@@ -662,7 +694,21 @@ final class TrackingController {
         }
         #endif
         if let reader = CameraEngine.liveDeviceZoomReader {
-            let dRead = reader()
+            let dNow = reader()
+            // 【PTS对齐卡·三】先记本帧样本,再按该帧采集时刻查除数(读回描述"现在",buffer 描述 1-2 帧前)
+            let _tNow = CACurrentMediaTime()
+            dRing.append((t: _tNow, d: dNow))
+            if dRing.count > 64 { dRing.removeFirst(dRing.count - 64) }
+            let _tCap: Double
+            if lensExecutionAllowed, let conv = CameraEngine.captureTimeConverter {
+                _tCap = conv(pts)          // 实时源:PTS(会话同步钟)→ host 秒
+            } else {
+                _tCap = _tNow              // 回放/交接期:帧即时合成,采集=现在(d 恒 1,查表恒等)
+            }
+            let dRead = lookupCaptureD(at: _tCap, fallback: dNow)
+            #if DEBUG
+            dbgDNow = dNow
+            #endif
             if abs(dRead - lensDeviceZoom) > 0.001 {
                 let _kStep = dRead / max(lensDeviceZoom, 0.01)
                 #if DEBUG
@@ -813,8 +859,8 @@ final class TrackingController {
             // Zt瞬(settle后) vs Zt簧(crop实际用) 并列 = 三选一判据;slew/hold/dt簧 = 三候选机制直读。
             // 注:computeFinalCropRect 在本块之后跑,簧值为上一帧,恒定 1 帧位差,判读时对齐。
             if lensSwitchTraceArm > 0 || frameCount % 15 == 0 {
-                PerfFileLog.shared.line(String(format: "🌀 尺度链 f%d Zt瞬=%.3f Zt簧=%.3f 簧目标=%.3f dt簧=%.4f d=%.3f effReq=%.3f eff实=%.3f cropW=%.0f 理想W=%.0f slew=%@(步%.4f/帽%.4f) hold=%@(gap%.4f)",
-                    frameCount, zoom, dbgSprungZt, dbgSpringTargetZt, dbgSpringDt, lensDeviceZoom,
+                PerfFileLog.shared.line(String(format: "🌀 尺度链 f%d Zt瞬=%.3f Zt簧=%.3f 簧目标=%.3f dt簧=%.4f d采=%.3f d现=%.3f effReq=%.3f eff实=%.3f cropW=%.0f 理想W=%.0f slew=%@(步%.4f/帽%.4f) hold=%@(gap%.4f)",
+                    frameCount, zoom, dbgSprungZt, dbgSpringTargetZt, dbgSpringDt, lensDeviceZoom, dbgDNow,
                     max(1.0, zoom / max(lensDeviceZoom, 1.0)), dbgEffActual,
                     lastCropRect?.width ?? -1, sensorW / max(1.0, zoom / max(lensDeviceZoom, 1.0)),
                     zoomController.dbgSlewHit ? "HIT" : "-", zoomController.dbgLpStepLog, zoomController.dbgMaxStepLog,
