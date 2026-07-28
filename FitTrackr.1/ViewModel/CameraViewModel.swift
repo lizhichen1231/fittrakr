@@ -60,9 +60,9 @@ final class CameraViewModel: NSObject, ObservableObject {
     @Published var lensShadowOnlyUI = true {
         didSet { follow.setLensShadowOnly(lensShadowOnlyUI) }
     }
-    // 【速率扫描卡·一】缓推速率五档(运行时立即生效;权威记录=每次 LENS-EXEC 行的当次 rate)
-    @Published var lensRampRateUI: Float = CameraEngine.lensRampRate {
-        didSet { CameraEngine.lensRampRate = lensRampRateUI }
+    // 【掉帧缓解+收尾卡·三】面板绑 toWide 档(1.0 vs 0.7 交替复验用);toUW 固定 2.0
+    @Published var lensRampRateUI: Float = CameraEngine.lensRampRateToWide {
+        didSet { CameraEngine.lensRampRateToWide = lensRampRateUI }
     }
     // 跳变取证:冻结"最近一次显著跳变那一帧"的整行数据(poseValid/srcUsed/rectConf/各Δ)
     @Published var probeHUD = ""
