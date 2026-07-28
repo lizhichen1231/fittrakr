@@ -395,6 +395,18 @@ fileprivate struct TunerSheet: View {
                 }
 
                 #if DEBUG
+                // 【速率扫描卡·一】五档扫"眼判翻转档";切档即生效,不需重启相机
+                Section(header: Text("🎚 缓推速率 (factors/s)")) {
+                    Picker("rate", selection: $vm.lensRampRateUI) {
+                        ForEach([Float(2.0), 1.5, 1.0, 0.7, 0.5], id: \.self) { r in
+                            Text(String(format: "%.1f", r)).tag(r)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
+                #endif
+
+                #if DEBUG
                 // 【方案B·刀1 验收开关】强制 Tier 0(超广角数字裁剪=现状)⇄ 自动(Tier 1 dualWide)。
                 // 重启相机生效;控制台看「📷 刀1 能力分层」与「✅ Using:」行确认设备切换。收口时评估撤留。
                 Section(header: Text("🔪 刀1 能力分层")) {

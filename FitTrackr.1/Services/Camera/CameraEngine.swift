@@ -68,7 +68,7 @@ protocol CameraEngineDelegate: AnyObject {
     func start() {
         #if DEBUG
         // 埋点卡三:形态标注首行——从执行器常量实导,避免不同形态数据混比(文案不写死)。
-        PerfFileLog.shared.line("🏷 形态=\(lensRampRate > 0 ? String(format: "缓推(rate %.1f/s,瞬切后备)", lensRampRate) : "瞬切(直写执行器)") 执行器=setLensDeviceZoom白名单")
+        PerfFileLog.shared.line("🏷 形态=\(CameraEngine.lensRampRate > 0 ? String(format: "缓推(rate %.1f/s,瞬切后备)", CameraEngine.lensRampRate) : "瞬切(直写执行器)") 执行器=setLensDeviceZoom白名单")
         LensReconProbe.dumpDualWide()   // 【查勘#2 Q2 探针】用完即撤(probe/lens-recon)
         #endif
         // 任务零:全应用锁死竖屏——已删设备方向通知订阅(采集层 connection 一次性设死 .portrait,不再跟随旋转)
@@ -110,7 +110,9 @@ protocol CameraEngineDelegate: AnyObject {
     /// 刀4:唯一合法设备 zoom 写入口(仲裁指令专用)。写前更新白名单 → KVO 守卫放行;其余写入照拦。
     // 【单人收口卡·一】回缓推:闪回双向出现,归因除数时延——瞬切下错位=全步长(2×,必可见);
     // 缓推下每帧 k≈1.03,帧入口 readback+逐帧微重映射(帧序修正后)吸收到不可见量级。
-    let lensRampRate: Float = 2.0   // 缓推速率(factors/s);0 = 瞬切(后备形态,直写)
+    // 【速率扫描卡·一】改静态可调:面板五档(2.0/1.5/1.0/0.7/0.5)扫描"眼判翻转档"。
+    // 每次 LENS-EXEC 行记当次实际 rate(权威记录);🏷 形态行只是 start() 时刻快照。
+    static var lensRampRate: Float = 2.0   // 缓推速率(factors/s);0 = 瞬切(后备形态,直写)
 
     func setLensDeviceZoom(_ z: CGFloat, reason: String) {
         sessionQueue.async {
@@ -120,8 +122,8 @@ protocol CameraEngineDelegate: AnyObject {
             self.sanctionedDeviceZoom = z
             do {
                 try dev.lockForConfiguration()
-                if self.lensRampRate > 0 {
-                    dev.ramp(toVideoZoomFactor: z, withRate: self.lensRampRate)
+                if CameraEngine.lensRampRate > 0 {
+                    dev.ramp(toVideoZoomFactor: z, withRate: CameraEngine.lensRampRate)
                 } else {
                     dev.videoZoomFactor = z
                 }
@@ -129,7 +131,7 @@ protocol CameraEngineDelegate: AnyObject {
             } catch {
                 print("🎯 LENS-EXEC 失败: lockForConfiguration \(error)(reason=\(reason))"); return
             }
-            let form = self.lensRampRate > 0 ? String(format: "缓推(rate %.1f/s)", self.lensRampRate) : "瞬切"
+            let form = CameraEngine.lensRampRate > 0 ? String(format: "缓推(rate %.1f/s)", CameraEngine.lensRampRate) : "瞬切"
             let msg = "🎯 LENS-EXEC \(form)→\(String(format: "%.2f", z)) 实读起点=\(String(format: "%.2f", dev.videoZoomFactor)) reason=\(reason)"
             print(msg)
             #if DEBUG

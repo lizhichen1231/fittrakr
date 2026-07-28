@@ -60,6 +60,10 @@ final class CameraViewModel: NSObject, ObservableObject {
     @Published var lensShadowOnlyUI = true {
         didSet { follow.setLensShadowOnly(lensShadowOnlyUI) }
     }
+    // 【速率扫描卡·一】缓推速率五档(运行时立即生效;权威记录=每次 LENS-EXEC 行的当次 rate)
+    @Published var lensRampRateUI: Float = CameraEngine.lensRampRate {
+        didSet { CameraEngine.lensRampRate = lensRampRateUI }
+    }
     // 跳变取证:冻结"最近一次显著跳变那一帧"的整行数据(poseValid/srcUsed/rectConf/各Δ)
     @Published var probeHUD = ""
     let probeJumpThreshold: CGFloat = 0.03   // anchorΔ 或 rectBoxΔ 超此(占画面宽 3%)算一次跳,刷新冻结行
