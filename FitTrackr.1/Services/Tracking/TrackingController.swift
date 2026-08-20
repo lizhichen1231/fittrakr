@@ -444,10 +444,19 @@ final class TrackingController {
     private var lensLastCmdFrame = -1
     var dbgLensShadow = ""   // 常驻 HUD 行:Tier/模式/三Z/最近指令/锁定态(全部实读)
 
+    /// 【贴边卡·补】低频事件行双写(print+落盘):STATE 转移/模式边界/找回心跳此前只上 console,
+    /// 逼得每次判读都要连 Xcode——脱机 live_*.log 必须自足,真机测完直接读文件出结论。
+    func fileLog(_ s: String) {
+        print(s)
+        #if DEBUG
+        PerfFileLog.shared.line(s)
+        #endif
+    }
+
     /// 刀4:影子开关(TunerSheet 经 vm 调)。拨回 ON = 回滚:设备回 1.0、空间映射回 1、仲裁清态。
     func setLensShadowOnly(_ on: Bool) {
         TrackingController.lensShadowOnly = on
-        print("🎯 LENS-MODE → \(on ? "影子(只决策不动设备)" : "执行(指令驱动设备zoom)") 当前Zdev=\(String(format: "%.1f", lensDeviceZoom))")
+        fileLog("🎯 LENS-MODE → \(on ? "影子(只决策不动设备)" : "执行(指令驱动设备zoom)") 当前Zdev=\(String(format: "%.1f", lensDeviceZoom))")
         if on, lensDeviceTarget != 1.0 {   // 【闪动修】对着目标值判(lensDeviceZoom 现为缓推过程量)
             executeLensTransition(to: 1.0, reason: "shadowOnly=ON 回滚")
         }
@@ -987,9 +996,12 @@ final class TrackingController {
                 tier1: CameraEngine.currentTier1,
                 deviceZoom: lensDeviceZoom, edgeGapBuffer: _edgeGapMin), at: _lensNow)
             #if DEBUG
-            // 【贴边卡·六】逐帧埋点(切换窗内 或 贴边判定/驻留期间):四边距/贴边/驻留/三态/prev/cheb/Zd。
+            // 【贴边卡·六】逐帧埋点(切换窗内 或 贴边判定/驻留期间 或 主摄段近边接近区 gap<0.10):
+            // 四边距/贴边/驻留/三态/prev/cheb/Zd。近边接近区一并落盘——零触发档(带太窄/驻留太长)
+            // 也要有"离触发差多少"的证据,否则那格扫描表只能填"没触发",归因缺失。
             // ★prev 进 PerfFileLog(此前只在 console)——扫描表的最小数据集,心跳 150 帧粒度出不来。
-            if lensSwitchTraceArm > 0 || lensArbiter.dbgEdgeTouch || lensArbiter.edgeDwellElapsed(at: _lensNow) > 0 {
+            if lensSwitchTraceArm > 0 || lensArbiter.dbgEdgeTouch || lensArbiter.edgeDwellElapsed(at: _lensNow) > 0
+                || (_lensPrev == .wide && (_edgeGapMin ?? 1) < 0.10) {
                 let _eg = _edgeGaps.map { String(format: "边距=L%.3f/R%.3f/T%.3f/B%.3f", $0.l, $0.r, $0.t, $0.b) } ?? "边距=miss"
                 let _chb = _lensCenter.map { String(format: "%.3f", max(abs($0.x), abs($0.y))) } ?? "nil"
                 PerfFileLog.shared.line(String(format: "📐 贴边 f%d %@ 触=%@ 驻=%.2f/%.2fs 态=%@ prev=%@ cheb=%@ Zd=%.2f 带=%.2f",
@@ -999,6 +1011,10 @@ final class TrackingController {
             }
             #endif
             if _lensOut.command != .none {
+                // 【贴边卡·补】观测窗布防搬到指令帧:影子模式指令后此前没有 🔬/🌀/📐 窗(原布防点
+                // 在 executeLensTransition,只有执行模式走到)——脱机判读两种模式都要有窗。
+                // 执行模式下 executeLensTransition 会再设一次同值,幂等无害。
+                lensSwitchTraceArm = 120
                 let _mode = TrackingController.lensShadowOnly ? "影子" : "执行"
                 let _targetD: CGFloat = (_lensOut.command == .toWide) ? lensArbiter.p.S : 1.0
                 // 指令日志:全部实读值(帧号/模式/三Z/中心/速度/触发线/PI锁/三态/Tier/距上次)——禁止写死文案
@@ -1036,9 +1052,11 @@ final class TrackingController {
             // 心跳:每 150 帧落一行完整状态(零指令场景也可对答案)
             if frameCount % 150 == 0 {
                 let _cs = _lensCenter.map { String(format: "c=(%.3f,%.3f)", $0.x, $0.y) } ?? "c=nil"
-                // 【贴边卡·六】prev(仲裁器内部镜头态)入心跳:影子模式下 Zd 恒 1,文件里无从重建 prev——已补
-                PerfFileLog.shared.line(String(format: "🎯 心跳 f%d %@ %@ vel=%.3f prev=%@",
-                                               frameCount, dbgLensShadow, _cs, lensShadowVel, _lensPrev.rawValue))
+                // 【贴边卡·六】prev(仲裁器内部镜头态)入心跳:影子模式下 Zd 恒 1,文件里无从重建 prev——已补。
+                // 带/驻也入心跳:扫描零事件档(误触发=0 的格)需要每个时间窗自述当时参数,否则无法归格。
+                PerfFileLog.shared.line(String(format: "🎯 心跳 f%d %@ %@ vel=%.3f prev=%@ 带=%.2f 驻=%.2f",
+                                               frameCount, dbgLensShadow, _cs, lensShadowVel, _lensPrev.rawValue,
+                                               LensArbiter.edgeBandBuffer, LensArbiter.exitDwellSec))
             }
             #endif
 
@@ -1189,11 +1207,11 @@ final class TrackingController {
             if wasSearching {
                 let via = pi.dbgSrcMerged ? "P+R" : "pose"   // 并源池标记(chosen 精确源不追,近似)
                 let solo = (pi.dbgCurThresh <= pi.soloMatchThreshold + 0.001) ? "Y" : "N"
-                print(String(format: "🔍 STATE searching→locked @f%d (reacquired %.1fs, cont=%.2f, via=%@, solo=%@)",
+                fileLog(String(format: "🔍 STATE searching→locked @f%d (reacquired %.1fs, cont=%.2f, via=%@, solo=%@)",
                              frameCount, elapsed, pi.dbgCurCont, via, solo))
                 setStateEvent(String(format: "RELOCK %.2f", pi.dbgCurCont), now)
             } else if wasUnlocked {
-                print("🔒 STATE unlocked→locked @f\(frameCount)")
+                fileLog("🔒 STATE unlocked→locked @f\(frameCount)")
                 setStateEvent("LOCK", now)
             }
             #endif
@@ -1205,7 +1223,7 @@ final class TrackingController {
                 #endif
                 if now - since > searchTimeoutSec {
                     #if DEBUG
-                    print(String(format: "👻 STATE searching→lost @f%d (timeout %.1fs, totalCandidatesSeen=%d)",
+                    fileLog(String(format: "👻 STATE searching→lost @f%d (timeout %.1fs, totalCandidatesSeen=%d)",
                                  frameCount, searchTimeoutSec, dbgSearchCandSeen))
                     setStateEvent("LOST", now)
                     #endif
@@ -1216,7 +1234,7 @@ final class TrackingController {
                     // Part 4.5 搜索心跳:每 30 帧一行,看已搜多久/候选数/最佳被拒分(不改状态)
                     if frameCount % 30 == 0 {
                         let pi = PersonIdentifier.shared
-                        print(String(format: "🔍 SEARCHING %.1fs candidates=%d bestCont=%.2f bestColor=%.2f",
+                        fileLog(String(format: "🔍 SEARCHING %.1fs candidates=%d bestCont=%.2f bestColor=%.2f",
                                      now - since, pi.lastCandidateCount, pi.dbgBestRejectCont, pi.dbgBestRejectColor))
                     }
                     #endif
@@ -1226,7 +1244,7 @@ final class TrackingController {
                 if now - reacqLockedAt < reacqCooldownSec {
                     #if DEBUG
                     if frameCount % 30 == 0 {
-                        print(String(format: "🔒 REACQ-COOLDOWN 保持 locked(距上次找回 %.1fs<%.0fs,不进 searching)", now - reacqLockedAt, reacqCooldownSec))
+                        fileLog(String(format: "🔒 REACQ-COOLDOWN 保持 locked(距上次找回 %.1fs<%.0fs,不进 searching)", now - reacqLockedAt, reacqCooldownSec))
                     }
                     #endif
                     break
@@ -1234,7 +1252,7 @@ final class TrackingController {
                 lockState = .searching(since: now)
                 #if DEBUG
                 dbgSearchCandSeen = PersonIdentifier.shared.lastCandidateCount   // 新一轮 searching 起点
-                print("🔒 STATE locked→searching @f\(frameCount) (findTarget nil, candidates=\(PersonIdentifier.shared.lastCandidateCount))")
+                fileLog("🔒 STATE locked→searching @f\(frameCount) (findTarget nil, candidates=\(PersonIdentifier.shared.lastCandidateCount))")
                 setStateEvent("SEARCH", now)
                 #endif
             case .unlocked:
@@ -1245,7 +1263,7 @@ final class TrackingController {
                 if wedgeNoMatchSince < 0 { wedgeNoMatchSince = now }
                 if now - wedgeNoMatchSince >= TrackingController.wedgeTimeoutSec {
                     let held = now - wedgeNoMatchSince
-                    print(String(format: "🔓 STATE wedge-timeout @f%d(PI已锁+unlocked 无匹配 %.1fs≥%.0fs)→ 强制解锁重找", frameCount, held, TrackingController.wedgeTimeoutSec))
+                    fileLog(String(format: "🔓 STATE wedge-timeout @f%d(PI已锁+unlocked 无匹配 %.1fs≥%.0fs)→ 强制解锁重找", frameCount, held, TrackingController.wedgeTimeoutSec))
                     #if DEBUG
                     setStateEvent("WEDGE-UNLOCK", now)
                     #endif

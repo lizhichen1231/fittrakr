@@ -64,12 +64,23 @@ final class CameraViewModel: NSObject, ObservableObject {
     @Published var lensRampRateUI: Float = CameraEngine.lensRampRateToWide {
         didSet { CameraEngine.lensRampRateToWide = lensRampRateUI }
     }
-    // 【贴边卡·四】扫描旋钮对:边带宽 × 出门驻留(宽带配长驻留/窄带配短驻留,配对扫)
+    // 【贴边卡·四】扫描旋钮对:边带宽 × 出门驻留(宽带配长驻留/窄带配短驻留,配对扫)。
+    // 切档即落盘一行——扫描表按 📐 参数 行切段归格,无此行则零事件档无法归属。
     @Published var lensEdgeBandUI: CGFloat = LensArbiter.edgeBandBuffer {
-        didSet { LensArbiter.edgeBandBuffer = lensEdgeBandUI }
+        didSet {
+            LensArbiter.edgeBandBuffer = lensEdgeBandUI
+            #if DEBUG
+            PerfFileLog.shared.line(String(format: "📐 参数 边带=%.2f 驻=%.2f(边带切档)", lensEdgeBandUI, LensArbiter.exitDwellSec))
+            #endif
+        }
     }
     @Published var lensExitDwellUI: Double = LensArbiter.exitDwellSec {
-        didSet { LensArbiter.exitDwellSec = lensExitDwellUI }
+        didSet {
+            LensArbiter.exitDwellSec = lensExitDwellUI
+            #if DEBUG
+            PerfFileLog.shared.line(String(format: "📐 参数 边带=%.2f 驻=%.2f(驻留切档)", LensArbiter.edgeBandBuffer, lensExitDwellUI))
+            #endif
+        }
     }
     // 跳变取证:冻结"最近一次显著跳变那一帧"的整行数据(poseValid/srcUsed/rectConf/各Δ)
     @Published var probeHUD = ""

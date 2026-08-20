@@ -68,7 +68,10 @@ protocol CameraEngineDelegate: AnyObject {
     func start() {
         #if DEBUG
         // 埋点卡三:形态标注首行——从执行器常量实导,避免不同形态数据混比(文案不写死)。
-        PerfFileLog.shared.line(String(format: "🏷 形态=缓推不对称(W%.1f/U%.1f,0=瞬切) 执行器=setLensDeviceZoom白名单", CameraEngine.lensRampRateToWide, CameraEngine.lensRampRateToUW))
+        PerfFileLog.shared.line(String(format: "🏷 形态=缓推不对称(W%.1f/U%.1f,0=瞬切) 执行器=setLensDeviceZoom白名单 贴边带=%.2f 出门驻=%.2f 前置驻=%.1f",
+                                       CameraEngine.lensRampRateToWide, CameraEngine.lensRampRateToUW,
+                                       LensArbiter.edgeBandBuffer, LensArbiter.exitDwellSec,
+                                       LensArbiter.Params().dwellSec))
         LensReconProbe.dumpDualWide()   // 【查勘#2 Q2 探针】用完即撤(probe/lens-recon)
         #endif
         // 任务零:全应用锁死竖屏——已删设备方向通知订阅(采集层 connection 一次性设死 .portrait,不再跟随旋转)
