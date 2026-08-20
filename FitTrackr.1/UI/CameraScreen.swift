@@ -279,6 +279,10 @@ struct CameraScreen: View {
                 }
             }
             .onAppear {
+                #if DEBUG
+                // 【画质探针·待撤】FTQ_BENCH=1 无头基准:不起相机,纯跑处理链计时(QualityProbeView.swift)
+                if QualityProbeBench.benchMode { QualityProbeBench.runIfNeeded(); return }
+                #endif
                 forcePortrait()   // 兜底:若已卡在横屏进来,掰回竖屏
                 vm.updateOutputSize(for: geo.size)
                 vm.start()
@@ -381,6 +385,7 @@ fileprivate struct TunerSheet: View {
     @ObservedObject var vm: CameraViewModel
     #if DEBUG
     @State private var tier0Forced = CameraEngine.forceTier0   // 刀1 验收开关的界面态
+    @State private var showQualityProbe = false                // 【画质探针·待撤】临时入口
     #endif
 
     var body: some View {
@@ -404,6 +409,11 @@ fileprivate struct TunerSheet: View {
                     }
                     .pickerStyle(.segmented)
                 }
+                // 【画质探针·待撤】临时入口:糙,不进正式 UI,新 UI 开工时随探针整体删除
+                Section(header: Text("🧪 画质探针(临时)")) {
+                    Button("打开画质探针(锐化/去噪/对比)") { showQualityProbe = true }
+                }
+
                 // 【贴边卡·四】扫描旋钮对(切档即生效):0.03/0.20 为初值档;扫 {0,0.02,0.04}×{0.10,0.20,0.35}
                 Section(header: Text("📐 贴边通道:带宽(buffer) × 出门驻留(s)")) {
                     Picker("edgeBand", selection: $vm.lensEdgeBandUI) {
@@ -520,6 +530,10 @@ fileprivate struct TunerSheet: View {
                 }
             }
         }
+        #if DEBUG
+        // 【画质探针·待撤】全屏探针页,不复用任何现有布局
+        .fullScreenCover(isPresented: $showQualityProbe) { QualityProbeView() }
+        #endif
     }
 }
 
