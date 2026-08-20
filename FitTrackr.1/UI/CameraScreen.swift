@@ -404,6 +404,21 @@ fileprivate struct TunerSheet: View {
                     }
                     .pickerStyle(.segmented)
                 }
+                // 【贴边卡·四】扫描旋钮对(切档即生效):0.03/0.20 为初值档;扫 {0,0.02,0.04}×{0.10,0.20,0.35}
+                Section(header: Text("📐 贴边通道:带宽(buffer) × 出门驻留(s)")) {
+                    Picker("edgeBand", selection: $vm.lensEdgeBandUI) {
+                        ForEach([CGFloat(0), 0.02, 0.03, 0.04], id: \.self) { v in
+                            Text(String(format: "%.2f", v)).tag(v)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    Picker("exitDwell", selection: $vm.lensExitDwellUI) {
+                        ForEach([0.10, 0.20, 0.35], id: \.self) { v in
+                            Text(String(format: "%.2f", v)).tag(v)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
                 #endif
 
                 #if DEBUG

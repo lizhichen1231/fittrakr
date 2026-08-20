@@ -64,6 +64,13 @@ final class CameraViewModel: NSObject, ObservableObject {
     @Published var lensRampRateUI: Float = CameraEngine.lensRampRateToWide {
         didSet { CameraEngine.lensRampRateToWide = lensRampRateUI }
     }
+    // 【贴边卡·四】扫描旋钮对:边带宽 × 出门驻留(宽带配长驻留/窄带配短驻留,配对扫)
+    @Published var lensEdgeBandUI: CGFloat = LensArbiter.edgeBandBuffer {
+        didSet { LensArbiter.edgeBandBuffer = lensEdgeBandUI }
+    }
+    @Published var lensExitDwellUI: Double = LensArbiter.exitDwellSec {
+        didSet { LensArbiter.exitDwellSec = lensExitDwellUI }
+    }
     // 跳变取证:冻结"最近一次显著跳变那一帧"的整行数据(poseValid/srcUsed/rectConf/各Δ)
     @Published var probeHUD = ""
     let probeJumpThreshold: CGFloat = 0.03   // anchorΔ 或 rectBoxΔ 超此(占画面宽 3%)算一次跳,刷新冻结行

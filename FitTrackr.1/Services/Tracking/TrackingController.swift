@@ -973,11 +973,31 @@ final class TrackingController {
                 lensShadowPrevCenter = c
                 lensShadowPrevFrame = frameCount
             }
+            // 【贴边卡·一】当帧检测框四边到 buffer 边界的距离(buffer 系全宽=1)。
+            // ★来源钉死 _rectResult(当帧新测量),不用 stableBox/rawBox——S 期两者冻结,喂进去=旧病复发。
+            let _edgeGaps: (l: CGFloat, r: CGFloat, t: CGFloat, b: CGFloat)? = _rectResult.map { rr in
+                (rr.0.minX / max(sensorW, 1), 1 - rr.0.maxX / max(sensorW, 1),
+                 rr.0.minY / max(sensorH, 1), 1 - rr.0.maxY / max(sensorH, 1))
+            }
+            let _edgeGapMin: CGFloat? = _edgeGaps.map { min($0.l, $0.r, $0.t, $0.b) }
+            let _lensPrev = lensArbiter.lens   // 决策前镜头态(=prev;埋点在 decide 后打,不捕获会读到已迁移值)
             let _lensOut = lensArbiter.decide(LensArbiterInput(
                 zoomReq: zoom, lockedCenter: _lensCenter, centerVel: lensShadowVel,
                 stateTag: _lensTag, chainFrames: assocChainFrames,
                 tier1: CameraEngine.currentTier1,
-                deviceZoom: lensDeviceZoom), at: _lensNow)
+                deviceZoom: lensDeviceZoom, edgeGapBuffer: _edgeGapMin), at: _lensNow)
+            #if DEBUG
+            // 【贴边卡·六】逐帧埋点(切换窗内 或 贴边判定/驻留期间):四边距/贴边/驻留/三态/prev/cheb/Zd。
+            // ★prev 进 PerfFileLog(此前只在 console)——扫描表的最小数据集,心跳 150 帧粒度出不来。
+            if lensSwitchTraceArm > 0 || lensArbiter.dbgEdgeTouch || lensArbiter.edgeDwellElapsed(at: _lensNow) > 0 {
+                let _eg = _edgeGaps.map { String(format: "边距=L%.3f/R%.3f/T%.3f/B%.3f", $0.l, $0.r, $0.t, $0.b) } ?? "边距=miss"
+                let _chb = _lensCenter.map { String(format: "%.3f", max(abs($0.x), abs($0.y))) } ?? "nil"
+                PerfFileLog.shared.line(String(format: "📐 贴边 f%d %@ 触=%@ 驻=%.2f/%.2fs 态=%@ prev=%@ cheb=%@ Zd=%.2f 带=%.2f",
+                    frameCount, _eg, lensArbiter.dbgEdgeTouch ? "Y" : "N",
+                    lensArbiter.edgeDwellElapsed(at: _lensNow), LensArbiter.exitDwellSec,
+                    _lensTag, _lensPrev.rawValue, _chb, lensDeviceZoom, LensArbiter.edgeBandBuffer))
+            }
+            #endif
             if _lensOut.command != .none {
                 let _mode = TrackingController.lensShadowOnly ? "影子" : "执行"
                 let _targetD: CGFloat = (_lensOut.command == .toWide) ? lensArbiter.p.S : 1.0
@@ -1016,8 +1036,9 @@ final class TrackingController {
             // 心跳:每 150 帧落一行完整状态(零指令场景也可对答案)
             if frameCount % 150 == 0 {
                 let _cs = _lensCenter.map { String(format: "c=(%.3f,%.3f)", $0.x, $0.y) } ?? "c=nil"
-                PerfFileLog.shared.line(String(format: "🎯 心跳 f%d %@ %@ vel=%.3f",
-                                               frameCount, dbgLensShadow, _cs, lensShadowVel))
+                // 【贴边卡·六】prev(仲裁器内部镜头态)入心跳:影子模式下 Zd 恒 1,文件里无从重建 prev——已补
+                PerfFileLog.shared.line(String(format: "🎯 心跳 f%d %@ %@ vel=%.3f prev=%@",
+                                               frameCount, dbgLensShadow, _cs, lensShadowVel, _lensPrev.rawValue))
             }
             #endif
 
