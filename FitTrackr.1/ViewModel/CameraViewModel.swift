@@ -486,6 +486,9 @@ extension CameraViewModel {
         //  - ⏱ 行(console+文件,每30帧):保留 → _perf 仅 need30 或 HUD 开时构造;
         //  - perfMini / probe / lockSummary(HUD 串):仅眼睛开关(showDebugOverlay)开时构造,关时零 String 开销。
         perfFrame += 1
+        #if DEBUG
+        CameraEngine.dbgMeasuredFPS = result.fps   // 【4K探针·待撤】面板实测帧率直读
+        #endif
         let _need30 = (perfFrame % 30 == 0)
         let _diagOn = showDebugOverlay
 

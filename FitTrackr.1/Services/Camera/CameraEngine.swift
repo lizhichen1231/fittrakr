@@ -387,27 +387,59 @@ protocol CameraEngineDelegate: AnyObject {
         guard let device = (session.inputs.compactMap { ($0 as? AVCaptureDeviceInput)?.device }
             .first { $0.hasMediaType(.video) }) else { return false }
 
+        // 过滤掉 ProRes Raw / Bayer 等不支持旋转的格式(1080p 路径与 4K 探针分支共用)
+        let safeSubtypes: [FourCharCode] = [
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+            kCVPixelFormatType_32BGRA,
+            kCVPixelFormatType_32ARGB,
+            kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+            kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
+        ]
+
+        #if DEBUG
+        CameraEngine.dbgActiveDevice = device
+        // 【4K探针·待撤】开关拨开:挑帧率最高的 4K 格式,其余链路照旧跑新分辨率。
+        // 无可用 4K → 如实屏显、不找替代,落回常规 1080p 路径(卡面★条款)。
+        if CameraEngine.capture4K {
+            func maxRate(_ f: AVCaptureDevice.Format) -> Double {
+                f.videoSupportedFrameRateRanges.map { $0.maxFrameRate }.max() ?? 0
+            }
+            let fourK = device.formats.filter { f in
+                let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+                return d.width == 3840 && d.height == 2160
+                    && safeSubtypes.contains(CMFormatDescriptionGetMediaSubType(f.formatDescription))
+            }
+            if let best = fourK.max(by: { maxRate($0) < maxRate($1) }) {
+                let cap = maxRate(best)
+                let useFps = min(Double(fps), cap)
+                do {
+                    try device.lockForConfiguration()
+                    device.activeFormat = best
+                    let dur = CMTimeMake(value: 1, timescale: Int32(useFps))
+                    device.activeVideoMinFrameDuration = dur
+                    device.activeVideoMaxFrameDuration = dur
+                    device.unlockForConfiguration()
+                    CameraEngine.dbg4KFormatLine = String(format: "4K 3840x2160@设%.0f(格式上限%.0f)", useFps, cap)
+                    PerfFileLog.shared.line("📺 4K探针 " + CameraEngine.dbg4KFormatLine)
+                    return true
+                } catch {
+                    CameraEngine.dbg4KFormatLine = "4K 配置失败:\(error.localizedDescription)"
+                    return false
+                }
+            } else {
+                CameraEngine.dbg4KFormatLine = "★无可用 4K 格式(safe 子类型内)——保持 1080p,停,等指示"
+                PerfFileLog.shared.line("📺 4K探针 " + CameraEngine.dbg4KFormatLine)
+            }
+        }
+        #endif
+
         // 选一个既支持该 fps、又分辨率≈1080p 的 format(不再取最大/4K——4K 处理太慢把帧率拖到 ~32)
-        // 过滤掉 ProRes Raw / Bayer 等不支持旋转的格式
         let matched = device.formats.filter { format in
             let supportsFrameRate = format.videoSupportedFrameRateRanges.contains {
                 $0.minFrameRate <= Double(fps) && Double(fps) <= $0.maxFrameRate
             }
-
-            let desc = format.formatDescription
-            let mediaSubType = CMFormatDescriptionGetMediaSubType(desc)
-
-            let safeFormats: [FourCharCode] = [
-                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-                kCVPixelFormatType_32BGRA,
-                kCVPixelFormatType_32ARGB,
-                kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
-                kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
-            ]
-
-            let isSafeFormat = safeFormats.contains(mediaSubType)
-
+            let isSafeFormat = safeSubtypes.contains(CMFormatDescriptionGetMediaSubType(format.formatDescription))
             return supportsFrameRate && isSafeFormat
         }.sorted { f1, f2 in
             // 取「面积最接近 1080p(1920×1080)」的 60 帧 format,而不是最大的(4K)
@@ -428,11 +460,39 @@ protocol CameraEngineDelegate: AnyObject {
             device.activeVideoMinFrameDuration = duration
             device.activeVideoMaxFrameDuration = duration
             device.unlockForConfiguration()
+            #if DEBUG
+            // 【4K探针·待撤】常规路径也写格式行(面板显示"当前格式"用;无 4K 时保留★行不覆盖)
+            if !CameraEngine.capture4K {
+                let d = CMVideoFormatDescriptionGetDimensions(targetFormat.formatDescription)
+                CameraEngine.dbg4KFormatLine = "\(d.width)x\(d.height)@设\(fps)"
+            }
+            #endif
             return true
         } catch {
             return false
         }
     }
+
+    #if DEBUG
+    // ═══ 【4K探针·待撤】开关 + 面板读数(全套随探针删除,登记 pending-removal.md)═══
+    static var capture4K = false                       // TunerSheet 开关;切换后重启相机会话生效
+    static var dbg4KFormatLine = "—"                   // 配置时写:当前格式(或★无 4K 停等指示)
+    static var dbgMeasuredFPS: Double = 0              // vm 每帧回写(实测帧率)
+    static weak var dbgActiveDevice: AVCaptureDevice?  // 压力/GDC 实时读
+    static func dbg4KLiveLine() -> String {
+        let th: String
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal: th = "nominal"; case .fair: th = "fair"
+        case .serious: th = "serious"; case .critical: th = "critical"
+        @unknown default: th = "?"
+        }
+        guard let dev = dbgActiveDevice else { return "实测=\(Int(dbgMeasuredFPS))fps 热=\(th) 设备=?" }
+        // 注:systemPressureCost 是 AVCaptureMultiCamSession 独有量;当前单 session 无此值,
+        // 用 device.systemPressureState(nominal/fair/serious/critical/shutdown)替代显示。
+        let gdc = "\(dev.isGeometricDistortionCorrectionSupported ? "Y" : "N")/\(dev.isGeometricDistortionCorrectionEnabled ? "开" : "关")"
+        return "实测=\(Int(dbgMeasuredFPS))fps 压力=\(dev.systemPressureState.level.rawValue) 热=\(th) GDC=\(gdc)"
+    }
+    #endif
 
     // 任务零:已删 currentVideoOrientation()(读 UIDevice.orientation,死代码,从未被调用)
     //         + handleOrientationChange()(空 no-op stub)。采集层 connection 一次性设死 .portrait。

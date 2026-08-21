@@ -387,6 +387,9 @@ fileprivate struct TunerSheet: View {
     @State private var tier0Forced = CameraEngine.forceTier0   // 刀1 验收开关的界面态
     @State private var showQualityProbe = false                // 【画质探针·待撤】临时入口
     @State private var showDenoiseProbe = false                // 【降噪探针·待撤】临时入口
+    @State private var cap4K = CameraEngine.capture4K          // 【4K探针·待撤】开关界面态
+    @State private var line4K = "—"                            // 【4K探针·待撤】读数行
+    private let timer4K = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
     #endif
 
     var body: some View {
@@ -418,6 +421,22 @@ fileprivate struct TunerSheet: View {
                 // 【降噪探针·待撤】临时入口:时域降噪(Metal 自写核 + 估计对齐)
                 Section(header: Text("🌨 降噪探针(临时)")) {
                     Button("打开降噪探针(时域/空域)") { showDenoiseProbe = true }
+                }
+
+                // 【4K探针·待撤】采集格式开关:切换即重启相机会话(以简单为准);
+                // 检测/跟踪/变焦/镜头切换/录制全不动,照常跑新分辨率——看会怎样。
+                Section(header: Text("📺 4K 探针(临时)")) {
+                    Toggle(cap4K ? "当前:4K → 拨回 1080p60(重启会话)"
+                                 : "当前:1080p60 → 拨开 4K(重启会话)", isOn: $cap4K)
+                        .onChange(of: cap4K) { v in
+                            CameraEngine.capture4K = v
+                            vm.stop(); vm.start()
+                        }
+                    Text(line4K)
+                        .font(.caption.monospaced())
+                        .onReceive(timer4K) { _ in
+                            line4K = "格式=" + CameraEngine.dbg4KFormatLine + "\n" + CameraEngine.dbg4KLiveLine()
+                        }
                 }
 
                 // 【贴边卡·四】扫描旋钮对(切档即生效):0.03/0.20 为初值档;扫 {0,0.02,0.04}×{0.10,0.20,0.35}

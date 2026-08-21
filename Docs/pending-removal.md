@@ -2,6 +2,13 @@
 
 > 登记规则:每条写明「删什么 / 何时删 / 移除自查命令」。删完把该条一并删掉。
 
+- 【4K探针】(登记 2026-08-20,【4K 探针】卡)
+  - 删什么:`CameraEngine.swift` 三处(setPreferredFrameRate 的 4K 分支、statics+dbg4KLiveLine 块、
+    常规路径格式行回写)+ `CameraViewModel.swift` 一行(dbgMeasuredFPS 回写)+
+    `CameraScreen.swift` TunerSheet 的开关 Section 与三个状态位 + 本条;
+  - 何时删:新 UI 开工时(与两只探针同批);
+  - 移除自查:`grep -rn "4K探针" FitTrackr.1/` 应零命中。
+
 - 【降噪探针】(登记 2026-08-20,【真机降噪试验入口】卡)
   - 删什么:`FitTrackr.1/UI/Debug/DenoiseProbeView.swift` 整文件 + `CameraScreen.swift` 三处挂点
     (`showDenoiseProbe` 状态、入口 Section、`.fullScreenCover`)+ 本条;
