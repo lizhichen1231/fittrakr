@@ -4,10 +4,11 @@
 //   全部代码在本文件;挂点两处(CameraScreen:TunerSheet 入口 / fullScreenCover)。
 //   新 UI 开工时整体删除——移除自查:grep "降噪探针" 应零命中。登记:Docs/pending-removal.md。
 // 链路:A·时域降噪(自写 Metal 内核,环形缓冲 4 前帧,逐像素运动阈值加权平均)
-//       + 对齐:整帧全局位移估计(两级 SAD + 抛物线亚格;★轨迹对齐不可用——
-//         逐帧裁剪位移未持久化,相册视频无绑定轨迹,见【真机降噪试验入口】卡·三)
+//       + 对齐:整帧全局位移估计(★全程 GPU:亮度 8 抽样 + SAD 全搜索 ±16 格 + CPU 抛物线亚格。
+//         初版 CPU 估计在 Debug(-Onone)下单帧数百 ms → 预览 1fps,已迁 GPU 根修;
+//         轨迹对齐不可用——逐帧裁剪位移未持久化,相册视频无绑定轨迹,见【真机降噪试验入口】卡·三)
 //       B·空域降噪(CINoiseReduction,默认关,作补充/塑料感对照)
-// 完成标准 = Debug+Release 双 build 过;真机效果 Zc 自验。
+// 线程:预览处理在串行后台队列,忙时丢帧不堵主线程;完成标准 = Debug+Release 双 build 过。
 // ═══════════════════════════════════════════════════════════════════════════
 
 import SwiftUI
@@ -20,7 +21,7 @@ import PhotosUI
 import Photos
 import UniformTypeIdentifiers
 
-// MARK: - 参数
+// MARK: - 参数(UI 绑定)+ 处理快照(跨线程传值,不在后台读 @Published)
 
 final class DenoiseParams: ObservableObject {
     static let shared = DenoiseParams()
@@ -30,92 +31,29 @@ final class DenoiseParams: ObservableObject {
     @Published var spatialOn = false            // B·空域(默认关)
     @Published var spatialLevel: Double = 0.03  // CINoiseReduction.noiseLevel
     @Published var bypass = false               // 长按看原图
-}
 
-// MARK: - 全局位移估计(两级 SAD;CPU,十六抽样粗搜 → 四抽样精搜 + 抛物线亚格)
-
-struct LumaGrids {
-    var g16: [Float]; var w16: Int; var h16: Int
-    var g4: [Float];  var w4: Int;  var h4: Int
-}
-
-enum GlobalMotion {
-    static func grids(from pb: CVPixelBuffer) -> LumaGrids? {
-        guard CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA else { return nil }
-        CVPixelBufferLockBaseAddress(pb, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
-        guard let base = CVPixelBufferGetBaseAddress(pb) else { return nil }
-        let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
-        let stride = CVPixelBufferGetBytesPerRow(pb)
-        let p = base.assumingMemoryBound(to: UInt8.self)
-        func decimate(_ d: Int) -> ([Float], Int, Int) {
-            let gw = w / d, gh = h / d
-            var g = [Float](repeating: 0, count: gw * gh)
-            for y in 0..<gh {
-                let row = p + (y * d) * stride
-                for x in 0..<gw {
-                    let o = (x * d) * 4
-                    // BGRA → 快速亮度 (b + 2g + r)/4
-                    g[y * gw + x] = (Float(row[o]) + 2 * Float(row[o + 1]) + Float(row[o + 2])) * 0.25
-                }
-            }
-            return (g, gw, gh)
-        }
-        let (a, aw, ah) = decimate(16)
-        let (b, bw, bh) = decimate(4)
-        return LumaGrids(g16: a, w16: aw, h16: ah, g4: b, w4: bw, h4: bh)
-    }
-
-    /// SAD:prev 平移 (dx,dy)(格单位)与 cur 重叠区平均绝对差
-    private static func sad(_ prev: [Float], _ cur: [Float], _ w: Int, _ h: Int, _ dx: Int, _ dy: Int) -> Float {
-        let x0 = max(0, -dx), x1 = min(w, w - dx)
-        let y0 = max(0, -dy), y1 = min(h, h - dy)
-        if x1 - x0 < 4 || y1 - y0 < 4 { return .greatestFiniteMagnitude }
-        var s: Float = 0
-        prev.withUnsafeBufferPointer { pp in cur.withUnsafeBufferPointer { cp in
-            for y in y0..<y1 {
-                let pr = (y + dy) * w + dx, cr = y * w
-                for x in x0..<x1 { s += abs(pp[pr + x] - cp[cr + x]) }
-            }
-        }}
-        return s / Float((x1 - x0) * (y1 - y0))
-    }
-
-    /// 返回:prev 中与 cur 对齐所需采样偏移(满分辨率像素):prev[x+off] ≈ cur[x]
-    static func estimate(prev: LumaGrids, cur: LumaGrids) -> SIMD2<Float> {
-        // 一级:16 抽样全搜索 ±8 格(±128px)
-        var best: (d: (Int, Int), v: Float) = ((0, 0), .greatestFiniteMagnitude)
-        for dy in -8...8 { for dx in -8...8 {
-            let v = sad(prev.g16, cur.g16, prev.w16, prev.h16, dx, dy)
-            if v < best.v { best = ((dx, dy), v) }
-        }}
-        // 二级:4 抽样围绕粗解 ±3 格精搜(粗格=4细格)
-        let cx = best.d.0 * 4, cy = best.d.1 * 4
-        var fine: (d: (Int, Int), v: Float) = ((cx, cy), .greatestFiniteMagnitude)
-        var surface = [Int: Float]()   // 键 dx*1000+dy,抛物线用
-        for dy in (cy - 3)...(cy + 3) { for dx in (cx - 3)...(cx + 3) {
-            let v = sad(prev.g4, cur.g4, prev.w4, prev.h4, dx, dy)
-            surface[dx * 1000 + dy] = v
-            if v < fine.v { fine = ((dx, dy), v) }
-        }}
-        // 抛物线亚格 refine(各轴独立;邻点缺失则跳过)
-        func para(_ vm: Float?, _ v0: Float, _ vp: Float?) -> Float {
-            guard let a = vm, let b = vp else { return 0 }
-            let den = a - 2 * v0 + b
-            return den > 1e-6 ? max(-0.5, min(0.5, 0.5 * (a - b) / den)) : 0
-        }
-        let (fx, fy) = fine.d
-        let sx = para(surface[(fx - 1) * 1000 + fy], fine.v, surface[(fx + 1) * 1000 + fy])
-        let sy = para(surface[fx * 1000 + fy - 1], fine.v, surface[fx * 1000 + fy + 1])
-        return SIMD2<Float>((Float(fx) + sx) * 4, (Float(fy) + sy) * 4)   // 4 抽样格 → 满分辨率 px
+    var snapshot: DenoiseSnapshot {
+        DenoiseSnapshot(frameCount: frameCount, strength: Float(strength), motionThr: Float(motionThr),
+                        spatialOn: spatialOn, spatialLevel: Float(spatialLevel), bypass: bypass)
     }
 }
 
-// MARK: - 时域降噪核(Metal,运行时编译——单文件自足,不引 .metal 构建产物)
+struct DenoiseSnapshot {
+    var frameCount: Int
+    var strength: Float
+    var motionThr: Float
+    var spatialOn: Bool
+    var spatialLevel: Float
+    var bypass: Bool
+}
+
+// MARK: - Metal 内核(运行时编译——单文件自足,不引 .metal 构建产物)
 
 private let kKernelSrc = """
 #include <metal_stdlib>
 using namespace metal;
+
+// ── 时域加权平均(逐像素运动否决)──
 struct U { int count; float strength; float thr; float pad; float2 off[4]; };
 kernel void tdenoise(texture2d<float, access::read>  cur  [[texture(0)]],
                      texture2d<float, access::sample> p0  [[texture(1)]],
@@ -143,6 +81,40 @@ kernel void tdenoise(texture2d<float, access::read>  cur  [[texture(0)]],
     }
     outT.write(float4(acc / wsum, c.a), gid);
 }
+
+// ── 亮度 8 抽样(2×2 平均)→ 位移估计网格 ──
+kernel void lumaDecim(texture2d<float, access::read> src [[texture(0)]],
+                      device float* out [[buffer(0)]],
+                      constant int2& gsz [[buffer(1)]],
+                      uint2 gid [[thread_position_in_grid]]) {
+    if ((int)gid.x >= gsz.x || (int)gid.y >= gsz.y) return;
+    uint2 p = uint2(gid.x * 8 + 3, gid.y * 8 + 3);
+    float3 m = (src.read(p).rgb + src.read(p + uint2(2, 0)).rgb
+              + src.read(p + uint2(0, 2)).rgb + src.read(p + uint2(2, 2)).rgb) * 0.25;
+    out[gid.y * gsz.x + gid.x] = dot(m, float3(0.299, 0.587, 0.114));
+}
+
+// ── SAD 全搜索:一线程一候选位移,prev[x+d] 对 cur[x],隔行采样 ──
+kernel void sadSearch(device const float* prev [[buffer(0)]],
+                      device const float* cur  [[buffer(1)]],
+                      constant int4& g [[buffer(2)]],        // x=w y=h z=R
+                      device float* sadOut [[buffer(3)]],
+                      uint tid [[thread_position_in_grid]]) {
+    int R = g.z, side = 2 * R + 1;
+    if ((int)tid >= side * side) return;
+    int dx = (int)(tid % side) - R, dy = (int)(tid / side) - R;
+    int w = g.x, h = g.y;
+    int x0 = max(0, -dx), x1 = min(w, w - dx);
+    int y0 = max(0, -dy), y1 = min(h, h - dy);
+    if (x1 - x0 < 8 || y1 - y0 < 8) { sadOut[tid] = 1e30; return; }
+    float s = 0; int n = 0;
+    for (int y = y0; y < y1; y += 2) {
+        int pr = (y + dy) * w + dx, cr = y * w;
+        for (int x = x0; x < x1; x++) s += fabs(prev[pr + x] - cur[cr + x]);
+        n += x1 - x0;
+    }
+    sadOut[tid] = s / float(max(n, 1));
+}
 """
 
 private struct KernelUniforms {   // 与 Metal 端 U 逐字段对齐(48B:4+4+4+4pad+4×8)
@@ -153,16 +125,26 @@ private struct KernelUniforms {   // 与 Metal 端 U 逐字段对齐(48B:4+4+4+4
     var off = (SIMD2<Float>.zero, SIMD2<Float>.zero, SIMD2<Float>.zero, SIMD2<Float>.zero)
 }
 
+// MARK: - 时域降噪器(含 GPU 位移估计)
+
 final class TemporalDenoiser {
     private let device: MTLDevice
     private let queue: MTLCommandQueue
-    private let pipeline: MTLComputePipelineState
+    private let psDenoise: MTLComputePipelineState
+    private let psLuma: MTLComputePipelineState
+    private let psSad: MTLComputePipelineState
     private var texCache: CVMetalTextureCache?
-    // 环形缓冲:私有纹理副本 + 各自累计位移 + 亮度网格(估计用)
-    private struct Entry { var tex: MTLTexture; var pan: SIMD2<Float>; }
+    // 环形缓冲:私有纹理副本 + 各自累计位移
+    private struct Entry { var tex: MTLTexture; var pan: SIMD2<Float> }
     private var ring: [Entry] = []
-    private var lastGrids: LumaGrids?
     private var runningPan = SIMD2<Float>.zero
+    // 位移估计:双网格缓冲(prev/cur 交换)+ SAD 输出
+    private let searchR = 16                        // ±16 格 × 8px = ±128px
+    private var gridA: MTLBuffer?, gridB: MTLBuffer?
+    private var sadBuf: MTLBuffer?
+    private var curIsA = true
+    private var havePrevGrid = false
+    private var gw = 0, gh = 0
     private var outPool: CVPixelBufferPool?
     private var poolW = 0, poolH = 0
     private(set) var lastDisp = SIMD2<Float>.zero   // 屏显:最近一帧估计位移(px)
@@ -170,13 +152,17 @@ final class TemporalDenoiser {
     init?() {
         guard let d = MTLCreateSystemDefaultDevice(), let q = d.makeCommandQueue(),
               let lib = try? d.makeLibrary(source: kKernelSrc, options: nil),
-              let fn = lib.makeFunction(name: "tdenoise"),
-              let ps = try? d.makeComputePipelineState(function: fn) else { return nil }
-        device = d; queue = q; pipeline = ps
+              let f1 = lib.makeFunction(name: "tdenoise"),
+              let f2 = lib.makeFunction(name: "lumaDecim"),
+              let f3 = lib.makeFunction(name: "sadSearch"),
+              let p1 = try? d.makeComputePipelineState(function: f1),
+              let p2 = try? d.makeComputePipelineState(function: f2),
+              let p3 = try? d.makeComputePipelineState(function: f3) else { return nil }
+        device = d; queue = q; psDenoise = p1; psLuma = p2; psSad = p3
         CVMetalTextureCacheCreate(nil, nil, d, nil, &texCache)
     }
 
-    func reset() { ring.removeAll(); lastGrids = nil; runningPan = .zero; lastDisp = .zero }
+    func reset() { ring.removeAll(); havePrevGrid = false; runningPan = .zero; lastDisp = .zero }
 
     private func metalTexture(_ pb: CVPixelBuffer) -> MTLTexture? {
         guard let cache = texCache else { return nil }
@@ -186,52 +172,107 @@ final class TemporalDenoiser {
         return cvTex.flatMap { CVMetalTextureGetTexture($0) }
     }
 
-    private func makePool(w: Int, h: Int) {
-        guard w != poolW || h != poolH || outPool == nil else { return }
-        let attrs: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferWidthKey as String: w, kCVPixelBufferHeightKey as String: h,
-            kCVPixelBufferIOSurfacePropertiesKey as String: [:], kCVPixelBufferMetalCompatibilityKey as String: true]
-        var pool: CVPixelBufferPool?
-        CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &pool)
-        outPool = pool; poolW = w; poolH = h
+    private func ensureBuffers(w: Int, h: Int) {
+        let nw = w / 8, nh = h / 8
+        if nw != gw || nh != gh || gridA == nil {
+            gw = nw; gh = nh
+            gridA = device.makeBuffer(length: gw * gh * 4, options: .storageModeShared)
+            gridB = device.makeBuffer(length: gw * gh * 4, options: .storageModeShared)
+            let side = 2 * searchR + 1
+            sadBuf = device.makeBuffer(length: side * side * 4, options: .storageModeShared)
+            havePrevGrid = false
+        }
+        if w != poolW || h != poolH || outPool == nil {
+            let attrs: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: w, kCVPixelBufferHeightKey as String: h,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+                kCVPixelBufferMetalCompatibilityKey as String: true]
+            var pool: CVPixelBufferPool?
+            CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &pool)
+            outPool = pool; poolW = w; poolH = h
+        }
     }
 
-    /// 单帧处理:估计位移 → 内核加权平均 → 入环。返回处理后 buffer(失败回原样)。
-    func process(_ pb: CVPixelBuffer, params: DenoiseParams) -> CVPixelBuffer {
-        guard let curTex = metalTexture(pb), let grids = GlobalMotion.grids(from: pb) else { return pb }
+    /// 步骤1(GPU):当前帧亮度网格 + 对上一帧网格 SAD 搜索 → 位移(px)。CPU 只做 1089 浮点 argmin+抛物线。
+    private func estimateMotion(curTex: MTLTexture) -> SIMD2<Float>? {
+        guard let ga = gridA, let gb = gridB, let sb = sadBuf,
+              let cb = queue.makeCommandBuffer() else { return nil }
+        let curGrid = curIsA ? ga : gb
+        let prevGrid = curIsA ? gb : ga
+        var gsz = SIMD2<Int32>(Int32(gw), Int32(gh))
+        if let enc = cb.makeComputeCommandEncoder() {
+            enc.setComputePipelineState(psLuma)
+            enc.setTexture(curTex, index: 0)
+            enc.setBuffer(curGrid, offset: 0, index: 0)
+            enc.setBytes(&gsz, length: MemoryLayout<SIMD2<Int32>>.stride, index: 1)
+            let tg = MTLSize(width: 8, height: 8, depth: 1)
+            enc.dispatchThreadgroups(MTLSize(width: (gw + 7) / 8, height: (gh + 7) / 8, depth: 1),
+                                     threadsPerThreadgroup: tg)
+            enc.endEncoding()
+        }
+        let side = 2 * searchR + 1
+        if havePrevGrid, let enc = cb.makeComputeCommandEncoder() {
+            enc.setComputePipelineState(psSad)
+            enc.setBuffer(prevGrid, offset: 0, index: 0)
+            enc.setBuffer(curGrid, offset: 0, index: 1)
+            var g = SIMD4<Int32>(Int32(gw), Int32(gh), Int32(searchR), 0)
+            enc.setBytes(&g, length: MemoryLayout<SIMD4<Int32>>.stride, index: 2)
+            enc.setBuffer(sb, offset: 0, index: 3)
+            enc.dispatchThreadgroups(MTLSize(width: (side * side + 63) / 64, height: 1, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+            enc.endEncoding()
+        }
+        cb.commit(); cb.waitUntilCompleted()
+        defer { curIsA.toggle() }        // 本帧网格成为下一帧的 prev
+        guard havePrevGrid else { havePrevGrid = true; return SIMD2<Float>.zero }
+        // CPU:argmin + 抛物线亚格(1089 个浮点,-Onone 也无压力)
+        let sad = sb.contents().bindMemory(to: Float.self, capacity: side * side)
+        var bi = 0; var bv = Float.greatestFiniteMagnitude
+        for i in 0..<(side * side) where sad[i] < bv { bv = sad[i]; bi = i }
+        let bx = bi % side, by = bi / side
+        func para(_ m: Float, _ c: Float, _ p: Float) -> Float {
+            let den = m - 2 * c + p
+            return den > 1e-6 ? max(-0.5, min(0.5, 0.5 * (m - p) / den)) : 0
+        }
+        var sx: Float = 0, sy: Float = 0
+        if bx > 0 && bx < side - 1 { sx = para(sad[bi - 1], bv, sad[bi + 1]) }
+        if by > 0 && by < side - 1 { sy = para(sad[bi - side], bv, sad[bi + side]) }
+        return SIMD2<Float>((Float(bx - searchR) + sx) * 8, (Float(by - searchR) + sy) * 8)
+    }
+
+    /// 单帧处理:GPU 估位移 → 内核加权平均 → 当前帧入环。返回处理后 buffer(失败回原样)。
+    func process(_ pb: CVPixelBuffer, snap: DenoiseSnapshot) -> CVPixelBuffer {
+        guard let curTex = metalTexture(pb) else { return pb }
         let w = curTex.width, h = curTex.height
-        makePool(w: w, h: h)
-        // 位移:cur vs 上一帧;环中各前帧偏移 = runningPan - entry.pan
-        if let lg = lastGrids {
-            let d = GlobalMotion.estimate(prev: lg, cur: grids)
+        ensureBuffers(w: w, h: h)
+        if let d = estimateMotion(curTex: curTex), havePrevGrid {
             runningPan += d; lastDisp = d
         }
-        lastGrids = grids
         var out: CVPixelBuffer?
         if let pool = outPool { CVPixelBufferPoolCreatePixelBuffer(nil, pool, &out) }
         guard let outPB = out, let outTex = metalTexture(outPB),
               let cb = queue.makeCommandBuffer() else { return pb }
 
-        let usable = Array(ring.suffix(min(params.frameCount - 1, 4)))
-        var u = KernelUniforms(count: Int32(usable.count), strength: Float(params.strength),
-                               thr: Float(params.motionThr) / 255.0, pad: 0)
+        let usable = Array(ring.suffix(min(snap.frameCount - 1, 4)))
+        var u = KernelUniforms(count: Int32(usable.count), strength: snap.strength,
+                               thr: snap.motionThr / 255.0, pad: 0)
         var offs = [SIMD2<Float>](repeating: .zero, count: 4)
         for (i, e) in usable.enumerated().prefix(4) { offs[i] = runningPan - e.pan }
         u.off = (offs[0], offs[1], offs[2], offs[3])
 
         if let enc = cb.makeComputeCommandEncoder() {
-            enc.setComputePipelineState(pipeline)
+            enc.setComputePipelineState(psDenoise)
             enc.setTexture(curTex, index: 0)
             for i in 0..<4 { enc.setTexture(i < usable.count ? usable[i].tex : curTex, index: 1 + i) }
             enc.setTexture(outTex, index: 5)
             enc.setBytes(&u, length: MemoryLayout<KernelUniforms>.stride, index: 0)
             let tg = MTLSize(width: 16, height: 16, depth: 1)
-            let grid = MTLSize(width: (w + 15) / 16, height: (h + 15) / 16, depth: 1)
-            enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
+            enc.dispatchThreadgroups(MTLSize(width: (w + 15) / 16, height: (h + 15) / 16, depth: 1),
+                                     threadsPerThreadgroup: tg)
             enc.endEncoding()
         }
-        // 当前帧拷贝入环(输入 buffer 会被播放器复用,必须留私有副本)
+        // 当前帧拷贝入环(输入 buffer 会被播放器/reader 复用,必须留私有副本)
         let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
         desc.usage = [.shaderRead]; desc.storageMode = .private
         if let copy = device.makeTexture(descriptor: desc), let blit = cb.makeBlitCommandEncoder() {
@@ -282,6 +323,9 @@ final class DenoiseProbeModel: NSObject, ObservableObject {
     private var loopObs: NSObjectProtocol?
     private var currentURL: URL?
     weak var boundView: MTKView?
+    // 【1fps 修】处理移出主线程:串行队列 + 忙时丢帧(display link 只取帧,不等处理)
+    private let procQueue = DispatchQueue(label: "dnp.process", qos: .userInitiated)
+    private var busy = false
 
     @Published var status = "未加载:先从相册选视频"
     @Published var fpsText = "—"
@@ -318,29 +362,34 @@ final class DenoiseProbeModel: NSObject, ObservableObject {
     }
 
     @objc private func tick() {
-        guard let out = videoOutput else { return }
+        guard let out = videoOutput, !busy else { return }
         let t = out.itemTime(forHostTime: CACurrentMediaTime())
         guard out.hasNewPixelBuffer(forItemTime: t),
               let pb = out.copyPixelBuffer(forItemTime: t, itemTimeForDisplay: nil) else { return }
-        let processed: CVPixelBuffer
-        if params.bypass || denoiser == nil {
-            processed = pb
-        } else {
-            processed = denoiser!.process(pb, params: params)
+        busy = true
+        let snap = params.snapshot                  // 主线程取快照,后台不读 @Published
+        procQueue.async { [weak self] in
+            guard let self else { return }
+            let processed: CVPixelBuffer
+            if snap.bypass || self.denoiser == nil { processed = pb }
+            else { processed = self.denoiser!.process(pb, snap: snap) }
+            var img = CIImage(cvPixelBuffer: processed)
+            if snap.spatialOn, !snap.bypass {
+                let f = CIFilter.noiseReduction()
+                f.inputImage = img; f.noiseLevel = snap.spatialLevel; f.sharpness = 0.4
+                img = (f.outputImage ?? img).cropped(to: img.extent)
+            }
+            let disp = self.denoiser?.lastDisp ?? .zero
+            DispatchQueue.main.async {
+                self.renderer.image = img
+                self.boundView?.setNeedsDisplay()
+                let now = CACurrentMediaTime()
+                self.fpsStamps.append(now); self.fpsStamps.removeAll { now - $0 > 1.0 }
+                self.fpsText = "\(self.fpsStamps.count) fps"
+                self.dispText = String(format: "(%.1f, %.1f)px", disp.x, disp.y)
+                self.busy = false
+            }
         }
-        var img = CIImage(cvPixelBuffer: processed)
-        if params.spatialOn, !params.bypass {
-            let f = CIFilter.noiseReduction()
-            f.inputImage = img; f.noiseLevel = Float(params.spatialLevel); f.sharpness = 0.4
-            img = (f.outputImage ?? img).cropped(to: img.extent)
-        }
-        renderer.image = img
-        boundView?.setNeedsDisplay()
-        // FPS(滚动 1s)+ 位移读数
-        let now = CACurrentMediaTime()
-        fpsStamps.append(now); fpsStamps.removeAll { now - $0 > 1.0 }
-        fpsText = "\(fpsStamps.count) fps"
-        if let d = denoiser?.lastDisp { dispText = String(format: "(%.1f, %.1f)px", d.x, d.y) }
     }
 
     /// 长按 bypass:结束时清环重预热,避免陈旧帧错位入平均
@@ -363,21 +412,24 @@ final class DenoiseProbeModel: NSObject, ObservableObject {
         exporting = true
         player.pause()
         status = "导出中…(全帧处理,与预览同链)"
-        let p = params
+        let snap = params.snapshot
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let t0 = CACurrentMediaTime()
-            let result = Self.runExport(url: url, denoiser: den, params: p)
+            let result = Self.runExport(url: url, denoiser: den, snap: snap)
             let dt = CACurrentMediaTime() - t0
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.exporting = false
+                self.denoiser?.reset()
+                self.player.play()                  // 导出完恢复预览
                 switch result {
                 case .failure(let msg):
                     self.status = "导出失败:\(msg)"
                 case .success(let outURL, let durSec):
                     let perMin = durSec > 0 ? dt / (durSec / 60.0) : 0
                     let line = String(format: "🌨 降噪探针 导出 %.1fs(素材 %.1fs → %.0f 秒/分钟)N=%d s=%.2f thr=%.0f 空域=%@",
-                                      dt, durSec, perMin, p.frameCount, p.strength, p.motionThr, p.spatialOn ? "开" : "关")
+                                      dt, durSec, perMin, snap.frameCount, snap.strength, snap.motionThr,
+                                      snap.spatialOn ? "开" : "关")
                     PerfFileLog.shared.line(line); print(line)
                     self.status = String(format: "导出 %.1fs = %.0f 秒/分钟素材,存相册中…", dt, perMin)
                     PHPhotoLibrary.requestAuthorization { s in
@@ -400,8 +452,7 @@ final class DenoiseProbeModel: NSObject, ObservableObject {
 
     private enum ExportResult { case success(URL, Double); case failure(String) }
 
-    private static func runExport(url: URL, denoiser: TemporalDenoiser, params: DenoiseParams)
-        -> ExportResult {
+    private static func runExport(url: URL, denoiser: TemporalDenoiser, snap: DenoiseSnapshot) -> ExportResult {
         let asset = AVAsset(url: url)
         guard let track = asset.tracks(withMediaType: .video).first,
               let reader = try? AVAssetReader(asset: asset) else { return .failure("reader 创建失败") }
@@ -431,11 +482,11 @@ final class DenoiseProbeModel: NSObject, ObservableObject {
         while let sb = rout.copyNextSampleBuffer() {
             guard let pb = CMSampleBufferGetImageBuffer(sb) else { continue }
             let pts = CMSampleBufferGetPresentationTimeStamp(sb)
-            var outPB = denoiser.process(pb, params: params)
-            if params.spatialOn {
+            var outPB = denoiser.process(pb, snap: snap)
+            if snap.spatialOn {
                 let f = CIFilter.noiseReduction()
                 f.inputImage = CIImage(cvPixelBuffer: outPB)
-                f.noiseLevel = Float(params.spatialLevel); f.sharpness = 0.4
+                f.noiseLevel = snap.spatialLevel; f.sharpness = 0.4
                 if let img = f.outputImage, let pool = adaptor.pixelBufferPool {
                     var dst: CVPixelBuffer?
                     CVPixelBufferPoolCreatePixelBuffer(nil, pool, &dst)
