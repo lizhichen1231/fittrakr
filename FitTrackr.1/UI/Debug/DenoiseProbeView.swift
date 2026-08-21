@@ -253,6 +253,11 @@ final class TemporalDenoiser {
         if let pool = outPool { CVPixelBufferPoolCreatePixelBuffer(nil, pool, &out) }
         guard let outPB = out, let outTex = metalTexture(outPB),
               let cb = queue.makeCommandBuffer() else { return pb }
+        // 【标签修复】输出补挂输入帧的色彩附件(Primaries/Transfer/Matrix 等)。
+        // 池建的 buffer 无附件 → CI 按 sRGB 误读 709 内容 → 中调 −10% 的"变暗"(【降噪链亮度偏差】卡定量)。
+        if let atts = CVBufferGetAttachments(pb, .shouldPropagate) {
+            CVBufferSetAttachments(outPB, atts, .shouldPropagate)
+        }
 
         let usable = Array(ring.suffix(min(snap.frameCount - 1, 4)))
         var u = KernelUniforms(count: Int32(usable.count), strength: snap.strength,
@@ -491,6 +496,10 @@ final class DenoiseProbeModel: NSObject, ObservableObject {
                     var dst: CVPixelBuffer?
                     CVPixelBufferPoolCreatePixelBuffer(nil, pool, &dst)
                     if let d = dst {
+                        // 【标签修复】同上:CI 目标 buffer 也补挂源附件
+                        if let atts = CVBufferGetAttachments(outPB, .shouldPropagate) {
+                            CVBufferSetAttachments(d, atts, .shouldPropagate)
+                        }
                         ciCtx.render(img.cropped(to: CIImage(cvPixelBuffer: outPB).extent), to: d)
                         outPB = d
                     }
