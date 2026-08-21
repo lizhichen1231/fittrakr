@@ -386,6 +386,7 @@ fileprivate struct TunerSheet: View {
     #if DEBUG
     @State private var tier0Forced = CameraEngine.forceTier0   // 刀1 验收开关的界面态
     @State private var showQualityProbe = false                // 【画质探针·待撤】临时入口
+    @State private var showDenoiseProbe = false                // 【降噪探针·待撤】临时入口
     #endif
 
     var body: some View {
@@ -412,6 +413,11 @@ fileprivate struct TunerSheet: View {
                 // 【画质探针·待撤】临时入口:糙,不进正式 UI,新 UI 开工时随探针整体删除
                 Section(header: Text("🧪 画质探针(临时)")) {
                     Button("打开画质探针(锐化/去噪/对比)") { showQualityProbe = true }
+                }
+
+                // 【降噪探针·待撤】临时入口:时域降噪(Metal 自写核 + 估计对齐)
+                Section(header: Text("🌨 降噪探针(临时)")) {
+                    Button("打开降噪探针(时域/空域)") { showDenoiseProbe = true }
                 }
 
                 // 【贴边卡·四】扫描旋钮对(切档即生效):0.03/0.20 为初值档;扫 {0,0.02,0.04}×{0.10,0.20,0.35}
@@ -533,6 +539,8 @@ fileprivate struct TunerSheet: View {
         #if DEBUG
         // 【画质探针·待撤】全屏探针页,不复用任何现有布局
         .fullScreenCover(isPresented: $showQualityProbe) { QualityProbeView() }
+        // 【降噪探针·待撤】同上
+        .fullScreenCover(isPresented: $showDenoiseProbe) { DenoiseProbeView() }
         #endif
     }
 }
