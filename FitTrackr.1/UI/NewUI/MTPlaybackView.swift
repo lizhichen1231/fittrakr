@@ -102,10 +102,13 @@ struct MTPlaybackView: View {
         let dh = Lp(dh0, H - 56 - 566)
         var x = dx, y = dy, w = dw, h = dh
         if playEff < 0.999 {
-            var sxr: Double = 24
+            // 堆叠端源矩形 =【尺寸tokens】0.60H 高、9:16 宽、水平居中,卡顶 118
+            let cardH0 = 0.60 * H
+            let cardW0 = min(cardH0 * 9.0 / 16.0, W - 48)
+            var sxr: Double = (W - cardW0) / 2
             var syr: Double = 118
-            var swr: Double = W - 48
-            var shr: Double = Double(m.Hd) - 100
+            var swr: Double = cardW0
+            var shr: Double = cardH0
             if pane.g >= 0.5 {
                 let pad: Double = 24
                 let gap: Double = 12

@@ -92,22 +92,25 @@ func mtDeckGeom(i: Int, n: Int, posW: Double, g: Double, scrollY: Double,
     if d > thr { d -= Double(n) }
     var geom = MTCardGeom(x: 0, y: 0, w: 0, h: 0, z: 0, rot: 0, dim: 0, op: 1)
     if g < 0.001 && (d > 3.4 || d < -1.2) { geom.hidden = true; return geom }
-    // 堆叠端【回扫B5 固定值】:前卡左右 24;后卡仅右侧探出 10pt/层、缩小 4%/层、变暗 10%/层
-    let visW = W - 48, Hs = Hd - 100
+    // 堆叠端【尺寸tokens】:卡高 = 屏高×0.60,卡宽 = 卡高×9/16(≤W−48),水平居中;
+    // 后卡规则不变:右探 10pt/层、缩 4%/层、暗 10%/层(相对新尺寸)
+    let cardH0 = 0.60 * (Hd + 118)                 // 屏高 H = Hd + 118
+    let cardW0 = min(cardH0 * 9.0 / 16.0, W - 48)
+    let cx0 = (W - cardW0) / 2
     var rot = 0.0, z = 100.0, op = 1.0
-    var sx = 24.0, sc = 1.0, dim = 0.0
-    if d < 0 { sx = 24 + d * 420; rot = d * 8; z = 110 }
+    var sx = cx0, sc = 1.0, dim = 0.0
+    if d < 0 { sx = cx0 + d * 420; rot = d * 8; z = 110 }
     else {
         let dd = min(d, 4)
         sc = 1 - 0.04 * dd
         dim = min(0.6, 0.10 * dd)
         z = 100 - (dd * 10).rounded()
-        // 右边缘 = 前卡右边(W−24)+ 10pt×层深 → 左端随缩小右移,只露右侧一条边
-        sx = (W - 24 + 10 * dd) - visW * sc
+        // 右边缘 = 前卡右边 + 10pt×层深 → 左端随缩小右移,只露右侧一条边
+        sx = (cx0 + cardW0 + 10 * dd) - cardW0 * sc
     }
     if d > 2.6 { op = max(0, 1 - (d - 2.6) / 0.8) }
-    let sy = Hs * (1 - sc) / 2
-    let sw = visW * sc, sh = Hs * sc
+    let sy = cardH0 * (1 - sc) / 2
+    let sw = cardW0 * sc, sh = cardH0 * sc
     // 网格端【回扫B8 固定值】:两列,左右 24,列距 12,宽高比 3:4
     let pad = 24.0, gap = 12.0
     let colW = (W - pad * 2 - gap) / 2, cardH = (colW * 4.0 / 3.0).rounded()
@@ -208,7 +211,8 @@ struct MTLibraryView: View {
 
     // 【回扫B7】进度条:独立于日期行,底边 = 卡上沿(118)以上 10pt;宽度对齐卡(左右 24)
     private var progressBar: some View {
-        let bw = m.W - 48
+        let cardH0 = 0.60 * Double(m.H)
+        let bw = CGFloat(min(cardH0 * 9.0 / 16.0, Double(m.W) - 48))
         return ZStack(alignment: .leading) {
             Capsule().fill(Color.white.opacity(0.13))
             Capsule()
