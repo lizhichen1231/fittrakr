@@ -10,8 +10,7 @@ import ImageIO
 
 enum MTTint {
     case none
-    case theme      // 深蓝低饱和(设计稿主题背景调色)
-    case card       // saturate(0.72) brightness(0.8)(卡封面/播放器)
+    case card       // saturate(0.72) brightness(0.8)(卡封面/播放器;内容素材调色,非主题图)
 }
 
 final class MTImageStore: ObservableObject {
@@ -61,17 +60,6 @@ final class MTImageStore: ObservableObject {
         guard tint != .none else { return UIImage(cgImage: cg) }
         var img = CIImage(cgImage: cg)
         switch tint {
-        case .theme:
-            // ≈ 设计稿 saturate(.5) sepia(.4) hue-rotate(178°) saturate(1.6) brightness(.48)
-            let c = CIFilter.colorControls()
-            c.inputImage = img; c.saturation = 0.55; c.brightness = -0.02
-            img = c.outputImage ?? img
-            let m = CIFilter.colorMatrix()
-            m.inputImage = img
-            m.rVector = CIVector(x: 0.42, y: 0, z: 0, w: 0)
-            m.gVector = CIVector(x: 0, y: 0.58, z: 0, w: 0)
-            m.bVector = CIVector(x: 0, y: 0, z: 0.82, w: 0)
-            img = m.outputImage ?? img
         case .card:
             let c = CIFilter.colorControls()
             c.inputImage = img; c.saturation = 0.72; c.brightness = -0.055
@@ -98,4 +86,25 @@ struct MTCachedImage: View {
             placeholder
         }
     }
+}
+
+
+/// 【主题图】设计稿成品(Assets "MTThemeBG",烘焙自设计稿 CSS 滤镜链)。
+/// 原样使用;仅当源像素超过屏幕时做一次性降采样(保色彩空间),结果缓存。
+enum MTThemeArt {
+    static let image: UIImage = {
+        guard let src = UIImage(named: "MTThemeBG") else { return UIImage() }
+        let scr = UIScreen.main.bounds.size
+        let maxPix = max(scr.width, scr.height) * UIScreen.main.scale
+        let srcPix = max(src.size.width, src.size.height) * src.scale
+        guard srcPix > maxPix, let data = src.pngData(),
+              let ds = CGImageSourceCreateWithData(data as CFData, nil),
+              let cg = CGImageSourceCreateThumbnailAtIndex(ds, 0, [
+                  kCGImageSourceCreateThumbnailFromImageAlways: true,
+                  kCGImageSourceShouldCacheImmediately: true,
+                  kCGImageSourceThumbnailMaxPixelSize: maxPix,
+              ] as CFDictionary)
+        else { return src }
+        return UIImage(cgImage: cg)
+    }()
 }

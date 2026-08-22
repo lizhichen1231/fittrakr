@@ -4,6 +4,10 @@
 
 import SwiftUI
 import QuartzCore
+import os
+
+// 【吸附确定化】真机日志:log stream --predicate 'subsystem == "com.zhichenli.FitTrackr-1"'
+let mtDeckLog = Logger(subsystem: "com.zhichenli.FitTrackr-1", category: "deck.snap")
 
 // 【掉帧卡·粒度】高频每帧量单独成对象:订阅方精确到"真的每帧要动的视图"。
 // mo.pos 甩动时 BottomBar/DayHeader 不再整屏重建;mo.recT 走表时拍摄页只有 HUD 重建。
@@ -112,7 +116,6 @@ final class MTAppModel: ObservableObject {
     }
 
     // ── tickers(对应设计稿各 raf 槽)──
-    private let deckTicker = MTTicker()     // _raf: decay/snap
     private let gTicker = MTTicker()        // _graf: pane.g morph / 惯性滚动
     private let dialTicker = MTTicker()     // _draf
     private let playTicker = MTTicker()     // _praf: 播放进度
@@ -122,7 +125,7 @@ final class MTAppModel: ObservableObject {
     private let recTicker = MTTicker()      // 录制计时
 
     func stopAll() {
-        [deckTicker, gTicker, dialTicker, playTicker, psTicker, fxTicker, cdTicker, recTicker].forEach { $0.stop() }
+        [gTicker, dialTicker, playTicker, psTicker, fxTicker, cdTicker, recTicker].forEach { $0.stop() }
     }
 
     // ═══ 卡组横滑/竖拉(设计稿 dragStart/Move/End + _runPhysics/_runG/_runScroll)═══
@@ -133,7 +136,7 @@ final class MTAppModel: ObservableObject {
     private var trail = MTTrail()
 
     func deckDown(_ p: CGPoint) {
-        deckTicker.stop(); gTicker.stop()
+        gTicker.stop()
         x0 = p.x; y0 = p.y
         p0 = mo.pos; g0 = pane.g; s0 = pane.scrollY
         drag = true; axis = 0
@@ -157,7 +160,12 @@ final class MTAppModel: ObservableObject {
             } else { pane.g = max(0, min(1, g0 - Double(dy) / 320)); pane.scrollY = 0 }
         }
     }
-    func deckUp() {
+    /// 堆叠卡吸附位(顶层卡 minX;XCUITest 断言同源)
+    var deckSnapX: Double {
+        let cardW = min(0.60 * Double(H) * 9.0 / 16.0, Double(W) - 48)
+        return (Double(W) - cardW) / 2
+    }
+    func deckUp(predicted: CGSize = .zero) {
         guard drag else { return }
         drag = false
         let v = trail.velocity
@@ -177,15 +185,17 @@ final class MTAppModel: ObservableObject {
             return
         }
         if axis == 1 {
-            var vv = Double(-v.x) / 420
-            vv = max(-9, min(9, vv))
-            let moved = mo.pos - p0
-            if abs(vv) > 1.4 { runDecay(vv); return }
-            var target = mo.pos.rounded()
-            if target == p0.rounded(), abs(moved) > 0.16 || abs(vv) > 0.35 {
-                target += (moved != 0 ? moved : vv) > 0 ? 1 : -1
-            }
-            runSnap(target)
+            // 【吸附确定化】唯一收尾路径:predictedEnd 定目标索引 → spring 动画到精确 offset。
+            // 不存在自由停靠:慢拖/快甩/停顿后松手,一律动画到整数索引。
+            let cardW = min(0.60 * Double(H) * 9.0 / 16.0, Double(W) - 48)
+            let thr = cardW * 0.3
+            let pw = Double(predicted.width)
+            let target: Double
+            if pw < -thr { target = floor(mo.pos) + 1 }        // 左甩/左拖过阈 → 下一张
+            else if pw > thr { target = ceil(mo.pos) - 1 }     // 右甩 → 上一张
+            else { target = mo.pos.rounded() }                 // 未过阈 → 回弹最近
+            mtDeckLog.info("deckUp pos=\(self.mo.pos, format: .fixed(precision: 3)) predictedW=\(pw, format: .fixed(precision: 1)) thr=\(thr, format: .fixed(precision: 1)) target=\(Int(target)) snapX=\(self.deckSnapX, format: .fixed(precision: 1))")
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) { mo.pos = target }
         } else if axis == 2 {
             let vy = Double(v.y)
             if pane.g > 0.001 && pane.g < 0.999 {
@@ -193,24 +203,6 @@ final class MTAppModel: ObservableObject {
             } else if pane.g >= 0.999 && abs(vy) > 300 {
                 runScroll(-vy)
             }
-        }
-    }
-    private func runDecay(_ v0: Double) {
-        var v = v0
-        deckTicker.run { [weak self] dt in
-            guard let self else { return false }
-            self.mo.pos += v * dt
-            v *= exp(-3.2 * dt)
-            if abs(v) < 1.2 { self.runSnap((self.mo.pos + v / 3.2).rounded()); return false }
-            return true
-        }
-    }
-    private func runSnap(_ target: Double) {
-        deckTicker.run { [weak self] dt in
-            guard let self else { return false }
-            self.mo.pos += (target - self.mo.pos) * (1 - exp(-11 * dt))
-            if abs(target - self.mo.pos) < 0.002 { self.mo.pos = MT.wrap(target, self.n); return false }
-            return true
         }
     }
     private func runG(_ target: Double) {
@@ -292,7 +284,6 @@ final class MTAppModel: ObservableObject {
         }
     }
     private func applyDial(_ idx: Int) {
-        deckTicker.stop()
         if idx < cats.count {
             let name = cats[idx]
             dayIdx = name == "全部" ? 0 : max(0, days.firstIndex(where: { $0.cat == name }) ?? 0)

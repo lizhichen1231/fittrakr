@@ -11,10 +11,10 @@ struct MTThemeBackground: View {
     var body: some View {
         GeometryReader { geo in
             ZStack {
-                // 【掉帧卡】降采样 + 调色烘焙的缓存位图;此处只动 transform
-                MTCachedImage(url: mtThemeURL, maxPixel: 2000, tint: .theme,
-                              placeholder: Color(red: 0.03, green: 0.05, blue: 0.10))
-                .frame(width: geo.size.width * 1.2, height: geo.size.height * 1.12)
+                // 【主题图】设计稿成品 asset,原样显示;运行时只动 transform
+                Image(uiImage: MTThemeArt.image)
+                    .resizable().scaledToFill()
+                    .frame(width: geo.size.width * 1.2, height: geo.size.height * 1.12)
                 .scaleEffect(1.08)
                 .offset(x: drift ? -geo.size.width * 0.016 : 0, y: drift ? geo.size.height * 0.009 : 0)
                 .position(x: geo.size.width / 2, y: geo.size.height / 2)
@@ -235,6 +235,8 @@ struct MTLibraryView: View {
                                       W: Double(m.W), Hd: Double(m.Hd))
                 if !geom.hidden {
                     card(clip: clips[i], geom: geom, g: g)
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityIdentifier(i == Int(MT.wrap(mo.pos.rounded(), m.n)) ? "deck.card.top" : "deck.card.\(i)")
                 }
             }
         }
@@ -248,7 +250,7 @@ struct MTLibraryView: View {
                     if !deckBegan { deckBegan = true; m.deckDown(v.startLocation) }
                     m.deckMove(v.location)
                 }
-                .onEnded { _ in deckBegan = false; m.deckUp() }
+                .onEnded { v in deckBegan = false; m.deckUp(predicted: v.predictedEndTranslation) }
         )
     }
 

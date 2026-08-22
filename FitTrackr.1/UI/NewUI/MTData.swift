@@ -136,5 +136,5 @@ func mtCapParams() -> [MTCapParam] {
 
 func mtCapDefaults() -> [Int] { [0, 0, 2, 0, 0, 0] }
 
-/// 主题背景图(素材库/设置/回看/拍摄预览共用,设计稿 picsum id/1018)
-let mtThemeURL = URL(string: "https://picsum.photos/id/1018/1080/1920")
+// 主题背景:设计稿成品图(源图×设计稿 CSS 滤镜,离线烘焙)已入 Assets("MTThemeBG")。
+// 运行时零下载零调色;仅当源大于屏幕像素时做一次性降采样(见 MTThemeArt)。

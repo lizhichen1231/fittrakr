@@ -104,8 +104,8 @@ struct MTCaptureView: View {
         let hue: Double = [0, -6, -14, 12][wb]
         let sat: Double = [1, 1.08, 1.12, 0.92][wb]
         return GeometryReader { geo in
-            MTCachedImage(url: mtThemeURL, maxPixel: 2000, tint: .none,
-                          placeholder: Color(red: 0.02, green: 0.03, blue: 0.05))
+            Image(uiImage: MTThemeArt.image)
+                .resizable().scaledToFill()
                 .saturation(0.72 * sat)
                 .hueRotation(.degrees(hue))
                 .brightness((ev - 1) * 0.35 - 0.06)
