@@ -128,81 +128,47 @@ final class MTAppModel: ObservableObject {
         [gTicker, dialTicker, playTicker, psTicker, fxTicker, cdTicker, recTicker].forEach { $0.stop() }
     }
 
-    // ═══ 卡组横滑/竖拉(设计稿 dragStart/Move/End + _runPhysics/_runG/_runScroll)═══
-    private var drag = false
-    private var axis: Int = 0               // 0 未定 1 x 2 y 3 none
-    private var x0: CGFloat = 0, y0: CGFloat = 0
-    private var p0: Double = 0, g0: Double = 0, s0: Double = 0
-    private var trail = MTTrail()
+    // ═══ 卡组(横向物理 = UIScrollView,见 MTDeckScroll;此处只剩 tap / 竖拉 / 复位)═══
+    private var g0: Double = 0, s0: Double = 0
+    var deckResetTick = 0                   // applyDial 等复位 → scrollView 归位信号
 
-    func deckDown(_ p: CGPoint) {
-        gTicker.stop()
-        x0 = p.x; y0 = p.y
-        p0 = mo.pos; g0 = pane.g; s0 = pane.scrollY
-        drag = true; axis = 0
-        trail.reset(p)
-    }
-    func deckMove(_ p: CGPoint) {
-        guard drag else { return }
-        trail.push(p)
-        let dx = p.x - x0, dy = p.y - y0
-        if axis == 0 {
-            if max(abs(dx), abs(dy)) < 7 { return }
-            axis = abs(dx) > abs(dy) ? 1 : 2
-            if axis == 1 && g0 > 0 { axis = 3 }
-        }
-        if axis == 1 { mo.pos = p0 - Double(dx) / 420 }
-        else if axis == 2 {
-            if g0 >= 1 {
-                let s = s0 - Double(dy)
-                if s < 0 { pane.g = max(0, 1 + s / 320); pane.scrollY = 0 }
-                else { pane.scrollY = min(maxScroll, s); pane.g = 1 }
-            } else { pane.g = max(0, min(1, g0 - Double(dy) / 320)); pane.scrollY = 0 }
-        }
-    }
     /// 堆叠卡吸附位(顶层卡 minX;XCUITest 断言同源)
     var deckSnapX: Double {
         let cardW = min(0.60 * Double(H) * 9.0 / 16.0, Double(W) - 48)
         return (Double(W) - cardW) / 2
     }
-    func deckUp(predicted: CGSize = .zero) {
-        guard drag else { return }
-        drag = false
-        let v = trail.velocity
-        if axis == 0 {  // 轻点:打开单条回看(设计稿网格命中公式)
-            if pane.g < 0.5 { openPlay(Int(MT.wrap(mo.pos.rounded(), n))) }
-            else if pane.g >= 0.999 {
-                let relX = Double(x0), relY = Double(y0) + pane.scrollY
-                let pad = 24.0, gap = 12.0
-                let colW = (Double(W) - pad * 2 - gap) / 2
-                let cardH = (colW * 4.0 / 3.0).rounded()
-                let col = relX < pad + colW ? 0 : (relX > pad + colW + gap ? 1 : -1)
-                let row = Int(floor((relY - 72) / (cardH + gap)))
-                let i = row * 2 + col
-                if col >= 0, row >= 0, i < n,
-                   (relY - 72).truncatingRemainder(dividingBy: cardH + gap) <= cardH { openPlay(i) }
-            }
-            return
+    /// 点击(scrollView 的 tap 识别器回调;p 为视口坐标)
+    func deckTap(_ p: CGPoint) {
+        if pane.g < 0.5 { openPlay(Int(MT.wrap(mo.pos.rounded(), n))) }
+        else if pane.g >= 0.999 {
+            let relX = Double(p.x), relY = Double(p.y) + pane.scrollY
+            let pad = 24.0, gap = 12.0
+            let colW = (Double(W) - pad * 2 - gap) / 2
+            let cardH = (colW * 4.0 / 3.0).rounded()
+            let col = relX < pad + colW ? 0 : (relX > pad + colW + gap ? 1 : -1)
+            let row = Int(floor((relY - 72) / (cardH + gap)))
+            let i = row * 2 + col
+            if col >= 0, row >= 0, i < n,
+               (relY - 72).truncatingRemainder(dividingBy: cardH + gap) <= cardH { openPlay(i) }
         }
-        if axis == 1 {
-            // 【吸附确定化】唯一收尾路径:predictedEnd 定目标索引 → spring 动画到精确 offset。
-            // 不存在自由停靠:慢拖/快甩/停顿后松手,一律动画到整数索引。
-            let cardW = min(0.60 * Double(H) * 9.0 / 16.0, Double(W) - 48)
-            let thr = cardW * 0.3
-            let pw = Double(predicted.width)
-            let target: Double
-            if pw < -thr { target = floor(mo.pos) + 1 }        // 左甩/左拖过阈 → 下一张
-            else if pw > thr { target = ceil(mo.pos) - 1 }     // 右甩 → 上一张
-            else { target = mo.pos.rounded() }                 // 未过阈 → 回弹最近
-            mtDeckLog.info("deckUp pos=\(self.mo.pos, format: .fixed(precision: 3)) predictedW=\(pw, format: .fixed(precision: 1)) thr=\(thr, format: .fixed(precision: 1)) target=\(Int(target)) snapX=\(self.deckSnapX, format: .fixed(precision: 1))")
-            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) { mo.pos = target }
-        } else if axis == 2 {
-            let vy = Double(v.y)
-            if pane.g > 0.001 && pane.g < 0.999 {
-                runG(vy < -350 ? 1 : vy > 350 ? 0 : (pane.g > 0.5 ? 1 : 0))
-            } else if pane.g >= 0.999 && abs(vy) > 300 {
-                runScroll(-vy)
-            }
+    }
+    /// 竖拉三段(独立识别器,方向仲裁后才会进来)
+    func vertBegan() {
+        gTicker.stop()
+        g0 = pane.g; s0 = pane.scrollY
+    }
+    func vertChanged(dy: Double) {
+        if g0 >= 1 {
+            let s = s0 - dy
+            if s < 0 { pane.g = max(0, 1 + s / 320); pane.scrollY = 0 }
+            else { pane.scrollY = min(maxScroll, s); pane.g = 1 }
+        } else { pane.g = max(0, min(1, g0 - dy / 320)); pane.scrollY = 0 }
+    }
+    func vertEnded(vy: Double) {
+        if pane.g > 0.001 && pane.g < 0.999 {
+            runG(vy < -350 ? 1 : vy > 350 ? 0 : (pane.g > 0.5 ? 1 : 0))
+        } else if pane.g >= 0.999 && abs(vy) > 300 {
+            runScroll(-vy)
         }
     }
     private func runG(_ target: Double) {
@@ -284,6 +250,7 @@ final class MTAppModel: ObservableObject {
         }
     }
     private func applyDial(_ idx: Int) {
+        deckResetTick += 1
         if idx < cats.count {
             let name = cats[idx]
             dayIdx = name == "全部" ? 0 : max(0, days.firstIndex(where: { $0.cat == name }) ?? 0)

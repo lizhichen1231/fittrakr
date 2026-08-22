@@ -140,7 +140,6 @@ struct MTLibraryView: View {
     @ObservedObject var m: MTAppModel
     @ObservedObject var mo: MTMotion
     @ObservedObject var pane: MTPane
-    @State private var deckBegan = false
 
     var body: some View {
         let g = pane.g
@@ -237,21 +236,13 @@ struct MTLibraryView: View {
                     card(clip: clips[i], geom: geom, g: g)
                         .accessibilityElement(children: .ignore)
                         .accessibilityIdentifier(i == Int(MT.wrap(mo.pos.rounded(), m.n)) ? "deck.card.top" : "deck.card.\(i)")
+                        .accessibilityLabel("\(i)")   // 测试读顶卡索引(前进张数断言)
                 }
             }
         }
         .mask(deckMask(g: g))
-        .contentShape(Rectangle())
-        .gesture(
-            DragGesture(minimumDistance: 0, coordinateSpace: .local)
-                .onChanged { v in
-                    // 【回扫A2】began 标志:首个 onChanged 的 translation 常已非零,
-                    // 旧判定会漏掉 down → up 被 guard → 松手不吸附
-                    if !deckBegan { deckBegan = true; m.deckDown(v.startLocation) }
-                    m.deckMove(v.location)
-                }
-                .onEnded { v in deckBegan = false; m.deckUp(predicted: v.predictedEndTranslation) }
-        )
+        .allowsHitTesting(false)   // 渲染层不吃 touch;手势全在下方 scrollView 物理层
+        .background(MTDeckScroll(m: m, pane: pane))
     }
 
     @ViewBuilder private func deckMask(g: Double) -> some View {
