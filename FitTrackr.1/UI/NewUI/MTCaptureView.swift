@@ -103,12 +103,14 @@ struct MTCaptureView: View {
         let wb = m.capSelOf(1)
         let hue: Double = [0, -6, -14, 12][wb]
         let sat: Double = [1, 1.08, 1.12, 0.92][wb]
+        let b = 0.85 * ev   // 设计稿 brightness(0.85·ev),乘法
         return GeometryReader { geo in
             Image(uiImage: MTThemeArt.image)
                 .resizable().scaledToFill()
                 .saturation(0.72 * sat)
                 .hueRotation(.degrees(hue))
-                .brightness((ev - 1) * 0.35 - 0.06)
+                .overlay(Color.black.opacity(b < 1 ? 1 - b : 0))      // ≤1:精确乘法
+                .brightness(b > 1 ? (b - 1) * 0.5 : 0)                // >1:无乘法对应,轻加法近似
                 .frame(width: geo.size.width, height: geo.size.height)
                 .clipped()
         }

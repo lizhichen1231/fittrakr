@@ -1,29 +1,23 @@
-// 【新 UI·性能】图片管线 —— 下载一次 → 降采样到目标像素 → 调色烘焙 → 缓存 UIImage。
-// 运行时只渲染现成位图(禁每帧滤镜/重解码;视差与漂移只动 transform)。
-// 掉帧排查卡:主题图与卡片封面的每帧 saturation/colorMultiply 滤镜链是嫌疑项,烘焙后归零。
+// 【新 UI·性能】图片管线 —— 下载一次 → 降采样到目标像素 → 缓存 UIImage。色彩原样。
+// 【色差卡】CoreImage 调色已全删:CI 在线性空间做 saturation/brightness,与 CSS 的
+// 非线性 sRGB 域数学不同 → 更亮更鲜艳的塑料感。设计稿滤镜改在 SwiftUI 层按数值实现
+// (saturation 矩阵同 Rec.709;brightness 乘法用黑 overlay),见各使用处。
+// 解码一律钉死 sRGB(不许按 P3 拉伸)。
 
 import SwiftUI
 import UIKit
-import CoreImage
-import CoreImage.CIFilterBuiltins
 import ImageIO
-
-enum MTTint {
-    case none
-    case card       // saturate(0.72) brightness(0.8)(卡封面/播放器;内容素材调色,非主题图)
-}
 
 final class MTImageStore: ObservableObject {
     static let shared = MTImageStore()
     private var cache: [String: UIImage] = [:]        // 主线程读写
     private var inflight = Set<String>()
-    private let ciCtx = CIContext(options: [.cacheIntermediates: false])
     private let workQ = DispatchQueue(label: "mt.imagestore", qos: .userInitiated)
     @Published private var generation = 0             // 新图就绪 → 观察方轻量重算
 
-    func image(_ url: URL?, maxPixel: CGFloat, tint: MTTint) -> UIImage? {
+    func image(_ url: URL?, maxPixel: CGFloat) -> UIImage? {
         guard let url else { return nil }
-        let key = url.absoluteString + "|\(Int(maxPixel))|\(tint)"
+        let key = url.absoluteString + "|\(Int(maxPixel))"
         if let hit = cache[key] { return hit }
         guard !inflight.contains(key) else { return nil }
         inflight.insert(key)
@@ -32,7 +26,7 @@ final class MTImageStore: ObservableObject {
             var out: UIImage? = nil
             if let data = try? Data(contentsOf: url),
                let down = Self.downsample(data: data, maxPixel: maxPixel) {
-                out = self.bake(down, tint: tint)
+                out = UIImage(cgImage: Self.forceSRGB(down))
             }
             DispatchQueue.main.async {
                 self.inflight.remove(key)
@@ -55,19 +49,16 @@ final class MTImageStore: ObservableObject {
         return CGImageSourceCreateThumbnailAtIndex(src, 0, opts)
     }
 
-    /// 调色一次性烘焙(替代运行时 SwiftUI 滤镜链)
-    private func bake(_ cg: CGImage, tint: MTTint) -> UIImage {
-        guard tint != .none else { return UIImage(cgImage: cg) }
-        var img = CIImage(cgImage: cg)
-        switch tint {
-        case .card:
-            let c = CIFilter.colorControls()
-            c.inputImage = img; c.saturation = 0.72; c.brightness = -0.055
-            img = c.outputImage ?? img
-        case .none: break
-        }
-        guard let out = ciCtx.createCGImage(img, from: img.extent) else { return UIImage(cgImage: cg) }
-        return UIImage(cgImage: out)
+    /// 【色差卡3】钉死 sRGB:非 sRGB 空间(如 P3)的解码结果重绘进 sRGB 上下文
+    private static func forceSRGB(_ cg: CGImage) -> CGImage {
+        let srgb = CGColorSpace(name: CGColorSpace.sRGB)!
+        if let cs = cg.colorSpace, cs.name == CGColorSpace.sRGB { return cg }
+        guard let ctx = CGContext(data: nil, width: cg.width, height: cg.height,
+                                  bitsPerComponent: 8, bytesPerRow: 0, space: srgb,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return cg }
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: cg.width, height: cg.height))
+        return ctx.makeImage() ?? cg
     }
 }
 
@@ -76,11 +67,10 @@ struct MTCachedImage: View {
     @ObservedObject private var store = MTImageStore.shared
     let url: URL?
     let maxPixel: CGFloat
-    let tint: MTTint
     var placeholder = Color(red: 0.078, green: 0.078, blue: 0.078)
 
     var body: some View {
-        if let ui = store.image(url, maxPixel: maxPixel, tint: tint) {
+        if let ui = store.image(url, maxPixel: maxPixel) {
             Image(uiImage: ui).resizable().scaledToFill()
         } else {
             placeholder

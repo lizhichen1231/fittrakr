@@ -265,7 +265,11 @@ struct MTLibraryView: View {
         return ZStack(alignment: .bottomTrailing) {
             RoundedRectangle(cornerRadius: 18)
                 .fill(Color(red: 0.078, green: 0.078, blue: 0.078))
-            MTCachedImage(url: clip.imgURL, maxPixel: 750, tint: .card)
+            // 设计稿卡封面 filter: saturate(0.72) brightness(0.8)——
+            // brightness 是乘法,SwiftUI 用黑 20% overlay 精确等价;色彩管线零调色
+            MTCachedImage(url: clip.imgURL, maxPixel: 750)
+                .saturation(0.72)
+                .overlay(Color.black.opacity(0.2))
                 .frame(width: geom.w, height: geom.h)
                 .clipped()
             LinearGradient(colors: [.black.opacity(0.45), .clear], startPoint: .bottom, endPoint: UnitPoint(x: 0.5, y: 0.66))
