@@ -6,11 +6,13 @@ import SwiftUI
 
 struct MTPlaybackView: View {
     @ObservedObject var m: MTAppModel
+    @ObservedObject var mo: MTMotion
+    @ObservedObject var pane: MTPane
 
     var body: some View {
         let playIdx = min(m.playIdx ?? 0, m.n - 1)
         let clip = m.clips[playIdx]
-        let ps = m.ps
+        let ps = mo.ps
         let playEff = m.playEff
         let uiOp = m.tagPickOpen ? 0.0 : 1.0
         let Lp: (Double, Double) -> Double = { a, b in a + (b - a) * ps }
@@ -96,13 +98,13 @@ struct MTPlaybackView: View {
             var syr: Double = 118
             var swr: Double = W - 64
             var shr: Double = Double(m.Hd) - 100
-            if m.g >= 0.5 {
+            if pane.g >= 0.5 {
                 let pad: Double = 20
                 let gap: Double = 12
                 let colW: Double = (W - pad * 2 - gap) / 2
                 let cardH: Double = (colW * 1.45).rounded()
                 sxr = pad + Double(playIdx % 2) * (colW + gap)
-                syr = 190.0 + Double(playIdx / 2) * (cardH + gap) - m.scrollY
+                syr = 190.0 + Double(playIdx / 2) * (cardH + gap) - pane.scrollY
                 swr = colW
                 shr = cardH
             }
@@ -112,7 +114,7 @@ struct MTPlaybackView: View {
             w = swr + (dw - swr) * q
             h = shr + (dh - shr) * q
         }
-        let cs = Int((m.playT * Double(clip.secs)).rounded())
+        let cs = Int((mo.playT * Double(clip.secs)).rounded())
         let mm: Int = cs / 60
         let sSec: String = String(format: "%02d", cs % 60)
         let clock: String = "\(mm):\(sSec) / \(clip.dur)"
@@ -125,15 +127,9 @@ struct MTPlaybackView: View {
     }
 
     private func clipImage(_ clip: MTClip, w: CGFloat, h: CGFloat) -> some View {
-        AsyncImage(url: clip.imgURL) { img in
-            img.resizable().scaledToFill()
-        } placeholder: {
-            Color(red: 0.078, green: 0.078, blue: 0.078)
-        }
-        .saturation(0.72)
-        .brightness(-0.1)
-        .frame(width: w, height: h)
-        .clipped()
+        MTCachedImage(url: clip.imgURL, maxPixel: 1300, tint: .card)
+            .frame(width: w, height: h)
+            .clipped()
     }
 
     private func playerBody(clip: MTClip, clock: String, w: CGFloat, h: CGFloat) -> some View {
@@ -159,7 +155,7 @@ struct MTPlaybackView: View {
     private func readout(clip: MTClip) -> String {
         var acc = 0.0
         for sg in clip.parts {
-            if m.playT < acc + sg.frac {
+            if mo.playT < acc + sg.frac {
                 switch sg.kind {
                 case .gap: return "跟丢"
                 case .dark: return "未跟到"
@@ -180,7 +176,7 @@ struct MTPlaybackView: View {
                 Rectangle()
                     .fill(Color.white.opacity(0.85))
                     .frame(width: 1, height: 18)
-                    .offset(x: geo.size.width * CGFloat(m.playT) - 0.5, y: 3)
+                    .offset(x: geo.size.width * CGFloat(mo.playT) - 0.5, y: 3)
             }
             .contentShape(Rectangle())
             .highPriorityGesture(
@@ -195,8 +191,8 @@ struct MTPlaybackView: View {
         // 当前时刻参数(随 playT 联动)+ 全片汇总(设计稿公式)
         var zmCur = 1.0, acc = 0.0
         var stateCur = MTSegKind.lit
-        for sg in clip.parts { if m.playT < acc + sg.frac { zmCur = sg.zoom; stateCur = sg.kind; break }; acc += sg.frac }
-        let tick = Int(m.playT * 12)
+        for sg in clip.parts { if mo.playT < acc + sg.frac { zmCur = sg.zoom; stateCur = sg.kind; break }; acc += sg.frac }
+        let tick = Int(mo.playT * 12)
         let iso = [100, 125, 160, 200, 250, 320][(playIdx * 5 + tick * 3) % 6]
         let wb = [4800, 5000, 5200, 5400, 5600][(playIdx * 3 + tick) % 5]
         let ev = ["-0.3", "0.0", "+0.3", "+0.7"][(playIdx + tick * 2) % 4]
@@ -210,7 +206,7 @@ struct MTPlaybackView: View {
                 prevZ = sg.zoom
             }
         }
-        let cs = Int((m.playT * Double(clip.secs)).rounded())
+        let cs = Int((mo.playT * Double(clip.secs)).rounded())
         let gapDash = stateCur == .gap
         let summary = "\(cs / 60):" + String(format: "%02d", cs % 60) + " · "
             + (stateCur == .gap ? "跟丢" : stateCur == .dark ? "未跟到" : String(format: "%.1fx · 跟着", zmCur))
@@ -248,6 +244,7 @@ struct MTPlaybackView: View {
             row("大小 · 拍摄时间 · 导出", String(format: "%.1f GB · %@ 16:42 · 未导出", Double(clip.secs) * 0.055, m.day.d))
         }
         .foregroundColor(.white)
+        .drawingGroup()
     }
 
     // 轻量标签选择:文字压画面 + 左下羽化糊

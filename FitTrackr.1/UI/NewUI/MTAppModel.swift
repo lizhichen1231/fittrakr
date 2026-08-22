@@ -5,25 +5,45 @@
 import SwiftUI
 import QuartzCore
 
-final class MTAppModel: ObservableObject {
-
-    // ── 素材库 ──
+// 【掉帧卡·粒度】高频每帧量单独成对象:订阅方精确到"真的每帧要动的视图"。
+// mo.pos 甩动时 BottomBar/DayHeader 不再整屏重建;mo.recT 走表时拍摄页只有 HUD 重建。
+final class MTMotion: ObservableObject {
     @Published var pos: Double = 0          // 卡组位置(浮点,张)
-    @Published var dayIdx = 0
+    @Published var dialPos: Double = 0
+    @Published var playT: Double = 0
+    @Published var playFx: Double = 1
+    @Published var ps: Double = 0
+    @Published var capFx: Double = 1
+    @Published var capDialPos: Double = 0
+    @Published var capValPos: Double = 0
+    @Published var recT: Double = 0
+    // 录制中模拟:倍率连续变化 + 跟踪状态周期(设计稿公式)
+    var recZ: Double { max(1, min(3, 1.6 + 0.9 * sin(recT * 0.35) + 0.4 * sin(recT * 0.13))) }
+    var recState: String {
+        let ph = recT.truncatingRemainder(dividingBy: 19)
+        return ph < 15 ? "锁定" : ph < 17 ? "搜索中" : "未锁定"
+    }
+}
+/// 竖拉/收拢(仅竖向手势期间高频)
+final class MTPane: ObservableObject {
     @Published var g: Double = 0            // 0=堆叠 1=网格
     @Published var scrollY: Double = 0
+}
+
+final class MTAppModel: ObservableObject {
+    let mo = MTMotion()
+    let pane = MTPane()
+
+    // ── 素材库 ──
+    @Published var dayIdx = 0
     // ── 转盘(日期/分类)──
     @Published var dialOpen = false
     @Published var dialIn = false           // 入/出场 stagger 标志(SwiftUI 动画驱动)
-    @Published var dialPos: Double = 0
     var dial0: Double = 0                   // 打开时的位置(背景视差 delta 用)
     // ── 单条回看 ──
     @Published var playIdx: Int? = nil
-    @Published var playT: Double = 0
     @Published var playing = true
-    @Published var playFx: Double = 1       // 转场原始进度 0→1
     @Published var playFxMode: Int = 0      // 1=in -1=out 0=稳态
-    @Published var ps: Double = 0           // 统计层进度
     @Published var tagPickOpen = false
     @Published var tagIn = false
     @Published var tagNewOpen = false
@@ -38,10 +58,8 @@ final class MTAppModel: ObservableObject {
     var setPickRowFrame: CGRect = .zero     // 触发行捕获帧(root 空间)
     // ── 拍摄 ──
     @Published var capOpen = false
-    @Published var capFx: Double = 1
     @Published var capFxMode: Int = 0
     @Published var recOn = false
-    @Published var recT: Double = 0
     @Published var capCat = "力量训练"
     @Published var capTagOpen = false
     @Published var capTagIn = false
@@ -49,8 +67,6 @@ final class MTAppModel: ObservableObject {
     @Published var capFps = 60
     @Published var capDialOpen = false
     @Published var capDialIn = false
-    @Published var capDialPos: Double = 0
-    @Published var capValPos: Double = 0
     @Published var capSel: [Int: Int] = [:]
     @Published var cdActive: Int = 0        // 0 无 1 横 2 竖(拖动中浮出刻度)
 
@@ -81,27 +97,27 @@ final class MTAppModel: ObservableObject {
     var playEff: Double {
         guard playIdx != nil else { return 0 }
         switch playFxMode {
-        case 1: return MT.eob(playFx, c1: 0.6)
-        case -1: return 1 - MT.eob(playFx, c1: 0.6)
+        case 1: return MT.eob(mo.playFx, c1: 0.6)
+        case -1: return 1 - MT.eob(mo.playFx, c1: 0.6)
         default: return 1
         }
     }
     var capEff: Double {
         guard capOpen else { return 0 }
         switch capFxMode {
-        case 1: return capFx
-        case -1: return 1 - capFx
+        case 1: return mo.capFx
+        case -1: return 1 - mo.capFx
         default: return 1
         }
     }
 
     // ── tickers(对应设计稿各 raf 槽)──
     private let deckTicker = MTTicker()     // _raf: decay/snap
-    private let gTicker = MTTicker()        // _graf: g morph / 惯性滚动
+    private let gTicker = MTTicker()        // _graf: pane.g morph / 惯性滚动
     private let dialTicker = MTTicker()     // _draf
     private let playTicker = MTTicker()     // _praf: 播放进度
     private let psTicker = MTTicker()       // _psraf
-    private let fxTicker = MTTicker()       // playFx / capFx 转场进度
+    private let fxTicker = MTTicker()       // mo.playFx / mo.capFx 转场进度
     private let cdTicker = MTTicker()       // _cdraf: 参数盘 snap
     private let recTicker = MTTicker()      // 录制计时
 
@@ -119,7 +135,7 @@ final class MTAppModel: ObservableObject {
     func deckDown(_ p: CGPoint) {
         deckTicker.stop(); gTicker.stop()
         x0 = p.x; y0 = p.y
-        p0 = pos; g0 = g; s0 = scrollY
+        p0 = mo.pos; g0 = pane.g; s0 = pane.scrollY
         drag = true; axis = 0
         trail.reset(p)
     }
@@ -132,13 +148,13 @@ final class MTAppModel: ObservableObject {
             axis = abs(dx) > abs(dy) ? 1 : 2
             if axis == 1 && g0 > 0 { axis = 3 }
         }
-        if axis == 1 { pos = p0 - Double(dx) / 420 }
+        if axis == 1 { mo.pos = p0 - Double(dx) / 420 }
         else if axis == 2 {
             if g0 >= 1 {
                 let s = s0 - Double(dy)
-                if s < 0 { g = max(0, 1 + s / 320); scrollY = 0 }
-                else { scrollY = min(maxScroll, s); g = 1 }
-            } else { g = max(0, min(1, g0 - Double(dy) / 320)); scrollY = 0 }
+                if s < 0 { pane.g = max(0, 1 + s / 320); pane.scrollY = 0 }
+                else { pane.scrollY = min(maxScroll, s); pane.g = 1 }
+            } else { pane.g = max(0, min(1, g0 - Double(dy) / 320)); pane.scrollY = 0 }
         }
     }
     func deckUp() {
@@ -146,9 +162,9 @@ final class MTAppModel: ObservableObject {
         drag = false
         let v = trail.velocity
         if axis == 0 {  // 轻点:打开单条回看(设计稿网格命中公式)
-            if g < 0.5 { openPlay(Int(MT.wrap(pos.rounded(), n))) }
-            else if g >= 0.999 {
-                let relX = Double(x0), relY = Double(y0) + scrollY
+            if pane.g < 0.5 { openPlay(Int(MT.wrap(mo.pos.rounded(), n))) }
+            else if pane.g >= 0.999 {
+                let relX = Double(x0), relY = Double(y0) + pane.scrollY
                 let pad = 20.0, gap = 12.0
                 let colW = (Double(W) - pad * 2 - gap) / 2
                 let cardH = (colW * 1.45).rounded()
@@ -163,18 +179,18 @@ final class MTAppModel: ObservableObject {
         if axis == 1 {
             var vv = Double(-v.x) / 420
             vv = max(-9, min(9, vv))
-            let moved = pos - p0
+            let moved = mo.pos - p0
             if abs(vv) > 1.4 { runDecay(vv); return }
-            var target = pos.rounded()
+            var target = mo.pos.rounded()
             if target == p0.rounded(), abs(moved) > 0.16 || abs(vv) > 0.35 {
                 target += (moved != 0 ? moved : vv) > 0 ? 1 : -1
             }
             runSnap(target)
         } else if axis == 2 {
             let vy = Double(v.y)
-            if g > 0.001 && g < 0.999 {
-                runG(vy < -350 ? 1 : vy > 350 ? 0 : (g > 0.5 ? 1 : 0))
-            } else if g >= 0.999 && abs(vy) > 300 {
+            if pane.g > 0.001 && pane.g < 0.999 {
+                runG(vy < -350 ? 1 : vy > 350 ? 0 : (pane.g > 0.5 ? 1 : 0))
+            } else if pane.g >= 0.999 && abs(vy) > 300 {
                 runScroll(-vy)
             }
         }
@@ -183,27 +199,27 @@ final class MTAppModel: ObservableObject {
         var v = v0
         deckTicker.run { [weak self] dt in
             guard let self else { return false }
-            self.pos += v * dt
+            self.mo.pos += v * dt
             v *= exp(-3.2 * dt)
-            if abs(v) < 1.2 { self.runSnap((self.pos + v / 3.2).rounded()); return false }
+            if abs(v) < 1.2 { self.runSnap((self.mo.pos + v / 3.2).rounded()); return false }
             return true
         }
     }
     private func runSnap(_ target: Double) {
         deckTicker.run { [weak self] dt in
             guard let self else { return false }
-            self.pos += (target - self.pos) * (1 - exp(-11 * dt))
-            if abs(target - self.pos) < 0.002 { self.pos = MT.wrap(target, self.n); return false }
+            self.mo.pos += (target - self.mo.pos) * (1 - exp(-11 * dt))
+            if abs(target - self.mo.pos) < 0.002 { self.mo.pos = MT.wrap(target, self.n); return false }
             return true
         }
     }
     private func runG(_ target: Double) {
         gTicker.run { [weak self] dt in
             guard let self else { return false }
-            self.g += (target - self.g) * (1 - exp(-10 * dt))
-            if abs(target - self.g) < 0.004 {
-                self.g = target
-                if target == 0 { self.scrollY = 0 }
+            self.pane.g += (target - self.pane.g) * (1 - exp(-10 * dt))
+            if abs(target - self.pane.g) < 0.004 {
+                self.pane.g = target
+                if target == 0 { self.pane.scrollY = 0 }
                 return false
             }
             return true
@@ -213,10 +229,10 @@ final class MTAppModel: ObservableObject {
         var sv = v0
         gTicker.run { [weak self] dt in
             guard let self else { return false }
-            var s = self.scrollY + sv * dt
+            var s = self.pane.scrollY + sv * dt
             sv *= exp(-3.4 * dt)
             if s < 0 || s > self.maxScroll { s = max(0, min(self.maxScroll, s)); sv = 0 }
-            self.scrollY = s
+            self.pane.scrollY = s
             return abs(sv) >= 24
         }
     }
@@ -232,7 +248,7 @@ final class MTAppModel: ObservableObject {
         dialTicker.stop()
         let cur = Double(cats.count + dayIdx)
         dial0 = cur
-        dialPos = cur
+        mo.dialPos = cur
         dialOpen = true
         dialIn = false
         withAnimation(.easeOut(duration: 0.24)) { dialIn = true }
@@ -246,7 +262,7 @@ final class MTAppModel: ObservableObject {
     }
     func dialDown(_ p: CGPoint) {
         dialTicker.stop()
-        dy0 = p.y; dp0 = dialPos; ddrag = true; dMoved = false
+        dy0 = p.y; dp0 = mo.dialPos; ddrag = true; dMoved = false
         dTrail.reset(p)
     }
     func dialMove(_ p: CGPoint) {
@@ -254,7 +270,7 @@ final class MTAppModel: ObservableObject {
         dTrail.push(p)
         let dp = Double(dy0 - p.y) / 54
         if abs(dp) > 0.05 { dMoved = true }
-        dialPos = max(-0.4, min(Double(nItems) - 0.6, dp0 + dp))
+        mo.dialPos = max(-0.4, min(Double(nItems) - 0.6, dp0 + dp))
     }
     func dialUp() {
         guard ddrag else { return }
@@ -262,13 +278,13 @@ final class MTAppModel: ObservableObject {
         if !dMoved { closeDial(); return }
         var v = Double(-dTrail.velocity.y) / 54
         v = max(-14, min(14, v))
-        var target = (dialPos + v / 5).rounded()
+        var target = (mo.dialPos + v / 5).rounded()
         target = max(0, min(Double(nItems - 1), target))
         dialTicker.run { [weak self] dt in
             guard let self else { return false }
-            self.dialPos += (target - self.dialPos) * (1 - exp(-10 * dt))
-            if abs(target - self.dialPos) < 0.004 {
-                self.dialPos = target
+            self.mo.dialPos += (target - self.mo.dialPos) * (1 - exp(-10 * dt))
+            if abs(target - self.mo.dialPos) < 0.004 {
+                self.mo.dialPos = target
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) { self.applyDial(Int(target)) }
                 return false
             }
@@ -281,22 +297,22 @@ final class MTAppModel: ObservableObject {
             let name = cats[idx]
             dayIdx = name == "全部" ? 0 : max(0, days.firstIndex(where: { $0.cat == name }) ?? 0)
         } else { dayIdx = idx - cats.count }
-        pos = 0; scrollY = 0
+        mo.pos = 0; pane.scrollY = 0
         closeDial()
     }
 
     // ═══ 单条回看 ═══
     func openPlay(_ i: Int) {
-        playIdx = i; playT = 0; playing = true; ps = 0
-        playFxMode = 1; playFx = 0
-        runFx(duration: 0.42) { [weak self] t in self?.playFx = t } done: { [weak self] in self?.playFxMode = 0 }
+        playIdx = i; mo.playT = 0; playing = true; mo.ps = 0
+        playFxMode = 1; mo.playFx = 0
+        runFx(duration: 0.42) { [weak self] t in self?.mo.playFx = t } done: { [weak self] in self?.playFxMode = 0 }
         runPlayLoop()
     }
     func closePlay() {
         psTicker.stop()
-        ps = 0
-        playFxMode = -1; playFx = 0
-        runFx(duration: 0.42) { [weak self] t in self?.playFx = t } done: { [weak self] in
+        mo.ps = 0
+        playFxMode = -1; mo.playFx = 0
+        runFx(duration: 0.42) { [weak self] t in self?.mo.playFx = t } done: { [weak self] in
             self?.playTicker.stop()
             self?.playIdx = nil; self?.playFxMode = 0
         }
@@ -316,9 +332,9 @@ final class MTAppModel: ObservableObject {
             guard let self, self.playIdx != nil else { return false }
             if self.playing && !self.scrubbing {
                 let secs = Double(self.clips[min(self.playIdx!, self.n - 1)].secs)
-                var t = self.playT + dt / max(1, secs)
+                var t = self.mo.playT + dt / max(1, secs)
                 if t >= 1 { t = 0 }
-                self.playT = t
+                self.mo.playT = t
             }
             return true
         }
@@ -335,7 +351,7 @@ final class MTAppModel: ObservableObject {
     private var psTrail = MTTrail()
     func psDown(_ p: CGPoint) {
         guard !tagPickOpen else { return }
-        psY0 = p.y; ps0 = ps; psDragOn = true; psMoved = false
+        psY0 = p.y; ps0 = mo.ps; psDragOn = true; psMoved = false
         psTrail.reset(p)
     }
     func psMove(_ p: CGPoint) {
@@ -343,18 +359,18 @@ final class MTAppModel: ObservableObject {
         psTrail.push(p)
         let dy = p.y - psY0
         if abs(dy) > 7 { psMoved = true }
-        if psMoved { ps = max(0, min(1, ps0 - Double(dy) / 340)) }
+        if psMoved { mo.ps = max(0, min(1, ps0 - Double(dy) / 340)) }
     }
     func psUp() {
         guard psDragOn else { return }
         psDragOn = false
         guard psMoved else { return }
         let vy = Double(psTrail.velocity.y)
-        let target: Double = vy < -300 ? 1 : vy > 300 ? 0 : (ps > 0.5 ? 1 : 0)
+        let target: Double = vy < -300 ? 1 : vy > 300 ? 0 : (mo.ps > 0.5 ? 1 : 0)
         psTicker.run { [weak self] dt in
             guard let self else { return false }
-            self.ps += (target - self.ps) * (1 - exp(-10 * dt))
-            if abs(target - self.ps) < 0.004 { self.ps = target; return false }
+            self.mo.ps += (target - self.mo.ps) * (1 - exp(-10 * dt))
+            if abs(target - self.mo.ps) < 0.004 { self.mo.ps = target; return false }
             return true
         }
         // 点按判定窗结束后复位(togglePlay 用)
@@ -363,7 +379,7 @@ final class MTAppModel: ObservableObject {
     // 复盘带擦洗
     func bandScrub(_ frac: Double, ended: Bool) {
         scrubbing = !ended
-        playT = max(0, min(1, frac))
+        mo.playT = max(0, min(1, frac))
     }
     // 标签选择
     func openTagPick() {
@@ -423,14 +439,14 @@ final class MTAppModel: ObservableObject {
 
     // ═══ 拍摄 ═══
     func openCap() {
-        capOpen = true; recOn = false; recT = 0
-        capFxMode = 1; capFx = 0
-        runFx(duration: 0.3) { [weak self] t in self?.capFx = t } done: { [weak self] in self?.capFxMode = 0 }
+        capOpen = true; recOn = false; mo.recT = 0
+        capFxMode = 1; mo.capFx = 0
+        runFx(duration: 0.3) { [weak self] t in self?.mo.capFx = t } done: { [weak self] in self?.capFxMode = 0 }
     }
     func closeCap() {
         if recOn { stopRec() }
-        capFxMode = -1; capFx = 0
-        runFx(duration: 0.3) { [weak self] t in self?.capFx = t } done: { [weak self] in
+        capFxMode = -1; mo.capFx = 0
+        runFx(duration: 0.3) { [weak self] t in self?.mo.capFx = t } done: { [weak self] in
             guard let self else { return }
             self.capOpen = false; self.capFxMode = 0
             self.capDialOpen = false; self.capTagOpen = false
@@ -438,10 +454,10 @@ final class MTAppModel: ObservableObject {
     }
     func capSelOf(_ i: Int) -> Int { capSel[i] ?? capDefaults[i] }
     private func startRec() {
-        recOn = true; recT = 0; capTagOpen = false
+        recOn = true; mo.recT = 0; capTagOpen = false
         recTicker.run { [weak self] dt in
             guard let self, self.recOn else { return false }
-            self.recT += dt
+            self.mo.recT += dt
             return true
         }
     }
@@ -474,7 +490,7 @@ final class MTAppModel: ObservableObject {
     func openCapDial() {
         guard !recOn else { return }
         if capDialOpen { closeCapDial(); return }  // 图标再点 = 收起
-        capValPos = Double(capSelOf(Int(capDialPos.rounded())))
+        mo.capValPos = Double(capSelOf(Int(mo.capDialPos.rounded())))
         capDialOpen = true; capDialIn = false
         withAnimation(.spring(response: 0.38, dampingFraction: 0.72)) { capDialIn = true }
     }
@@ -487,8 +503,8 @@ final class MTAppModel: ObservableObject {
     }
     func capReset() {
         capSel = [:]
-        let i = max(0, min(capDefaults.count - 1, Int(capDialPos.rounded())))
-        capValPos = Double(capDefaults[i])
+        let i = max(0, min(capDefaults.count - 1, Int(mo.capDialPos.rounded())))
+        mo.capValPos = Double(capDefaults[i])
     }
     // 两级手势:横滑=换参数,竖滑=调值
     private var cdDragOn = false, cdMoved = false
@@ -498,7 +514,7 @@ final class MTAppModel: ObservableObject {
     func cdDown(_ p: CGPoint) {
         cdTicker.stop()
         cdX0 = p.x; cdY0 = p.y
-        cdPh = capDialPos; cdPv = capValPos
+        cdPh = mo.capDialPos; cdPv = mo.capValPos
         cdDragOn = true; cdMoved = false
         // 按起手位置定轴:值列一带(距屏底 >205)= 竖滑,弧盘一带 = 横滑
         cdAxis = (H - p.y) > 205 ? 2 : 1
@@ -514,13 +530,13 @@ final class MTAppModel: ObservableObject {
             cdActive = cdAxis
         }
         if cdAxis == 1 {
-            capDialPos = max(-0.3, min(Double(capParams.count) - 0.7, cdPh - dx / 120))
+            mo.capDialPos = max(-0.3, min(Double(capParams.count) - 0.7, cdPh - dx / 120))
         } else {
-            let len = capParams[max(0, min(capParams.count - 1, Int((capDialPos).rounded())))].vals.count
+            let len = capParams[max(0, min(capParams.count - 1, Int((mo.capDialPos).rounded())))].vals.count
             var v = cdPv - dy / 44
             if v < 0 { v *= 0.35 }
             else if v > Double(len - 1) { v = Double(len - 1) + (v - Double(len - 1)) * 0.35 }
-            capValPos = v
+            mo.capValPos = v
         }
     }
     func cdUp() {
@@ -529,36 +545,30 @@ final class MTAppModel: ObservableObject {
         cdActive = 0
         guard cdMoved else { return }
         if cdAxis == 1 {
-            let target = max(0, min(Double(capParams.count - 1), capDialPos.rounded()))
+            let target = max(0, min(Double(capParams.count - 1), mo.capDialPos.rounded()))
             cdSnap(\.capDialPos, target) { [weak self] in
                 guard let self else { return }
-                self.capValPos = Double(self.capSelOf(Int(target)))
+                self.mo.capValPos = Double(self.capSelOf(Int(target)))
             }
         } else {
-            let i = max(0, min(capParams.count - 1, Int(capDialPos.rounded())))
+            let i = max(0, min(capParams.count - 1, Int(mo.capDialPos.rounded())))
             let len = capParams[i].vals.count
-            let target = max(0, min(Double(len - 1), capValPos.rounded()))
+            let target = max(0, min(Double(len - 1), mo.capValPos.rounded()))
             cdSnap(\.capValPos, target) { [weak self] in
                 self?.capSel[i] = Int(target)   // 松手即生效
             }
         }
     }
-    private func cdSnap(_ key: ReferenceWritableKeyPath<MTAppModel, Double>, _ target: Double, done: @escaping () -> Void) {
+    private func cdSnap(_ key: ReferenceWritableKeyPath<MTMotion, Double>, _ target: Double, done: @escaping () -> Void) {
         cdTicker.run { [weak self] dt in
             guard let self else { return false }
-            self[keyPath: key] += (target - self[keyPath: key]) * (1 - exp(-10 * dt))
-            if abs(target - self[keyPath: key]) < 0.004 {
-                self[keyPath: key] = target
+            self.mo[keyPath: key] += (target - self.mo[keyPath: key]) * (1 - exp(-10 * dt))
+            if abs(target - self.mo[keyPath: key]) < 0.004 {
+                self.mo[keyPath: key] = target
                 done()
                 return false
             }
             return true
         }
-    }
-    // 录制中模拟:倍率连续变化 + 跟踪状态周期(设计稿公式)
-    var recZ: Double { max(1, min(3, 1.6 + 0.9 * sin(recT * 0.35) + 0.4 * sin(recT * 0.13))) }
-    var recState: String {
-        let ph = recT.truncatingRemainder(dividingBy: 19)
-        return ph < 15 ? "锁定" : ph < 17 ? "搜索中" : "未锁定"
     }
 }

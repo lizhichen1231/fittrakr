@@ -14,12 +14,12 @@ struct MTRootView: View {
                 if showEmpty {
                     MTEmptyView(m: m)
                 } else {
-                    MTLibraryView(m: m)
+                    MTLibraryView(m: m, mo: m.mo, pane: m.pane)
                     if m.setOpen { MTSettingsView(m: m).zIndex(4) }
-                    MTBottomBar(m: m).zIndex(6)
-                    if m.playIdx != nil { MTPlaybackView(m: m).zIndex(7) }
+                    MTBottomBar(m: m, pane: m.pane).zIndex(6)
+                    if m.playIdx != nil { MTPlaybackView(m: m, mo: m.mo, pane: m.pane).zIndex(7) }
                 }
-                if m.capOpen { MTCaptureView(m: m).zIndex(8) }
+                if m.capOpen { MTCaptureView(m: m, mo: m.mo).zIndex(8) }
                 // 预览退出角(仅新 UI 预览期:左上长按退回旧 UI;新 UI 转正后删)
                 Color.clear
                     .frame(width: 44, height: 44)

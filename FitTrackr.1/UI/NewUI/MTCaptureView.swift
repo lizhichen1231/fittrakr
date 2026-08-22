@@ -7,6 +7,7 @@ import SwiftUI
 
 struct MTCaptureView: View {
     @ObservedObject var m: MTAppModel
+    @ObservedObject var mo: MTMotion
     @State private var breath = false
 
     var body: some View {
@@ -91,10 +92,10 @@ struct MTCaptureView: View {
     // 预览:静态图 + EV/白平衡实时调色(设计稿模拟;真相机接线为后续卡)
     private var preview: some View {
         let evB = [0.62, 0.8, 1.0, 1.22, 1.45]
-        let cIdx = max(0, min(m.capParams.count - 1, Int(m.capDialPos.rounded())))
+        let cIdx = max(0, min(m.capParams.count - 1, Int(mo.capDialPos.rounded())))
         var ev = evB[m.capSelOf(2)]
         if cIdx == 2 && m.capDialOpen {
-            let c = max(0.0, min(4.0, m.capValPos))
+            let c = max(0.0, min(4.0, mo.capValPos))
             let f = Int(floor(c)), r = c - Double(f)
             ev = evB[f] + (evB[min(4, f + 1)] - evB[f]) * r
         }
@@ -102,9 +103,8 @@ struct MTCaptureView: View {
         let hue: Double = [0, -6, -14, 12][wb]
         let sat: Double = [1, 1.08, 1.12, 0.92][wb]
         return GeometryReader { geo in
-            AsyncImage(url: mtThemeURL) { img in
-                img.resizable().scaledToFill()
-            } placeholder: { Color(red: 0.02, green: 0.03, blue: 0.05) }
+            MTCachedImage(url: mtThemeURL, maxPixel: 2000, tint: .none,
+                          placeholder: Color(red: 0.02, green: 0.03, blue: 0.05))
                 .saturation(0.72 * sat)
                 .hueRotation(.degrees(hue))
                 .brightness((ev - 1) * 0.35 - 0.06)
@@ -132,7 +132,7 @@ struct MTCaptureView: View {
     }
 
     private var recHud: some View {
-        let rs = Int(m.recT)
+        let rs = Int(mo.recT)
         let showAux = m.recOn && !m.capDialOpen
         return ZStack(alignment: .topLeading) {
             Text("\(rs / 60):" + String(format: "%02d", rs % 60))
@@ -143,19 +143,19 @@ struct MTCaptureView: View {
                 .position(x: m.W / 2, y: 62 + 8)
                 .opacity(m.recOn ? 1 : 0)
             ZStack(alignment: .leading) {
-                Text("超广角").opacity(m.recZ < 1.4 ? 1 : 0)
-                Text("主摄").opacity(m.recZ < 1.4 ? 0 : 1)
+                Text("超广角").opacity(mo.recZ < 1.4 ? 1 : 0)
+                Text("主摄").opacity(mo.recZ < 1.4 ? 0 : 1)
             }
             .font(.system(size: 12))
             .foregroundColor(.white.opacity(0.85))
             .mtShadow(false)
-            .animation(.easeOut(duration: 0.2), value: m.recZ < 1.4)
+            .animation(.easeOut(duration: 0.2), value: mo.recZ < 1.4)
             .position(x: 26 + 30, y: 62 + 8)
             .opacity(showAux ? 1 : 0)
             HStack(spacing: 6) {
-                Text(String(format: "%.1fx", m.recZ))
-                Text(m.recState)
-                    .foregroundColor(m.recState == "锁定" ? MT.accent : .white.opacity(0.85))
+                Text(String(format: "%.1fx", mo.recZ))
+                Text(mo.recState)
+                    .foregroundColor(mo.recState == "锁定" ? MT.accent : .white.opacity(0.85))
             }
             .font(.system(size: 12)).monospacedDigit()
             .foregroundColor(.white.opacity(0.85))
@@ -236,10 +236,10 @@ struct MTCaptureView: View {
 
     // ── 双轴参数弧盘 ──
     private var capDial: some View {
-        let pos = m.capDialPos
+        let pos = mo.capDialPos
         let cIdx = max(0, min(m.capParams.count - 1, Int(pos.rounded())))
         let hOff = abs(pos - Double(cIdx))
-        let vPos = m.capValPos
+        let vPos = mo.capValPos
         return ZStack(alignment: .bottomLeading) {
             Color.black.opacity(0.001)
             // 浮动玻璃面板(泡泡弹出,原点=参数入口图标)

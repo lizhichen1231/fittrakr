@@ -5,10 +5,8 @@ import UIKit
 struct CameraScreen: View {
     @ObservedObject var vm: CameraViewModel
     @State private var showTuner = false
-    #if DEBUG
-    @State private var envNewUI = false        // 【新 UI】MT_NEW_UI 环境变量直开(预览/截图用)
+    @State private var envNewUI = false        // 【新 UI】MT_NEW_UI 环境变量直开(预览/性能测量;Release 也生效)
     @State private var envNewUIEmpty = false
-    #endif
 
     var body: some View {
         GeometryReader { geo in
@@ -286,11 +284,11 @@ struct CameraScreen: View {
                 #if DEBUG
                 // 【画质探针·待撤】FTQ_BENCH=1 无头基准:不起相机,纯跑处理链计时(QualityProbeView.swift)
                 if QualityProbeBench.benchMode { QualityProbeBench.runIfNeeded(); return }
-                // 【新 UI】MT_NEW_UI=1 直开新 UI(不起相机;=2 开空状态)——预览/截图用
+                #endif
+                // 【新 UI】MT_NEW_UI=1 直开新 UI(不起相机;=2 开空状态)——预览/性能测量用
                 if let v = ProcessInfo.processInfo.environment["MT_NEW_UI"], v == "1" || v == "2" {
                     envNewUIEmpty = (v == "2"); envNewUI = true; return
                 }
-                #endif
                 forcePortrait()   // 兜底:若已卡在横屏进来,掰回竖屏
                 vm.updateOutputSize(for: geo.size)
                 vm.start()
@@ -307,9 +305,7 @@ struct CameraScreen: View {
                 TunerSheet(vm: vm)
                     .presentationDetents([.fraction(0.35), .medium, .large])
             }
-            #if DEBUG
             .fullScreenCover(isPresented: $envNewUI) { MTRootView(showEmpty: envNewUIEmpty) }
-            #endif
         }
         .preferredColorScheme(.dark)
         .ignoresSafeArea()

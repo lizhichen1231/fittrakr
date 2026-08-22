@@ -1,3 +1,5 @@
+#if DEBUG
+// 【掉帧卡·附带】本文件依赖 DEBUG-only 埋点(dbg*/assocTrace),Release test 构建整体剔除
 import XCTest
 import AVFoundation
 @testable import FitTrackr_1
@@ -67,3 +69,5 @@ final class AssocBaselineTests: XCTestCase {
         try runAssocTrace("clip_2_sameshirt_dancetrack0004", seconds: 75)
     }
 }
+
+#endif

@@ -11,15 +11,9 @@ struct MTThemeBackground: View {
     var body: some View {
         GeometryReader { geo in
             ZStack {
-                AsyncImage(url: mtThemeURL) { img in
-                    img.resizable().scaledToFill()
-                } placeholder: {
-                    Color(red: 0.03, green: 0.05, blue: 0.10)
-                }
-                // 设计稿 filter: saturate(.5) sepia(.4) hue-rotate(178°) saturate(1.6) brightness(.48) 的近似
-                .saturation(0.55)
-                .colorMultiply(Color(red: 0.42, green: 0.58, blue: 0.82))
-                .brightness(-0.06)
+                // 【掉帧卡】降采样 + 调色烘焙的缓存位图;此处只动 transform
+                MTCachedImage(url: mtThemeURL, maxPixel: 2000, tint: .theme,
+                              placeholder: Color(red: 0.03, green: 0.05, blue: 0.10))
                 .frame(width: geo.size.width * 1.2, height: geo.size.height * 1.12)
                 .scaleEffect(1.08)
                 .offset(x: drift ? -geo.size.width * 0.016 : 0, y: drift ? geo.size.height * 0.009 : 0)
@@ -137,15 +131,17 @@ func mtDeckGeom(i: Int, n: Int, posW: Double, g: Double, scrollY: Double,
 // ── 素材库层 ──
 struct MTLibraryView: View {
     @ObservedObject var m: MTAppModel
+    @ObservedObject var mo: MTMotion
+    @ObservedObject var pane: MTPane
 
     var body: some View {
-        let g = m.g
+        let g = pane.g
         let clips = m.clips
-        let posW = MT.wrap(m.pos, m.n)
-        let dialDelta = m.dialOpen ? max(-24, min(24, (m.dial0 - m.dialPos) * 4)) : 0
+        let posW = MT.wrap(mo.pos, m.n)
+        let dialDelta = m.dialOpen ? max(-24, min(24, (m.dial0 - mo.dialPos) * 4)) : 0
         let parallax = CGSize(
             width: -30 * sin(2 * .pi * posW / Double(max(1, m.n))) * (1 - g),
-            height: dialDelta - 10 * g - min(34, m.scrollY * 0.08))
+            height: dialDelta - 10 * g - min(34, pane.scrollY * 0.08))
 
         ZStack(alignment: .topLeading) {
             MTThemeBackground(parallax: parallax)
@@ -169,12 +165,12 @@ struct MTLibraryView: View {
                 .onLongPressGesture(minimumDuration: 0.35) { m.openDial() }
                 .zIndex(6)
 
-            if m.dialOpen { MTDialView(m: m).zIndex(8) }
+            if m.dialOpen { MTDialView(m: m, mo: mo).zIndex(8) }
         }
     }
 
     private var dayHeader: some View {
-        let g = m.g
+        let g = pane.g
         let fs = 40 - 18 * g
         let s = fs / 40
         let hh = max(1.6, 3 * s)
@@ -195,6 +191,7 @@ struct MTLibraryView: View {
             }
             .padding(.leading, 26).padding(.trailing, 26)
             .padding(.top, 54)
+            .drawingGroup()
             .contentShape(Rectangle())
             .onTapGesture { m.openDial() }
             // 进度条(top 112,仅堆叠端)
@@ -214,14 +211,14 @@ struct MTLibraryView: View {
         }
         .mtShadow()
     }
-    private var posWFrac: Double { MT.wrap(m.pos, m.n) / Double(max(1, m.n)) }
+    private var posWFrac: Double { MT.wrap(mo.pos, m.n) / Double(max(1, m.n)) }
 
     private func deck(clips: [MTClip], g: Double) -> some View {
         let playEff = m.playEff
         return ZStack(alignment: .topLeading) {
             ForEach(0..<m.n, id: \.self) { i in
-                let geom = mtDeckGeom(i: i, n: m.n, posW: MT.wrap(m.pos, m.n), g: g,
-                                      scrollY: m.scrollY, playIdx: m.playIdx, playEff: playEff,
+                let geom = mtDeckGeom(i: i, n: m.n, posW: MT.wrap(mo.pos, m.n), g: g,
+                                      scrollY: pane.scrollY, playIdx: m.playIdx, playEff: playEff,
                                       W: Double(m.W), Hd: Double(m.Hd))
                 if !geom.hidden {
                     card(clip: clips[i], geom: geom, g: g)
@@ -258,10 +255,7 @@ struct MTLibraryView: View {
         return ZStack(alignment: .bottomTrailing) {
             RoundedRectangle(cornerRadius: 18)
                 .fill(Color(red: 0.078, green: 0.078, blue: 0.078))
-            AsyncImage(url: clip.imgURL) { img in
-                img.resizable().scaledToFill()
-            } placeholder: { Color(red: 0.078, green: 0.078, blue: 0.078) }
-                .saturation(0.72).brightness(-0.1)
+            MTCachedImage(url: clip.imgURL, maxPixel: 750, tint: .card)
                 .frame(width: geom.w, height: geom.h)
                 .clipped()
             LinearGradient(colors: [.black.opacity(0.45), .clear], startPoint: .bottom, endPoint: UnitPoint(x: 0.5, y: 0.66))
@@ -281,6 +275,7 @@ struct MTLibraryView: View {
         }
         .frame(width: geom.w, height: geom.h)
         .clipShape(RoundedRectangle(cornerRadius: 18))
+        .compositingGroup()
         .rotationEffect(.degrees(geom.rot))
         .opacity(geom.op)
         .position(x: geom.x + geom.w / 2, y: geom.y + geom.h / 2)
@@ -291,10 +286,11 @@ struct MTLibraryView: View {
 // ── 日期/分类弧形转盘 ──
 struct MTDialView: View {
     @ObservedObject var m: MTAppModel
+    @ObservedObject var mo: MTMotion
 
     var body: some View {
-        let gposC = m.dialPos + (m.dialPos >= Double(m.cats.count) ? 0.45 :
-                    m.dialPos > Double(m.cats.count - 1) ? (m.dialPos - Double(m.cats.count - 1)) * 0.45 : 0)
+        let gposC = mo.dialPos + (mo.dialPos >= Double(m.cats.count) ? 0.45 :
+                    mo.dialPos > Double(m.cats.count - 1) ? (mo.dialPos - Double(m.cats.count - 1)) * 0.45 : 0)
         ZStack(alignment: .topLeading) {
             Color(red: 0.008, green: 0.016, blue: 0.04).opacity(0.18)
             MTFeatherBlur(center: UnitPoint(x: 0, y: 0.46), rx: 0.85, ry: 0.8)
@@ -361,10 +357,11 @@ struct MTDialView: View {
 // ── 底部收拢栏 + 糊化渐隐(素材库/设置共用)──
 struct MTBottomBar: View {
     @ObservedObject var m: MTAppModel
+    @ObservedObject var pane: MTPane
     @State private var breath = false
 
     var body: some View {
-        let k = m.g * max(0, min(1, m.scrollY / 120))  // 收拢进度
+        let k = pane.g * max(0, min(1, pane.scrollY / 120))  // 收拢进度
         ZStack(alignment: .bottom) {
             // 糊化 + 压暗(设计稿 6 层近似为 Material 羽化 + 精确 scrim)
             bottomFade(k: k)
@@ -389,11 +386,18 @@ struct MTBottomBar: View {
         .frame(maxHeight: .infinity, alignment: .bottom)
     }
 
+    // 【掉帧卡】mask 参数随 k 每帧变 = 每帧重合成模糊 → 改两个静态形态交叉 opacity:
+    // 展开形态(k=0,通栏)与收拢形态(k=1,聚拢)各自 mask 恒定,过渡只动 opacity。
     private func bottomFade(k: Double) -> some View {
-        func lk(_ a: Double, _ b: Double) -> Double { a + (b - a) * k }
-        return ZStack {
-            MTFeatherBlur(center: .bottom, rx: lk(3.0, 1.04), ry: 1.05, inner: 0.2, dim: 0)
-            // 精确移植的压暗 scrim
+        ZStack {
+            fadeForm(rx: 3.0, scrimX: 3.2).opacity(1 - k)
+            fadeForm(rx: 1.04, scrimX: 1.2).opacity(k)
+        }
+        .clipped()
+    }
+    private func fadeForm(rx: Double, scrimX: Double) -> some View {
+        ZStack {
+            MTFeatherBlur(center: .bottom, rx: rx, ry: 1.05, inner: 0.2, dim: 0)
             EllipticalGradient(stops: [
                 .init(color: .black.opacity(0.96), location: 0),
                 .init(color: .black.opacity(0.82), location: 0.18),
@@ -402,9 +406,8 @@ struct MTBottomBar: View {
                 .init(color: .black.opacity(0.08), location: 0.82),
                 .init(color: .clear, location: 0.96),
             ], center: .bottom, startRadiusFraction: 0, endRadiusFraction: 0.5)
-            .scaleEffect(x: lk(3.2, 1.2) * 2, y: 2.1, anchor: .bottom)
+            .scaleEffect(x: scrimX * 2, y: 2.1, anchor: .bottom)
         }
-        .clipped()
     }
 
     private var shutter: some View {
