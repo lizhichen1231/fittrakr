@@ -92,21 +92,25 @@ func mtDeckGeom(i: Int, n: Int, posW: Double, g: Double, scrollY: Double,
     if d > thr { d -= Double(n) }
     var geom = MTCardGeom(x: 0, y: 0, w: 0, h: 0, z: 0, rot: 0, dim: 0, op: 1)
     if g < 0.001 && (d > 3.4 || d < -1.2) { geom.hidden = true; return geom }
-    // 堆叠端
-    let visW = W - 64, Hs = Hd - 100
-    var tx = 0.0, sc = 1.0, rot = 0.0, dim = 0.0, z = 100.0, op = 1.0
-    if d < 0 { tx = d * 420; rot = d * 8; z = 110 }
+    // 堆叠端【回扫B5 固定值】:前卡左右 24;后卡仅右侧探出 10pt/层、缩小 4%/层、变暗 10%/层
+    let visW = W - 48, Hs = Hd - 100
+    var rot = 0.0, z = 100.0, op = 1.0
+    var sx = 24.0, sc = 1.0, dim = 0.0
+    if d < 0 { sx = 24 + d * 420; rot = d * 8; z = 110 }
     else {
-        let b = mtLerpBase(min(d, 4))
-        tx = b.tx; sc = b.sc; dim = b.dim
-        z = 100 - (min(d, 4) * 10).rounded()
+        let dd = min(d, 4)
+        sc = 1 - 0.04 * dd
+        dim = min(0.6, 0.10 * dd)
+        z = 100 - (dd * 10).rounded()
+        // 右边缘 = 前卡右边(W−24)+ 10pt×层深 → 左端随缩小右移,只露右侧一条边
+        sx = (W - 24 + 10 * dd) - visW * sc
     }
     if d > 2.6 { op = max(0, 1 - (d - 2.6) / 0.8) }
-    let sx = 20 + tx + visW * (1 - sc) / 2, sy = Hs * (1 - sc) / 2
+    let sy = Hs * (1 - sc) / 2
     let sw = visW * sc, sh = Hs * sc
-    // 网格端
-    let pad = 20.0, gap = 12.0
-    let colW = (W - pad * 2 - gap) / 2, cardH = (colW * 1.45).rounded()
+    // 网格端【回扫B8 固定值】:两列,左右 24,列距 12,宽高比 3:4
+    let pad = 24.0, gap = 12.0
+    let colW = (W - pad * 2 - gap) / 2, cardH = (colW * 4.0 / 3.0).rounded()
     let col = Double(i % 2), row = Double(i / 2)
     let gx = pad + col * (colW + gap), gy = 72 + row * (cardH + gap) - scrollY
     func L(_ a: Double, _ b: Double) -> Double { a + (b - a) * g }
@@ -133,6 +137,7 @@ struct MTLibraryView: View {
     @ObservedObject var m: MTAppModel
     @ObservedObject var mo: MTMotion
     @ObservedObject var pane: MTPane
+    @State private var deckBegan = false
 
     var body: some View {
         let g = pane.g
@@ -146,8 +151,10 @@ struct MTLibraryView: View {
         ZStack(alignment: .topLeading) {
             MTThemeBackground(parallax: parallax)
 
-            // 顶部:日期行(serif,40→22px)+ 进度条
+            // 顶部:日期行 + 进度条(B7:条在卡上沿以上 10pt)
             dayHeader
+                .zIndex(3)
+            progressBar
                 .zIndex(3)
 
             // 卡组区(top 118 → 底)
@@ -192,24 +199,26 @@ struct MTLibraryView: View {
             .padding(.leading, 26).padding(.trailing, 26)
             .padding(.top, 54)
             .drawingGroup()
+            .frame(minHeight: 44, alignment: .topLeading)   // 【回扫A1】整行 44pt 热区
             .contentShape(Rectangle())
-            .onTapGesture { m.openDial() }
-            // 进度条(top 112,仅堆叠端)
-            GeometryReader { _ in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Color.white.opacity(0.13))
-                    Capsule()
-                        .fill(Color.white.opacity(0.7))
-                        .frame(width: max(0, (m.W - 64) / CGFloat(m.n)))
-                        .offset(x: (m.W - 64) * CGFloat(posWFrac))
-                }
-            }
-            .frame(width: m.W - 64, height: 2)
-            .padding(.leading, 20)
-            .padding(.top, 58 - 40 * (1 - g) * 0) // top 112 − (54+行高):以下方 offset 对齐
-            .opacity(1 - g)
+            .highPriorityGesture(TapGesture().onEnded { m.openDial() })
         }
         .mtShadow()
+    }
+
+    // 【回扫B7】进度条:独立于日期行,底边 = 卡上沿(118)以上 10pt;宽度对齐卡(左右 24)
+    private var progressBar: some View {
+        let bw = m.W - 48
+        return ZStack(alignment: .leading) {
+            Capsule().fill(Color.white.opacity(0.13))
+            Capsule()
+                .fill(Color.white.opacity(0.7))
+                .frame(width: max(0, bw / CGFloat(m.n)))
+                .offset(x: bw * CGFloat(posWFrac))
+        }
+        .frame(width: bw, height: 2)
+        .position(x: m.W / 2, y: 118 - 10 - 1)
+        .opacity(1 - pane.g)
     }
     private var posWFrac: Double { MT.wrap(mo.pos, m.n) / Double(max(1, m.n)) }
 
@@ -230,21 +239,25 @@ struct MTLibraryView: View {
         .gesture(
             DragGesture(minimumDistance: 0, coordinateSpace: .local)
                 .onChanged { v in
-                    if v.translation == .zero { m.deckDown(v.startLocation) }
+                    // 【回扫A2】began 标志:首个 onChanged 的 translation 常已非零,
+                    // 旧判定会漏掉 down → up 被 guard → 松手不吸附
+                    if !deckBegan { deckBegan = true; m.deckDown(v.startLocation) }
                     m.deckMove(v.location)
                 }
-                .onEnded { _ in m.deckUp() }
+                .onEnded { _ in deckBegan = false; m.deckUp() }
         )
     }
 
     @ViewBuilder private func deckMask(g: Double) -> some View {
-        if g < 0.02 {
+        // 【回扫D13】渐隐只属于网格态:接近网格(g>0.85)才渐入,过渡中不削堆叠卡顶;
+        // 纯透明渐隐 64pt,首行上沿在 72pt,未滚动时不被盖,滚动内容穿带自然淡出
+        let k = max(0, (g - 0.85) / 0.15)
+        if k < 0.02 {
             Rectangle()
         } else {
-            // smootherstep 顶部渐隐 64px(设计稿 8 段)
             LinearGradient(stops: (0...8).map { t in
                 let f = MT.ss(Double(t) / 8)
-                return Gradient.Stop(color: .black.opacity(1 - (1 - f) * g),
+                return Gradient.Stop(color: .black.opacity(1 - (1 - f) * k),
                                      location: Double(t) * 8 / Double(m.Hd))
             }, startPoint: .top, endPoint: .bottom)
         }
@@ -287,6 +300,7 @@ struct MTLibraryView: View {
 struct MTDialView: View {
     @ObservedObject var m: MTAppModel
     @ObservedObject var mo: MTMotion
+    @State private var dialBegan = false
 
     var body: some View {
         let gposC = mo.dialPos + (mo.dialPos >= Double(m.cats.count) ? 0.45 :
@@ -310,10 +324,10 @@ struct MTDialView: View {
         .gesture(
             DragGesture(minimumDistance: 0)
                 .onChanged { v in
-                    if v.translation == .zero { m.dialDown(v.startLocation) }
+                    if !dialBegan { dialBegan = true; m.dialDown(v.startLocation) }
                     m.dialMove(v.location)
                 }
-                .onEnded { _ in m.dialUp() }
+                .onEnded { _ in dialBegan = false; m.dialUp() }
         )
     }
 
@@ -365,20 +379,19 @@ struct MTBottomBar: View {
         ZStack(alignment: .bottom) {
             // 糊化 + 压暗(设计稿 6 层近似为 Material 羽化 + 精确 scrim)
             bottomFade(k: k)
-                .frame(height: 110)
+                .frame(height: 120)
                 .allowsHitTesting(false)
-            HStack {
+            ZStack {
                 tab(label: "素材库", active: !m.setOpen, k: k) {
                     LibGlyph()
                 } action: { m.setOpen = false }
-                Spacer()
+                    .offset(x: -96)
                 shutter
-                Spacer()
                 tab(label: "设置", active: m.setOpen, k: k) {
                     SetGlyph()
                 } action: { m.setOpen = true }
+                    .offset(x: 96)
             }
-            .padding(.horizontal, 48)
             .padding(.bottom, 14)
             .scaleEffect(1 - 0.16 * k, anchor: .bottom)
             .animation(.easeOut(duration: 0.15), value: k)
@@ -386,27 +399,22 @@ struct MTBottomBar: View {
         .frame(maxHeight: .infinity, alignment: .bottom)
     }
 
-    // 【掉帧卡】mask 参数随 k 每帧变 = 每帧重合成模糊 → 改两个静态形态交叉 opacity:
-    // 展开形态(k=0,通栏)与收拢形态(k=1,聚拢)各自 mask 恒定,过渡只动 opacity。
+    // 【回扫C12】糊化+压暗只在图标带:底边向上 120pt 内完成,顶端严格全透明。
+    // 竖直 smootherstep mask(静态,每帧零重合成——掉帧卡结论保持);自检判据:遮住图标后
+    // 画面应只在最底 120pt 内渐暗,任何高度不出现可辨边界。
+    private var fadeMask: LinearGradient {
+        LinearGradient(stops: (0...8).map { t in
+            let f = MT.ss(Double(t) / 8)
+            return Gradient.Stop(color: .black.opacity(f), location: Double(t) / 8)
+        }, startPoint: .top, endPoint: .bottom)
+    }
     private func bottomFade(k: Double) -> some View {
         ZStack {
-            fadeForm(rx: 3.0, scrimX: 3.2).opacity(1 - k)
-            fadeForm(rx: 1.04, scrimX: 1.2).opacity(k)
-        }
-        .clipped()
-    }
-    private func fadeForm(rx: Double, scrimX: Double) -> some View {
-        ZStack {
-            MTFeatherBlur(center: .bottom, rx: rx, ry: 1.05, inner: 0.2, dim: 0)
-            EllipticalGradient(stops: [
-                .init(color: .black.opacity(0.96), location: 0),
-                .init(color: .black.opacity(0.82), location: 0.18),
-                .init(color: .black.opacity(0.52), location: 0.42),
-                .init(color: .black.opacity(0.24), location: 0.64),
-                .init(color: .black.opacity(0.08), location: 0.82),
-                .init(color: .clear, location: 0.96),
-            ], center: .bottom, startRadiusFraction: 0, endRadiusFraction: 0.5)
-            .scaleEffect(x: scrimX * 2, y: 2.1, anchor: .bottom)
+            Rectangle().fill(.ultraThinMaterial).mask(fadeMask)
+            LinearGradient(stops: (0...8).map { t in
+                let f = MT.ss(Double(t) / 8)
+                return Gradient.Stop(color: .black.opacity(0.9 * f), location: Double(t) / 8)
+            }, startPoint: .top, endPoint: .bottom)
         }
     }
 

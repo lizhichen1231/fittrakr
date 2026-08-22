@@ -8,6 +8,7 @@ struct MTPlaybackView: View {
     @ObservedObject var m: MTAppModel
     @ObservedObject var mo: MTMotion
     @ObservedObject var pane: MTPane
+    @State private var psBegan = false
 
     var body: some View {
         let playIdx = min(m.playIdx ?? 0, m.n - 1)
@@ -34,6 +35,7 @@ struct MTPlaybackView: View {
             .buttonStyle(.plain)
             .position(x: 22 + 60, y: 58 + 10)
             .opacity(max(0, (playEff - 0.6) / 0.4))
+            .zIndex(10)   // 【回扫A3/A4】返回行永远压在视频卡(z2)之上
 
             // 播放器(转场矩形插值)
             player(clip: clip, playIdx: playIdx, playEff: playEff, Lp: Lp)
@@ -77,32 +79,38 @@ struct MTPlaybackView: View {
         }
         .ignoresSafeArea()
         .contentShape(Rectangle())
-        .gesture(
+        // 【回扫A3】改 simultaneousGesture:全屏 drag 不再抢走返回按钮的点击;
+        // 顶部 44pt 返回带(y<108)内 psDown 直接拒绝启动(m 侧过滤)
+        .simultaneousGesture(
             DragGesture(minimumDistance: 0)
                 .onChanged { v in
-                    if v.translation == .zero { m.psDown(v.startLocation) }
+                    if !psBegan { psBegan = true; m.psDown(v.startLocation) }
                     m.psMove(v.location)
                 }
-                .onEnded { _ in m.psUp() }
+                .onEnded { _ in psBegan = false; m.psUp() }
         )
     }
 
     // 播放器矩形:目标 vs 源(堆叠前卡 / 网格该格)按 playEff 插值
     private func player(clip: MTClip, playIdx: Int, playEff: Double, Lp: (Double, Double) -> Double) -> some View {
         let W = Double(m.W), H = Double(m.H)
-        let dx = Lp(20, 118), dy = Lp(92, 56)
-        let dw = W - 2 * dx, dh = H - dy - Lp(250, 566)
+        // 【回扫B9 固定值】顶部距返回行 16pt(返回行 top58 高20 → 卡顶 94)、左右 24;
+        // 高按素材比例(9:16),上限屏高 55%
+        let dx = Lp(24, 118), dy = Lp(94, 56)
+        let dw = W - 2 * dx
+        let dh0 = min(dw * 16.0 / 9.0, H * 0.55)
+        let dh = Lp(dh0, H - 56 - 566)
         var x = dx, y = dy, w = dw, h = dh
         if playEff < 0.999 {
-            var sxr: Double = 20
+            var sxr: Double = 24
             var syr: Double = 118
-            var swr: Double = W - 64
+            var swr: Double = W - 48
             var shr: Double = Double(m.Hd) - 100
             if pane.g >= 0.5 {
-                let pad: Double = 20
+                let pad: Double = 24
                 let gap: Double = 12
                 let colW: Double = (W - pad * 2 - gap) / 2
-                let cardH: Double = (colW * 1.45).rounded()
+                let cardH: Double = (colW * 4.0 / 3.0).rounded()
                 sxr = pad + Double(playIdx % 2) * (colW + gap)
                 syr = 190.0 + Double(playIdx / 2) * (cardH + gap) - pane.scrollY
                 swr = colW

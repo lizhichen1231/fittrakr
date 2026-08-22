@@ -86,9 +86,9 @@ final class MTAppModel: ObservableObject {
     var Hd: CGFloat { H - 118 }             // 卡组区高(顶部 118 下方)
     var Hs: CGFloat { Hd - 100 }            // 堆叠卡高
     var maxScroll: Double {
-        let pad = 20.0, gap = 12.0
+        let pad = 24.0, gap = 12.0
         let colW = (Double(W) - pad * 2 - gap) / 2
-        let cardH = (colW * 1.45).rounded()
+        let cardH = (colW * 4.0 / 3.0).rounded()
         let rows = Double((n + 1) / 2)
         return max(0, 72 + rows * (cardH + gap) - gap + 124 - Double(Hd))
     }
@@ -165,9 +165,9 @@ final class MTAppModel: ObservableObject {
             if pane.g < 0.5 { openPlay(Int(MT.wrap(mo.pos.rounded(), n))) }
             else if pane.g >= 0.999 {
                 let relX = Double(x0), relY = Double(y0) + pane.scrollY
-                let pad = 20.0, gap = 12.0
+                let pad = 24.0, gap = 12.0
                 let colW = (Double(W) - pad * 2 - gap) / 2
-                let cardH = (colW * 1.45).rounded()
+                let cardH = (colW * 4.0 / 3.0).rounded()
                 let col = relX < pad + colW ? 0 : (relX > pad + colW + gap ? 1 : -1)
                 let row = Int(floor((relY - 72) / (cardH + gap)))
                 let i = row * 2 + col
@@ -351,6 +351,7 @@ final class MTAppModel: ObservableObject {
     private var psTrail = MTTrail()
     func psDown(_ p: CGPoint) {
         guard !tagPickOpen else { return }
+        guard p.y > 108 else { return }   // 【回扫A3】顶部返回带 44pt 内不启动统计层拖拽
         psY0 = p.y; ps0 = mo.ps; psDragOn = true; psMoved = false
         psTrail.reset(p)
     }

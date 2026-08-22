@@ -30,6 +30,18 @@ struct MTRootView: View {
             .onAppear {
                 m.W = geo.size.width
                 m.H = geo.size.height
+                #if DEBUG
+                // 截图直达(MT_NEW_SCREEN=grid/play/stats/cap)——模拟器无法驱动手势,逐项回扫出图用
+                switch ProcessInfo.processInfo.environment["MT_NEW_SCREEN"] {
+                case "grid": m.pane.g = 1
+                case "play": m.openPlay(2); DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { m.playing = false }
+                case "stats":
+                    m.openPlay(2)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { m.playing = false; m.mo.ps = 1 }
+                case "cap": m.openCap()
+                default: break
+                }
+                #endif
             }
             .onChange(of: geo.size) { s in
                 m.W = s.width

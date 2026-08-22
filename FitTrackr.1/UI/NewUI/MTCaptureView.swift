@@ -9,6 +9,7 @@ struct MTCaptureView: View {
     @ObservedObject var m: MTAppModel
     @ObservedObject var mo: MTMotion
     @State private var breath = false
+    @State private var cdBegan = false
 
     var body: some View {
         let chrome = m.recOn ? 0.0 : 1.0
@@ -271,10 +272,10 @@ struct MTCaptureView: View {
         .gesture(
             DragGesture(minimumDistance: 0)
                 .onChanged { v in
-                    if v.translation == .zero { m.cdDown(v.startLocation) }
+                    if !cdBegan { cdBegan = true; m.cdDown(v.startLocation) }
                     m.cdMove(v.location)
                 }
-                .onEnded { _ in m.cdUp() }
+                .onEnded { _ in cdBegan = false; m.cdUp() }
         )
     }
 
