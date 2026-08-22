@@ -289,6 +289,11 @@ struct CameraScreen: View {
                 if let v = ProcessInfo.processInfo.environment["MT_NEW_UI"], v == "1" || v == "2" {
                     envNewUIEmpty = (v == "2"); envNewUI = true; return
                 }
+                // 【新 UI】mt.newUI 常开(UserDefaults;scheme Launch Arguments 传 -mt.newUI YES
+                // 即写入)→ 启动直进新 UI,不起旧相机。Debug/Release 一致。
+                if UserDefaults.standard.bool(forKey: "mt.newUI") {
+                    envNewUIEmpty = false; envNewUI = true; return
+                }
                 forcePortrait()   // 兜底:若已卡在横屏进来,掰回竖屏
                 vm.updateOutputSize(for: geo.size)
                 vm.start()
@@ -305,7 +310,10 @@ struct CameraScreen: View {
                 TunerSheet(vm: vm)
                     .presentationDetents([.fraction(0.35), .medium, .large])
             }
-            .fullScreenCover(isPresented: $envNewUI) { MTRootView(showEmpty: envNewUIEmpty) }
+            .fullScreenCover(isPresented: $envNewUI, onDismiss: { vm.start() }) {
+                // 直进模式退出(左上长按)→ 旧相机此时未启动,补启
+                MTRootView(showEmpty: envNewUIEmpty)
+            }
         }
         .preferredColorScheme(.dark)
         .ignoresSafeArea()
@@ -390,12 +398,15 @@ struct CameraScreen: View {
 // MARK: - 调参抽屉（保持原有代码）
 fileprivate struct TunerSheet: View {
     @ObservedObject var vm: CameraViewModel
+    // 【新 UI】运行时入口(不依赖构建配置,Debug/Release 一致;转正后撤,入口改 App 根)
+    @State private var showNewUI = false
+    @State private var newUIEmpty = false
+    @State private var verTaps = 0                             // 版本号连点计数(5 次切换常开)
+    @State private var newUIPinned = UserDefaults.standard.bool(forKey: "mt.newUI")
     #if DEBUG
     @State private var tier0Forced = CameraEngine.forceTier0   // 刀1 验收开关的界面态
     @State private var showQualityProbe = false                // 【画质探针·待撤】临时入口
     @State private var showDenoiseProbe = false                // 【降噪探针·待撤】临时入口
-    @State private var showNewUI = false                       // 【新 UI】预览入口(转正后此按钮撤,入口改 App 根)
-    @State private var newUIEmpty = false
     @State private var cap4K = CameraEngine.capture4K          // 【4K探针·待撤】开关界面态
     @State private var line4K = "—"                            // 【4K探针·待撤】读数行
     private let timer4K = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
@@ -432,12 +443,34 @@ fileprivate struct TunerSheet: View {
                     Button("打开降噪探针(时域/空域)") { showDenoiseProbe = true }
                 }
 
-                // 【新 UI】claude.design MyTrack.dc.html 的 SwiftUI 实现(素材库/回看/设置/拍摄)。
-                // 预览期入口;转正 = 换 App 根视图 + 撤本按钮。退出:新 UI 内左上角长按 1.2s。
+                #endif
+
+                // 【新 UI】运行时入口 —— 不在任何 #if 内,Debug/Release 一致。
+                // 打开方式:①下面两个按钮;②UserDefaults "mt.newUI"(scheme Launch Arguments
+                // 传 -mt.newUI YES,启动直进);③版本号行连点 5 次切换常开(旧 UI 无关于页,落位在此)。
                 Section(header: Text("🎨 新 UI(MyTrack.dc)")) {
                     Button("进入新 UI · 素材库") { newUIEmpty = false; showNewUI = true }
                     Button("进入新 UI · 空状态") { newUIEmpty = true; showNewUI = true }
+                    HStack {
+                        Text("版本")
+                        Spacer()
+                        Text("\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?") (\(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"))"
+                             + (newUIPinned ? " · 新UI常开" : ""))
+                            .foregroundColor(.secondary)
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        verTaps += 1
+                        if verTaps >= 5 {
+                            verTaps = 0
+                            newUIPinned.toggle()
+                            UserDefaults.standard.set(newUIPinned, forKey: "mt.newUI")
+                            if newUIPinned { newUIEmpty = false; showNewUI = true }
+                        }
+                    }
                 }
+
+                #if DEBUG
 
                 // 【4K探针·待撤】采集格式开关:切换即重启相机会话(以简单为准);
                 // 检测/跟踪/变焦/镜头切换/录制全不动,照常跑新分辨率——看会怎样。
@@ -576,9 +609,9 @@ fileprivate struct TunerSheet: View {
         .fullScreenCover(isPresented: $showQualityProbe) { QualityProbeView() }
         // 【降噪探针·待撤】同上
         .fullScreenCover(isPresented: $showDenoiseProbe) { DenoiseProbeView() }
-        // 【新 UI】预览
-        .fullScreenCover(isPresented: $showNewUI) { MTRootView(showEmpty: newUIEmpty) }
         #endif
+        // 【新 UI】运行时入口(不依赖构建配置)
+        .fullScreenCover(isPresented: $showNewUI) { MTRootView(showEmpty: newUIEmpty) }
     }
 }
 
