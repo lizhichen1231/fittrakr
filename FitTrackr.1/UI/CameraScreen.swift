@@ -5,6 +5,10 @@ import UIKit
 struct CameraScreen: View {
     @ObservedObject var vm: CameraViewModel
     @State private var showTuner = false
+    #if DEBUG
+    @State private var envNewUI = false        // 【新 UI】MT_NEW_UI 环境变量直开(预览/截图用)
+    @State private var envNewUIEmpty = false
+    #endif
 
     var body: some View {
         GeometryReader { geo in
@@ -282,6 +286,10 @@ struct CameraScreen: View {
                 #if DEBUG
                 // 【画质探针·待撤】FTQ_BENCH=1 无头基准:不起相机,纯跑处理链计时(QualityProbeView.swift)
                 if QualityProbeBench.benchMode { QualityProbeBench.runIfNeeded(); return }
+                // 【新 UI】MT_NEW_UI=1 直开新 UI(不起相机;=2 开空状态)——预览/截图用
+                if let v = ProcessInfo.processInfo.environment["MT_NEW_UI"], v == "1" || v == "2" {
+                    envNewUIEmpty = (v == "2"); envNewUI = true; return
+                }
                 #endif
                 forcePortrait()   // 兜底:若已卡在横屏进来,掰回竖屏
                 vm.updateOutputSize(for: geo.size)
@@ -299,6 +307,9 @@ struct CameraScreen: View {
                 TunerSheet(vm: vm)
                     .presentationDetents([.fraction(0.35), .medium, .large])
             }
+            #if DEBUG
+            .fullScreenCover(isPresented: $envNewUI) { MTRootView(showEmpty: envNewUIEmpty) }
+            #endif
         }
         .preferredColorScheme(.dark)
         .ignoresSafeArea()
@@ -387,6 +398,8 @@ fileprivate struct TunerSheet: View {
     @State private var tier0Forced = CameraEngine.forceTier0   // 刀1 验收开关的界面态
     @State private var showQualityProbe = false                // 【画质探针·待撤】临时入口
     @State private var showDenoiseProbe = false                // 【降噪探针·待撤】临时入口
+    @State private var showNewUI = false                       // 【新 UI】预览入口(转正后此按钮撤,入口改 App 根)
+    @State private var newUIEmpty = false
     @State private var cap4K = CameraEngine.capture4K          // 【4K探针·待撤】开关界面态
     @State private var line4K = "—"                            // 【4K探针·待撤】读数行
     private let timer4K = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
@@ -421,6 +434,13 @@ fileprivate struct TunerSheet: View {
                 // 【降噪探针·待撤】临时入口:时域降噪(Metal 自写核 + 估计对齐)
                 Section(header: Text("🌨 降噪探针(临时)")) {
                     Button("打开降噪探针(时域/空域)") { showDenoiseProbe = true }
+                }
+
+                // 【新 UI】claude.design MyTrack.dc.html 的 SwiftUI 实现(素材库/回看/设置/拍摄)。
+                // 预览期入口;转正 = 换 App 根视图 + 撤本按钮。退出:新 UI 内左上角长按 1.2s。
+                Section(header: Text("🎨 新 UI(MyTrack.dc)")) {
+                    Button("进入新 UI · 素材库") { newUIEmpty = false; showNewUI = true }
+                    Button("进入新 UI · 空状态") { newUIEmpty = true; showNewUI = true }
                 }
 
                 // 【4K探针·待撤】采集格式开关:切换即重启相机会话(以简单为准);
@@ -560,6 +580,8 @@ fileprivate struct TunerSheet: View {
         .fullScreenCover(isPresented: $showQualityProbe) { QualityProbeView() }
         // 【降噪探针·待撤】同上
         .fullScreenCover(isPresented: $showDenoiseProbe) { DenoiseProbeView() }
+        // 【新 UI】预览
+        .fullScreenCover(isPresented: $showNewUI) { MTRootView(showEmpty: newUIEmpty) }
         #endif
     }
 }
